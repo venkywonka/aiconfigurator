@@ -92,6 +92,10 @@ def build_collect_command(args, case: FpmCase, run_dir: Path) -> FpmShellCommand
         argv.append("--keep-running")
     if args.dry_run:
         argv.append("--dry-run")
+    if getattr(args, "expected_vllm_version", None):
+        argv.extend(["--expected-vllm-version", args.expected_vllm_version])
+    if getattr(args, "allow_version_mismatch", False):
+        argv.append("--allow-version-mismatch")
     if args.extra_vllm_arg:
         argv.append("--")
         argv.extend(args.extra_vllm_arg)

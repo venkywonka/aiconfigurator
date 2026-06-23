@@ -30,6 +30,7 @@ import math
 import os
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 # Matplotlib needs a writable config dir (the default ~/.config may be read-only
@@ -639,6 +640,21 @@ def plot_allreduce_comparison(*, database, out_path: Path):
     print(f"[allreduce] wrote {out_path}")
 
 
+def _fpm_rel(case_fpm: str, run_name: str | None) -> str:
+    """Rewrite the leading run-name segment of a case's FPM relative path.
+
+    ``Case.fpm`` strings bake in the committed B300 golden run directory name
+    (e.g. ``fpm_upfront_qwen32_full_once_20260613_194007/tp8_ep1_past4096/...``).
+    A fresh collection (e.g. on H100) lands under a different run name; passing
+    ``--fpm-run-name`` swaps only that first path segment so the per-(tp,ep,past)
+    sub-path still resolves under ``--fpm-root``.
+    """
+    if not run_name:
+        return case_fpm
+    head, sep, tail = case_fpm.partition("/")
+    return f"{run_name}/{tail}" if sep else case_fpm
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--layerwise", type=Path, required=True, help="Layerwise CSV (AIC measured data).")
@@ -664,6 +680,25 @@ def main() -> int:
         help="Treat collected decode rows for --model with past_kv >= this as corrupt and "
         "linearly extrapolate them from past_kv 2048/4096. 0 disables the repair.",
     )
+    parser.add_argument(
+        "--system",
+        default="b300_sxm",
+        help="AIC systems-data SKU directory for the comm/compute tables (e.g. h100_sxm). "
+        "Defaults to b300_sxm to preserve existing behavior.",
+    )
+    parser.add_argument("--backend", default="vllm", help="AIC systems-data backend directory.")
+    parser.add_argument(
+        "--version",
+        default="0.20.1",
+        help="AIC systems-data version directory (must exist under --systems-root). "
+        "Note: H100 ships 0.19.0, not 0.20.1.",
+    )
+    parser.add_argument(
+        "--fpm-run-name",
+        default=None,
+        help="Override the leading run-name segment of each case's FPM path so a fresh FPM "
+        "run resolves under --fpm-root instead of the committed B300 golden run name.",
+    )
     args = parser.parse_args()
 
     if not args.layerwise.is_file():
@@ -677,6 +712,8 @@ def main() -> int:
         )
     # Stable ordering by parallelism.
     cases = sorted(cases, key=lambda c: (c.tp, c.ep, c.moe_tp))
+    if args.fpm_run_name:
+        cases = [replace(c, fpm=_fpm_rel(c.fpm, args.fpm_run_name)) for c in cases]
 
     systems_root = args.systems_root
     if args.moe_perf_file is not None:
@@ -696,7 +733,7 @@ def main() -> int:
     if layerwise_df.empty:
         raise SystemExit(f"No layerwise rows for model {args.model!r} in {args.layerwise}")
 
-    real_db = PerfDatabase("b300_sxm", "vllm", "0.20.1", systems_root=systems_root)
+    real_db = PerfDatabase(args.system, args.backend, args.version, systems_root=systems_root)
     # `database` applies the high-KV decode repair (linear extrapolation from
     # past_kv 2048/4096), so the decode lookup is corruption-free. The gen chart's
     # calibrated vs uncalibrated lines are then both computed from this DB.

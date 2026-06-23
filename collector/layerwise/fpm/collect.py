@@ -84,6 +84,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Run remaining TP/EP cases after a case fails, then exit nonzero.",
     )
     advanced.add_argument("--extra-vllm-arg", action="append", default=[])
+    advanced.add_argument(
+        "--expected-vllm-version",
+        default=None,
+        help="Forward to the FPM shell as --expected-vllm-version (image vLLM version gate).",
+    )
+    advanced.add_argument(
+        "--allow-version-mismatch",
+        action="store_true",
+        help="Forward to the FPM shell as --allow-version-mismatch: warn instead of failing if "
+        "the image's vLLM version differs from the expected version.",
+    )
     return parser
 
 

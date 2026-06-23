@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# reproduce_layerwise_fpm.sh
+# =============================================================================
+# One-shot driver to reproduce the full layerwise <-> FPM-ground-truth <-> align
+# experiment, top to bottom, on arbitrary hardware. Defaults are tuned for the
+# DENSE Qwen3-32B, TP=8 scenario on H100 (8xH100 for real FPM ground-truth,
+# 1xH100 for single-GPU TP-mock layerwise collection), mirroring the committed
+# B300 setup but with the current ("latest") code paths.
+#
+# Three stages (each independently selectable via STAGES=):
+#   layerwise : 1xGPU single-GPU TP-mock per-layer compute timing (vLLM container)
+#               -> <OUT_ROOT>/layerwise/<slug>/layerwise.csv
+#   fpm       : 8xGPU real Dynamo/vLLM deployment, ForwardPassMetrics ground truth,
+#               one run per [low,mid,high] pareto concurrency point
+#               -> <OUT_ROOT>/fpm/<slug>/<pareto>/.../fpm_metrics_phase.csv
+#   align     : tools/plot_fpm_vs_aic.py, one chart set per pareto point
+#               -> <OUT_ROOT>/charts/<slug>/<pareto>/fpm_vs_aic_*.png
+#
+# Default order is "layerwise fpm align" (fast stage first so a setup bug fails
+# in minutes, not after the ~hours-long FPM sweep). Reorder via STAGES=.
+#
+# DESIGN: fail-fast (set -euo pipefail). Idempotent: each unit drops a marker in
+# <OUT_ROOT>/.done/ and is skipped on re-run unless FORCE=1 -> fix the failure,
+# re-run, and completed work is skipped. DRY_RUN=1 prints every command without
+# executing (the no-GPU verification path). SMOKE=1 runs a tiny end-to-end probe.
+#
+# BAKED-IN CORRECTNESS (do not "fix" these):
+#   * NO --live-step-driver (deprecated; corrupts MoE decode). Decode uses the
+#     default execute_model_gpu source.
+#   * NSYS 2026.3.1 mounted read-only into the vLLM container.
+#   * FPM --gpus quoted / inferred from TP; vLLM cache kept separate from $HOME.
+#   * OUT_ROOT must be LOCAL ext4 -- nsys export to SMB/NFS dies "database is locked".
+#
+# H100-SPECIFIC CAVEATS (see slop/h100-dense-repro-driver/):
+#   * AIC systems-data for H100 is vllm/0.19.0 (there is NO 0.20.1 dir). The align
+#     stage points PerfDatabase at DATA_VERSION=0.19.0 while collection uses vLLM
+#     0.20.1 -- comm is modeled from 0.19.0 tables, compute measured on 0.20.1.
+#   * h100_sxm/vllm/0.19.0 has custom_allreduce_perf.parquet but NOT
+#     allreduce_rms_perf.parquet -> the vLLM backend falls back to custom_allreduce
+#     for the fused decode allreduce. Correct & expected; only the "custom vs fused"
+#     comparison chart degrades to custom-only.
+#   * The FPM shell HARD-FAILS if the image's vLLM != VLLM_VERSION. Either the image
+#     genuinely ships that version, or set ALLOW_VERSION_MISMATCH=1.
+#
+# Requires patches (already applied on this branch):
+#   M1/M2  tools/plot_fpm_vs_aic.py: --system/--backend/--version + --fpm-run-name
+#   M3     collector/layerwise/fpm/{collect,docker}.py: --allow-version-mismatch passthrough
+#
+# USAGE
+#   DRY_RUN=1 ./collector/layerwise/reproduce_layerwise_fpm.sh        # print all commands, no GPU
+#   SMOKE=1   ./collector/layerwise/reproduce_layerwise_fpm.sh        # tiny end-to-end probe
+#             ./collector/layerwise/reproduce_layerwise_fpm.sh        # full dense Qwen3-32B tp8 H100
+#   STAGES="align" FORCE=1 ./...reproduce_layerwise_fpm.sh            # re-plot only
+#   STAGES="layerwise" ./...reproduce_layerwise_fpm.sh               # just the 1xH100 collection
+# =============================================================================
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Repo / paths
+# ----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AIC_REPO="${AIC_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+OUT_ROOT="${OUT_ROOT:-/tmp/aic-h100-repro}"   # MUST be local ext4 (nsys lock trap on SMB/NFS)
+
+# ----------------------------------------------------------------------------
+# Mode toggles
+# ----------------------------------------------------------------------------
+DRY_RUN="${DRY_RUN:-0}"
+SMOKE="${SMOKE:-0}"
+FORCE="${FORCE:-0}"
+STAGES="${STAGES:-layerwise fpm align}"
+PREFLIGHT_IMAGE_CHECK="${PREFLIGHT_IMAGE_CHECK:-0}"   # 1 = docker-run the FPM image to verify vLLM version
+
+# ----------------------------------------------------------------------------
+# Hardware / systems-data identity
+# ----------------------------------------------------------------------------
+SYSTEM="${SYSTEM:-h100_sxm}"            # AIC systems-data SKU dir (comm/compute tables) used by align
+BACKEND="${BACKEND:-vllm}"
+DATA_VERSION="${DATA_VERSION:-0.19.0}"  # systems-data version dir for align; H100 has 0.19.0, NOT 0.20.1
+VLLM_VERSION="${VLLM_VERSION:-0.20.1}"  # actual vLLM used for collection (CSV label + image gate)
+
+# ----------------------------------------------------------------------------
+# Containers
+# ----------------------------------------------------------------------------
+VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:v0.20.1}"                          # layerwise
+DYNAMO_VLLM_IMAGE="${DYNAMO_VLLM_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0}"  # FPM
+ALLOW_VERSION_MISMATCH="${ALLOW_VERSION_MISMATCH:-0}"
+
+# ----------------------------------------------------------------------------
+# Nsight Systems (host install mounted read-only into the vLLM container)
+# ----------------------------------------------------------------------------
+NSYS_VERSION_DIR="${NSYS_VERSION_DIR:-2026.3.1}"
+NSYS_ROOT="${NSYS_ROOT:-$HOME/.local/opt/nsight-systems-cli-${NSYS_VERSION_DIR}/opt/nvidia/nsight-systems-cli/${NSYS_VERSION_DIR}}"
+NSYS_TARGET_HOST_DIR="${NSYS_TARGET_HOST_DIR:-$NSYS_ROOT/target-linux-x64}"
+NSYS_IMPORTER_HOST_DIR="${NSYS_IMPORTER_HOST_DIR:-$NSYS_ROOT/host-linux-x64}"
+
+# ----------------------------------------------------------------------------
+# Caches / auth
+# ----------------------------------------------------------------------------
+HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+HF_TOKEN="${HF_TOKEN:-}"
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-}"
+VLLM_CACHE_HOST="${VLLM_CACHE_HOST:-$HOME/.cache/aic-vllm}"   # kept separate from $HOME/.cache/vllm
+
+# ----------------------------------------------------------------------------
+# Scenario: parallelism + pareto + shapes
+# ----------------------------------------------------------------------------
+TP="${TP:-8}"
+EP="${EP:-1}"
+LW_TP_LIST="${LW_TP_LIST:-$TP}"          # layerwise TP sizes (single-GPU mock); default = focus TP
+FPM_TP_LIST="${FPM_TP_LIST:-$TP}"        # FPM real-deployment TP sizes
+DECODE_PAST_KV="${DECODE_PAST_KV:-4096}" # -> FPM subdir tp{T}_ep{E}_past4096 (matches PRIMARY_CASES)
+
+# [low, mid, high] throughput-latency pareto = real-workload concurrency sweep.
+PARETO_NAMES=(low mid high)
+PARETO_CONCURRENCY=(${PARETO_CONCURRENCY:-8 16 32})
+FPM_REQUESTS="${FPM_REQUESTS:-128}"
+
+# Large-ish ISL/OSL (FPM real-workload shape distribution).
+ISL_MIN="${ISL_MIN:-100}";  ISL_MAX="${ISL_MAX:-16384}";  ISL_MEAN="${ISL_MEAN:-4096}"
+OSL_MIN="${OSL_MIN:-100}";  OSL_MAX="${OSL_MAX:-4096}";   OSL_MEAN="${OSL_MEAN:-1024}"
+FPM_DATASET="${FPM_DATASET:-OpenAssistant/oasst1}"
+FPM_SHAPE_SOURCE="${FPM_SHAPE_SOURCE:-scaled_dataset}"
+FPM_WARMUP_REQUESTS="${FPM_WARMUP_REQUESTS:-4}"
+
+# Scheduler parity: forced via env so FPM shell + align agree (shell reads $MAX_NUM_SEQS).
+FPM_MAX_NUM_SEQS="${FPM_MAX_NUM_SEQS:-256}"
+FPM_MAX_NUM_BATCHED_TOKENS="${FPM_MAX_NUM_BATCHED_TOKENS:-2048}"
+
+# Layerwise shapes (single-GPU TP-mock).
+LW_PHASES="${LW_PHASES:-both}"
+LW_CTX_NEW_TOKENS="${LW_CTX_NEW_TOKENS:-1,16,128,1024,4096}"
+LW_GEN_BATCH_SIZES="${LW_GEN_BATCH_SIZES:-1,2,4,8,16,32,64}"
+LW_GEN_PAST_KV="${LW_GEN_PAST_KV:-1,4096,8192,16384,32768}"
+LW_MAX_DECODE_BATCH_SIZE="${LW_MAX_DECODE_BATCH_SIZE:-256}"
+LW_MAX_MODEL_LEN="${LW_MAX_MODEL_LEN:-40960}"   # >= max(LW_GEN_PAST_KV)+ctx margin
+LW_GPU_MEM_UTIL="${LW_GPU_MEM_UTIL:-0.9}"
+LW_GPUS="${LW_GPUS:-0}"                          # single GPU id for the TP-mock
+
+# Align / plot.
+PLOT_PHASES="${PLOT_PHASES:-ctx,gen,mixed,allreduce}"
+PLOT_PARETO="${PLOT_PARETO:-${PARETO_NAMES[*]}}" # which pareto points to plot (default all)
+
+# Quant legs (dense bf16; nvfp4 is Blackwell-only and intentionally excluded).
+GEMM_QUANT="${GEMM_QUANT:-bf16}"; ATTN_QUANT="${ATTN_QUANT:-bf16}"
+KV_QUANT="${KV_QUANT:-bf16}";     MOE_QUANT="${MOE_QUANT:-bf16}"
+
+# ----------------------------------------------------------------------------
+# Model matrix: "slug | hf_id | kind | moe_perf_file(optional, relative to repo)"
+# Edit this array to add models. Dense models leave moe_perf_file empty.
+# ----------------------------------------------------------------------------
+MODELS=(
+  "qwen32|Qwen/Qwen3-32B|dense|"
+)
+
+# SMOKE: tiny, fast, end-to-end plumbing probe.
+if [[ "$SMOKE" == "1" ]]; then
+  MODELS=("qwen0p6b|Qwen/Qwen3-0.6B|dense|")
+  LW_TP_LIST="1"; FPM_TP_LIST="1"; TP="1"
+  LW_PHASES="both"; LW_CTX_NEW_TOKENS="1,128"; LW_GEN_BATCH_SIZES="1,4"; LW_GEN_PAST_KV="1,4096"
+  LW_MAX_MODEL_LEN="8192"; LW_MAX_DECODE_BATCH_SIZE="8"
+  PARETO_NAMES=(low); PARETO_CONCURRENCY=(2); FPM_REQUESTS="8"; FPM_WARMUP_REQUESTS="1"
+  FPM_MAX_NUM_SEQS="8"; FPM_MAX_NUM_BATCHED_TOKENS="2048"; PLOT_PARETO="low"
+  LW_RUN_PRESET="smoke"
+fi
+LW_RUN_PRESET="${LW_RUN_PRESET:-full}"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+RUN_TS="${RUN_TS:-$(date -u +%Y%m%d_%H%M%S)}"
+LOG_DIR="$OUT_ROOT/logs"; DONE_DIR="$OUT_ROOT/.done"
+C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_OFF=$'\033[0m'
+
+log()  { printf '%s[driver]%s %s\n' "$C_BOLD" "$C_OFF" "$*"; }
+warn() { printf '%s[driver WARN]%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+err()  { printf '%s[driver ERROR]%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# run <logfile> <cmd...> : echo, then exec (or just echo under DRY_RUN), tee to log.
+run() {
+  local logf="$1"; shift
+  printf '%s+ %s%s\n' "$C_DIM" "$*" "$C_OFF"
+  if [[ "$DRY_RUN" == "1" ]]; then return 0; fi
+  mkdir -p "$(dirname "$logf")"
+  ( "$@" ) 2>&1 | tee "$logf"
+  return "${PIPESTATUS[0]}"
+}
+
+# run_env "VAR=val VAR2=val2" <logfile> <cmd...> : like run but with extra env.
+run_env() {
+  local envspec="$1" logf="$2"; shift 2
+  printf '%s+ %s %s%s\n' "$C_DIM" "$envspec" "$*" "$C_OFF"
+  if [[ "$DRY_RUN" == "1" ]]; then return 0; fi
+  mkdir -p "$(dirname "$logf")"
+  ( env $envspec "$@" ) 2>&1 | tee "$logf"
+  return "${PIPESTATUS[0]}"
+}
+
+done_marker() { echo "$DONE_DIR/$1.done"; }
+is_done()     { [[ "$FORCE" != "1" && -f "$(done_marker "$1")" ]]; }
+mark_done()   { [[ "$DRY_RUN" == "1" ]] || { mkdir -p "$DONE_DIR"; date -u +%Y-%m-%dT%H:%M:%SZ > "$(done_marker "$1")"; }; }
+
+hf_token_value() {
+  if [[ -n "$HF_TOKEN" ]]; then echo "$HF_TOKEN"; return; fi
+  if [[ -n "$HF_TOKEN_FILE" && -f "$HF_TOKEN_FILE" ]]; then cat "$HF_TOKEN_FILE"; return; fi
+  [[ -f "$HOME/hf.token" ]] && { cat "$HOME/hf.token"; return; }
+  echo ""
+}
+
+# ============================================================================
+# Preflight
+# ============================================================================
+preflight() {
+  log "Preflight (SYSTEM=$SYSTEM backend=$BACKEND data_version=$DATA_VERSION vllm=$VLLM_VERSION; SMOKE=$SMOKE DRY_RUN=$DRY_RUN)"
+  mkdir -p "$OUT_ROOT" "$LOG_DIR" "$DONE_DIR" "$HF_HOME" "$VLLM_CACHE_HOST/tilelang/tmp"
+
+  command -v docker >/dev/null 2>&1 || warn "docker not found on PATH (required for fpm + layerwise stages)."
+
+  # GPU count
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local ngpu; ngpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+    log "Visible GPUs: $ngpu"
+    [[ " $STAGES " == *" fpm "* && "$ngpu" -lt "$TP" ]] && warn "fpm stage needs >= $TP GPUs (TP=$TP) but only $ngpu visible."
+    [[ " $STAGES " == *" layerwise "* && "$ngpu" -lt 1 ]] && warn "layerwise stage needs >= 1 GPU."
+  else
+    warn "nvidia-smi not found -- cannot verify GPU count."
+  fi
+
+  # OUT_ROOT filesystem type (nsys 'database is locked' on SMB/NFS/fuse)
+  local fstype; fstype="$(stat -f -c %T "$OUT_ROOT" 2>/dev/null || echo unknown)"
+  case "$fstype" in
+    ext2/ext3|ext4|xfs|btrfs|tmpfs) log "OUT_ROOT=$OUT_ROOT fstype=$fstype (local OK)";;
+    *) warn "OUT_ROOT=$OUT_ROOT fstype=$fstype -- nsys export may fail with 'database is locked'. Use local ext4.";;
+  esac
+
+  # NSYS host dirs (layerwise)
+  if [[ " $STAGES " == *" layerwise "* ]]; then
+    [[ -d "$NSYS_TARGET_HOST_DIR" ]]   || warn "NSYS target dir missing: $NSYS_TARGET_HOST_DIR (set NSYS_ROOT/NSYS_TARGET_HOST_DIR)."
+    [[ -d "$NSYS_IMPORTER_HOST_DIR" ]] || warn "NSYS importer dir missing: $NSYS_IMPORTER_HOST_DIR."
+  fi
+
+  # HF token (fpm needs to pull/serve gated models)
+  if [[ " $STAGES " == *" fpm "* && -z "$(hf_token_value)" ]]; then
+    warn "No HF token (HF_TOKEN / HF_TOKEN_FILE / ~/hf.token). FPM model serve may fail for gated models."
+  fi
+
+  # Align needs systems-data for the target SKU/version
+  if [[ " $STAGES " == *" align "* ]]; then
+    local dd="$AIC_REPO/src/aiconfigurator/systems/data/$SYSTEM/$BACKEND/$DATA_VERSION"
+    if [[ -d "$dd" ]]; then
+      log "Align systems-data: $dd"
+      [[ -f "$dd/custom_allreduce_perf.parquet" ]] || warn "no custom_allreduce_perf.parquet in $dd -- comm term will be unavailable."
+      [[ -f "$dd/allreduce_rms_perf.parquet" ]]    || warn "no allreduce_rms_perf.parquet in $dd -- fused decode allreduce falls back to custom_allreduce (expected on H100 0.19.0)."
+    else
+      die "Align systems-data dir not found: $dd (set SYSTEM/BACKEND/DATA_VERSION). H100 ships 0.19.0, not 0.20.1."
+    fi
+  fi
+
+  # Optional: verify the FPM image's vLLM version (the shell hard-fails on mismatch)
+  if [[ " $STAGES " == *" fpm "* ]]; then
+    if [[ "$PREFLIGHT_IMAGE_CHECK" == "1" && "$DRY_RUN" != "1" ]]; then
+      local v; v="$(docker run --rm "$DYNAMO_VLLM_IMAGE" python -c 'import vllm,sys; sys.stdout.write(vllm.__version__)' 2>/dev/null || echo '?')"
+      log "FPM image vLLM version: $v (expected $VLLM_VERSION)"
+      if [[ "$v" != "$VLLM_VERSION" && "$ALLOW_VERSION_MISMATCH" != "1" ]]; then
+        die "FPM image vLLM=$v != $VLLM_VERSION and ALLOW_VERSION_MISMATCH!=1. The FPM shell will die. Set ALLOW_VERSION_MISMATCH=1 or use a matching image."
+      fi
+    else
+      warn "FPM image vLLM version unverified. The FPM shell HARD-FAILS if image vLLM != $VLLM_VERSION. Set PREFLIGHT_IMAGE_CHECK=1, or ALLOW_VERSION_MISMATCH=1 to bypass the gate."
+    fi
+  fi
+  log "Preflight done."
+}
+
+# ============================================================================
+# Stage: layerwise (1xGPU single-GPU TP-mock, inside vLLM container)
+# ============================================================================
+lw_run_dir() { echo "$OUT_ROOT/layerwise/$1"; }
+lw_csv()     { echo "$(lw_run_dir "$1")/layerwise.csv"; }
+
+stage_layerwise() {
+  local slug hf kind moe; local m
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r slug hf kind moe <<<"$m"
+    local unit="layerwise_${slug}"
+    if is_done "$unit"; then log "skip $unit (done; FORCE=1 to redo)"; continue; fi
+    local rdir; rdir="$(lw_run_dir "$slug")"; mkdir -p "$rdir"
+    log "Layerwise: $hf ($kind) tp=$LW_TP_LIST -> $rdir/layerwise.csv"
+
+    # In-container collect command (modeled on the committed run_layerwise_smoke.sh).
+    local incmd
+    incmd=$(cat <<EOS
+set -euo pipefail
+export PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:\$PATH"
+export LD_LIBRARY_PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:\${LD_LIBRARY_PATH:-}"
+nsys --version
+python3 -m collector.layerwise.vllm.collect \
+  --run-dir /results \
+  --model "${hf}" --model-kind "${kind}" \
+  --tp-sizes ${LW_TP_LIST} --ep-sizes ${EP} \
+  --phases ${LW_PHASES} --run-preset ${LW_RUN_PRESET} \
+  --ctx-new-tokens ${LW_CTX_NEW_TOKENS} --ctx-batch-sizes auto \
+  --gen-batch-sizes ${LW_GEN_BATCH_SIZES} --gen-past-kv ${LW_GEN_PAST_KV} \
+  --max-decode-batch-size ${LW_MAX_DECODE_BATCH_SIZE} \
+  --gemm-quant ${GEMM_QUANT} --attn-quant ${ATTN_QUANT} --kv-quant ${KV_QUANT} --moe-quant ${MOE_QUANT} \
+  --system ${SYSTEM} --framework-version ${VLLM_VERSION} \
+  --gpus ${LW_GPUS} --max-workers 1 \
+  --max-model-len ${LW_MAX_MODEL_LEN} \
+  --gpu-memory-utilization ${LW_GPU_MEM_UTIL}
+EOS
+)
+    run "$LOG_DIR/${unit}.log" \
+      docker run --rm --entrypoint bash --gpus "\"device=${LW_GPUS}\"" --ipc=host --network=host \
+        -v "$NSYS_TARGET_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:ro" \
+        -v "$NSYS_IMPORTER_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:ro" \
+        -v "$AIC_REPO:/workspace" \
+        -v "$rdir:/results" \
+        -v "$HF_HOME:/hf-cache" \
+        -v "$VLLM_CACHE_HOST:/home/dynamo/.cache/vllm" \
+        -v "$VLLM_CACHE_HOST:/root/.cache/vllm" \
+        -e HF_HOME=/hf-cache -e HF_HUB_CACHE=/hf-cache/hub \
+        -e HF_TOKEN="$(hf_token_value)" \
+        -e TILELANG_CACHE_DIR=/home/dynamo/.cache/vllm/tilelang \
+        -e TILELANG_TMP_DIR=/home/dynamo/.cache/vllm/tilelang/tmp \
+        -w /workspace "$VLLM_IMAGE" -lc "$incmd"
+
+    [[ "$DRY_RUN" == "1" || -f "$rdir/layerwise.csv" ]] || die "layerwise.csv not produced in $rdir"
+    mark_done "$unit"
+  done
+}
+
+# ============================================================================
+# Stage: fpm (8xGPU real Dynamo deployment, one run per pareto point)
+# ============================================================================
+fpm_run_dir() { echo "$OUT_ROOT/fpm/$1/$2"; }   # <slug>/<pareto>
+
+stage_fpm() {
+  local slug hf kind moe; local m i
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r slug hf kind moe <<<"$m"
+    for i in "${!PARETO_NAMES[@]}"; do
+      local pname="${PARETO_NAMES[$i]}" conc="${PARETO_CONCURRENCY[$i]}"
+      local unit="fpm_${slug}_${pname}"
+      if is_done "$unit"; then log "skip $unit (done; FORCE=1 to redo)"; continue; fi
+      local rdir; rdir="$(fpm_run_dir "$slug" "$pname")"; mkdir -p "$rdir"
+      log "FPM: $hf tp=$FPM_TP_LIST pareto=$pname concurrency=$conc -> $rdir"
+
+      local extra=()
+      [[ "$ALLOW_VERSION_MISMATCH" == "1" ]] && extra+=(--allow-version-mismatch --expected-vllm-version "$VLLM_VERSION")
+
+      # Scheduler parity forced via env (FPM shell reads $MAX_NUM_SEQS / $MAX_NUM_BATCHED_TOKENS;
+      # the python wrapper inherits os.environ into the subprocess).
+      run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value)" \
+        "$LOG_DIR/${unit}.log" \
+        python3 -m collector.layerwise.fpm.collect \
+          --model "$hf" \
+          --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
+          --phases context,decode,mixed \
+          --decode-past-kv "$DECODE_PAST_KV" \
+          --real-workload \
+          --real-workload-requests "$FPM_REQUESTS" --real-workload-concurrency "$conc" \
+          --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE" \
+          --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN" \
+          --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN" \
+          --prompt-token-mode safe_ascii \
+          --warmup-requests "$FPM_WARMUP_REQUESTS" \
+          --image "$DYNAMO_VLLM_IMAGE" \
+          --run-dir "$rdir" \
+          "${extra[@]}"
+
+      mark_done "$unit"
+    done
+  done
+}
+
+# ============================================================================
+# Stage: align (plot_fpm_vs_aic.py, one chart set per pareto point)
+# ============================================================================
+# Ensure <fpm_run_dir>/tp{T}_ep{E}_past{K}/fpm_metrics_phase.csv exists for each
+# collected TP. Single-TP runs land flat (case_run_dir nests only when >1 case),
+# so symlink the flat phase CSV into the nested path the plot's --fpm-run-name expects.
+normalize_fpm_layout() {
+  local rdir="$1" tp
+  for tp in ${FPM_TP_LIST//,/ }; do
+    local nested="$rdir/tp${tp}_ep${EP}_past${DECODE_PAST_KV}/fpm_metrics_phase.csv"
+    local flat="$rdir/fpm_metrics_phase.csv"
+    if [[ ! -e "$nested" && -f "$flat" ]]; then
+      printf '%s+ symlink %s -> %s%s\n' "$C_DIM" "$nested" "$flat" "$C_OFF"
+      [[ "$DRY_RUN" == "1" ]] || { mkdir -p "$(dirname "$nested")"; ln -sf "$flat" "$nested"; }
+    fi
+  done
+}
+
+# Read the FPM-resolved scheduler config for true plot parity, else fall back.
+plot_max_num_seqs() {
+  local rdir="$1" cfg; cfg="$(ls "$rdir"/effective_vllm_config.json "$rdir"/*/effective_vllm_config.json 2>/dev/null | head -1 || true)"
+  if [[ -n "$cfg" && -f "$cfg" && "$DRY_RUN" != "1" ]]; then
+    python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get('scheduler_config.max_num_seqs') or d.get('max_num_seqs') or $FPM_MAX_NUM_SEQS)" "$cfg" 2>/dev/null || echo "$FPM_MAX_NUM_SEQS"
+  else
+    echo "$FPM_MAX_NUM_SEQS"
+  fi
+}
+
+stage_align() {
+  local slug hf kind moe; local m pname
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r slug hf kind moe <<<"$m"
+    local lwcsv; lwcsv="$(lw_csv "$slug")"
+    if [[ "$DRY_RUN" != "1" && ! -f "$lwcsv" ]]; then die "layerwise CSV missing for align: $lwcsv (run layerwise stage first)"; fi
+    for pname in $PLOT_PARETO; do
+      local unit="align_${slug}_${pname}"
+      if is_done "$unit"; then log "skip $unit (done; FORCE=1 to redo)"; continue; fi
+      local fdir; fdir="$(fpm_run_dir "$slug" "$pname")"
+      normalize_fpm_layout "$fdir"
+      local cdir="$OUT_ROOT/charts/$slug/$pname"; mkdir -p "$cdir"
+      local mns; mns="$(plot_max_num_seqs "$fdir")"
+      log "Align: $hf pareto=$pname  layerwise=$lwcsv  fpm-root=$(dirname "$fdir")  -> $cdir"
+
+      local moearg=()
+      [[ -n "$moe" ]] && moearg=(--moe-perf-file "$AIC_REPO/$moe")
+
+      run "$LOG_DIR/${unit}.log" \
+        python3 tools/plot_fpm_vs_aic.py \
+          --layerwise "$lwcsv" \
+          --model "$hf" \
+          --system "$SYSTEM" --backend "$BACKEND" --version "$DATA_VERSION" \
+          --systems-root "$AIC_REPO/src/aiconfigurator/systems" \
+          --fpm-root "$(dirname "$fdir")" \
+          --fpm-run-name "$(basename "$fdir")" \
+          --vllm-max-num-seqs "$mns" --vllm-max-num-batched-tokens "$FPM_MAX_NUM_BATCHED_TOKENS" \
+          --phases "$PLOT_PHASES" \
+          --out-dir "$cdir" \
+          "${moearg[@]}"
+
+      mark_done "$unit"
+    done
+  done
+}
+
+# ============================================================================
+# Report
+# ============================================================================
+report() {
+  log "Done. STAGES='$STAGES'  OUT_ROOT=$OUT_ROOT"
+  if [[ "$DRY_RUN" == "1" ]]; then log "(DRY_RUN: nothing executed; commands printed above)"; return; fi
+  log "Artifacts:"
+  [[ -d "$OUT_ROOT/layerwise" ]] && find "$OUT_ROOT/layerwise" -name layerwise.csv -printf '  layerwise: %p\n' 2>/dev/null || true
+  [[ -d "$OUT_ROOT/fpm" ]]       && find "$OUT_ROOT/fpm" -name fpm_metrics_phase.csv -printf '  fpm:       %p\n' 2>/dev/null || true
+  [[ -d "$OUT_ROOT/charts" ]]    && find "$OUT_ROOT/charts" -name '*.png' -printf '  chart:     %p\n' 2>/dev/null || true
+  log "Logs: $LOG_DIR/"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+main() {
+  cd "$AIC_REPO"
+  log "repo=$AIC_REPO"
+  preflight
+  for stage in $STAGES; do
+    case "$stage" in
+      layerwise) log "== STAGE layerwise =="; stage_layerwise;;
+      fpm)       log "== STAGE fpm =="; stage_fpm;;
+      align)     log "== STAGE align =="; stage_align;;
+      *) die "unknown stage: $stage (valid: layerwise fpm align)";;
+    esac
+  done
+  report
+}
+
+main "$@"
