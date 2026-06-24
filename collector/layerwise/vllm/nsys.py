@@ -76,6 +76,36 @@ def _aggregate_step_rows(rows: list[dict[str, Any]]) -> dict[tuple[int, int, int
     return out
 
 
+def _filter_boundary_discards(
+    rows: list[dict[str, Any]], discard_first_n: int = 3
+) -> list[dict[str, Any]]:
+    """Drop the first ``discard_first_n`` steps of each capture cohort.
+
+    A windowed nsys capture opens with ``cudaProfilerStart`` followed by
+    ``torch.cuda.synchronize()`` (worker.py ``_cuda_profiler_call``), which drains
+    the GPU pipeline. The first few steps after that sync start from an empty
+    pipeline, so their kernel occupancy/overlap is a drain artifact, not steady
+    state. We discard them per ``(batch_size, past_kv, measure_run)`` cohort,
+    relative to each cohort's minimum step ordinal -- the ordinal ``N`` comes from
+    the ``bench_step::N...`` NVTX label, so the window boundary is implicit in the
+    step sequence (no explicit window-index field exists in the row).
+    """
+    if discard_first_n <= 0:
+        return list(rows)
+    cohort_min: dict[tuple[int, int, int], int] = {}
+    for row in rows:
+        cohort = (row["batch_size"], row["past_kv"], int(row.get("measure_run", 0)))
+        step = int(row["step"])
+        if cohort not in cohort_min or step < cohort_min[cohort]:
+            cohort_min[cohort] = step
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        cohort = (row["batch_size"], row["past_kv"], int(row.get("measure_run", 0)))
+        if int(row["step"]) >= cohort_min[cohort] + discard_first_n:
+            kept.append(row)
+    return kept
+
+
 def _latency_us_from_agg(agg: dict[str, Any], latency_source: str) -> float:
     if latency_source == "span":
         return float(agg["span_us"])
