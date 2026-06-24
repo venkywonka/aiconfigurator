@@ -36,7 +36,7 @@ _LAYERWISE_USE_FUSED_ALLREDUCE_RMS = True
 # Scale the per-step decode COMPUTE (layerwise) by (1 + k*batch); comm is modeled
 # separately via the fused all-reduce so it is NOT scaled here. k fit against FPM.
 # Set to 0.0 to disable.
-_DECODE_COMPUTE_BATCH_CAL = 0.0066
+_DECODE_COMPUTE_BATCH_CAL = 0.0
 
 
 class VLLMBackend(BaseBackend):

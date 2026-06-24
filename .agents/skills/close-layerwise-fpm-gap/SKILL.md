@@ -85,3 +85,46 @@ Give the user a compact table with:
 - exact caveats, especially missing TP FPM rows or failed mixed runs
 
 State whether the evidence points to FPM noise, deployment parity mismatch, layerwise collector error, AIC normalization error, or a real modeling gap.
+
+## Multi-track gap analysis (op-wise + layerwise)
+
+Beyond the single-track layerwise comparison above, the canonical multi-track analyzer compares
+ALL of AIC's predictor tracks against FPM through ONE per-step entry point (flip
+`vllm_backend._USE_LAYERWISE` + swap the `database`/mode):
+
+`collector/layerwise/diagnostics/aic_fpm_gap.py`  (report: `aic_fpm_gap_report.py`)
+
+| track | source | notes |
+|---|---|---|
+| `layerwise` | layerwise CSV (compute-version) + comm tables | version-matched to FPM; **cal-off headline** (`_DECODE_COMPUTE_BATCH_CAL=0`) |
+| `layerwise_cal0066` | + old 0.0066 decode batch-cal | counterfactual sensitivity (shows the removed, mis-tuned cal) |
+| `opwise_silicon` | measured op-wise `PerfDatabase` (SILICON) | the op-wise model |
+| `hybrid` | SILICON-with-empirical-fallback | `hybrid == opwise_silicon` ⇒ op coverage complete |
+| `empirical` | analytic SOL/scale_factor | version-skew-immune |
+| `sol` | pure roofline floor | bounds, not predicts |
+
+It is **SKU/version-general** (`--system`, `--model`, `--compute-version`, `--comm-version`) and
+**auto-detects both FPM layouts**: B300 TP-sweep (`tp{tp}_ep1_past4096/`) and the H100-SXM
+concurrency sweep (`fpm/qwen32/c{conc}/`, points merged; decode bins span batches 1..conc, grouped
+by batch via `build_summary_by_concurrency`).
+
+```bash
+python -m collector.layerwise.diagnostics.aic_fpm_gap \
+  --system h100_sxm --model Qwen/Qwen3-32B \
+  --compute-version 0.20.1 --comm-version 0.19.0 --workload-segment real \
+  --fpm-run fpm_golden_runs/fpm_h100_qwen32_tp8_8k1k_pareto_<ts> --out-dir <out>
+```
+
+Outputs: `gap_summary.csv`, `gap_summary_by_concurrency.csv` (per decode batch = concurrency),
+`compute_comm_decomposition.csv`, `gap_rows.csv`, plus `dashboard.html` + `verdict.md` (track ranking).
+
+Interpretation (carries the Core Rule + step 6):
+- Only the **layerwise** track is version-matched to FPM; op-wise/empirical/hybrid/SOL use the
+  comm/op-DB version, so their error mixes model + version skew — disclose it, don't bury it.
+- The headline forces `_DECODE_COMPUTE_BATCH_CAL=0`: the linear decode batch-cal is mis-tuned; on
+  H100 cal-on inflates dense decode to ~30% MAPE (→79% at batch 128). `layerwise_cal0066` exists
+  only to show that counterfactual.
+- H100 finding (2026-06-24, dense Qwen3-32B, TP=8 8k/1k): op-wise SILICON/hybrid **4.0%** gen MAPE
+  < layerwise(0.20.1) **7.9%** < empirical 28.9% < SOL 48.4% — op-wise wins on H100 (opposite of
+  B300), mainly because layerwise over-predicts low-batch decode via the H100 comm-table fallback
+  (`custom_allreduce` substituting for the missing fused `allreduce_rms`).

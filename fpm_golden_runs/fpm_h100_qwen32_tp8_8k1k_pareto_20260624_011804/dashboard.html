@@ -1,0 +1,52 @@
+<!doctype html><html><head><meta charset=utf-8>
+<title>8xH100 FPM Pareto - Qwen3-32B dense TP=8 8k/1k</title>
+<style>
+body{font-family:system-ui,Arial;margin:24px;color:#1a1a1a;background:#fafafa}
+h1{font-size:20px} h2{font-size:15px;margin-top:24px}
+table{border-collapse:collapse;margin:12px 0} td,th{border:1px solid #ccc;padding:6px 10px;text-align:right;font-variant-numeric:tabular-nums}
+th{background:#eee} .meta{color:#555;font-size:13px;line-height:1.6}
+#cv{background:#fff;border:1px solid #ddd}
+.badge{display:inline-block;background:#1a7f37;color:#fff;padding:2px 8px;border-radius:10px;font-size:12px}
+</style></head><body>
+<h1>8&times;H100 FPM Ground-Truth Pareto &mdash; Qwen3-32B dense, TP=8, ISL/OSL&approx;8192/1024 <span class=badge>SUCCESS 5/5</span></h1>
+<div class=meta>
+vLLM 0.20.1 (image vllm-runtime:1.2.0) &middot; max_num_seqs=128 &middot; max_num_batched_tokens=2048 &middot; bf16 KV &middot;
+real-workload concurrency sweep, synthetic fixed 8k/1k, past_kv=8192 &middot; Brev 8&times;H100-SXM.<br>
+Decode throughput/latency frontier: each point's in-flight batch = its concurrency; TPOT = median per-step decode latency at 8k KV.
+</div>
+<h2>Pareto curve (decode TPOT vs decode throughput/GPU)</h2>
+<canvas id=cv width=720 height=440></canvas>
+<h2>Operating points</h2>
+<table><tr><th>concurrency</th><th>median TPOT (ms)</th><th>p90 TPOT (ms)</th><th>decode tok/s</th><th>decode tok/s/GPU</th><th>steady decode rows</th><th>median prefill chunk (ms)</th></tr>
+<tr><td>1</td><td>6.109</td><td>6.135</td><td>163.7</td><td>20.5</td><td>6138</td><td>48.7885</td></tr>
+<tr><td>4</td><td>6.484</td><td>6.516</td><td>616.9</td><td>77.1</td><td>2021</td><td>49.523</td></tr>
+<tr><td>16</td><td>8.198</td><td>8.258</td><td>1951.7</td><td>244.0</td><td>1925</td><td>49.6285</td></tr>
+<tr><td>64</td><td>13.493</td><td>13.705</td><td>4743.2</td><td>592.9</td><td>1529</td><td>138.8375</td></tr>
+<tr><td>128</td><td>20.306</td><td>20.577</td><td>6303.6</td><td>787.9</td><td>980</td><td>218.5955</td></tr>
+</table>
+<div class=meta>TPOT monotone&uarr; with concurrency: <b>True</b> &middot; throughput/GPU monotone&uarr;: <b>True</b><br>
+Source: <code>fpm_golden_runs/fpm_h100_qwen32_tp8_8k1k_pareto_*/fpm/qwen32/c*/fpm_metrics_phase.csv</code> &middot;
+ledger: <code>slop/h100-fpm-pareto-8k1k/</code> &middot; Linear AIC-1181</div>
+<script>
+const pts=[{"c": 1, "tpot": 6.109, "thr": 20.5, "thr_tot": 163.7, "p90": 6.135, "prefill": 48.7885, "steady": 6138}, {"c": 4, "tpot": 6.484, "thr": 77.1, "thr_tot": 616.9, "p90": 6.516, "prefill": 49.523, "steady": 2021}, {"c": 16, "tpot": 8.198, "thr": 244.0, "thr_tot": 1951.7, "p90": 8.258, "prefill": 49.6285, "steady": 1925}, {"c": 64, "tpot": 13.493, "thr": 592.9, "thr_tot": 4743.2, "p90": 13.705, "prefill": 138.8375, "steady": 1529}, {"c": 128, "tpot": 20.306, "thr": 787.9, "thr_tot": 6303.6, "p90": 20.577, "prefill": 218.5955, "steady": 980}];
+const cv=document.getElementById('cv'),x=cv.getContext('2d');
+const PADL=70,PADB=50,W=cv.width,H=cv.height;
+const xs=pts.map(p=>p.thr),ys=pts.map(p=>p.tpot);
+const xmax=Math.max(...xs)*1.1,ymax=Math.max(...ys)*1.15;
+function X(v){return PADL+(v/xmax)*(W-PADL-20)}
+function Y(v){return H-PADB-(v/ymax)*(H-PADB-20)}
+x.strokeStyle='#999';x.beginPath();x.moveTo(PADL,10);x.lineTo(PADL,H-PADB);x.lineTo(W-10,H-PADB);x.stroke();
+x.fillStyle='#333';x.font='12px system-ui';
+x.fillText('decode tok/s/GPU',W/2-50,H-12);
+x.save();x.translate(16,H/2+40);x.rotate(-Math.PI/2);x.fillText('median decode TPOT (ms)',0,0);x.restore();
+// gridlines
+x.strokeStyle='#eee';x.fillStyle='#666';
+for(let i=0;i<=5;i++){let gx=PADL+i/5*(W-PADL-20);x.beginPath();x.moveTo(gx,10);x.lineTo(gx,H-PADB);x.stroke();x.fillText((xmax*i/5).toFixed(0),gx-10,H-PADB+16);}
+for(let i=0;i<=5;i++){let gy=H-PADB-i/5*(H-PADB-20);x.beginPath();x.moveTo(PADL,gy);x.lineTo(W-10,gy);x.stroke();x.fillText((ymax*i/5).toFixed(1),PADL-40,gy+4);}
+// line + points
+x.strokeStyle='#1f6feb';x.lineWidth=2;x.beginPath();
+pts.forEach((p,i)=>{const px=X(p.thr),py=Y(p.tpot);i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();
+pts.forEach(p=>{const px=X(p.thr),py=Y(p.tpot);x.fillStyle='#1f6feb';x.beginPath();x.arc(px,py,5,0,7);x.fill();
+x.fillStyle='#000';x.fillText('c='+p.c,px+8,py-6);});
+</script>
+</body></html>

@@ -117,7 +117,13 @@ DECODE_PAST_KV="${DECODE_PAST_KV:-4096}" # -> FPM subdir tp{T}_ep{E}_past4096 (m
 # [low, mid, high] throughput-latency pareto = real-workload concurrency sweep.
 PARETO_NAMES=(low mid high)
 PARETO_CONCURRENCY=(${PARETO_CONCURRENCY:-8 16 32})
-FPM_REQUESTS="${FPM_REQUESTS:-128}"
+FPM_REQUESTS="${FPM_REQUESTS:-128}"     # legacy fixed default; superseded by P2 per-point scaling below
+# P2: per-point request scaling -> requests(conc) = clamp(FPM_REQ_MULT*conc, FPM_REQ_MIN, FPM_REQ_MAX).
+# At OSL=1024 a fixed high request count makes low-concurrency points run for tens of minutes; scaling
+# keeps each point ~1-3 min while reaching steady state. {1,4,16,64,128} -> {6,8,32,128,256}.
+FPM_REQ_MULT="${FPM_REQ_MULT:-2}"
+FPM_REQ_MIN="${FPM_REQ_MIN:-6}"
+FPM_REQ_MAX="${FPM_REQ_MAX:-256}"
 
 # Large-ish ISL/OSL (FPM real-workload shape distribution).
 ISL_MIN="${ISL_MIN:-100}";  ISL_MAX="${ISL_MAX:-16384}";  ISL_MEAN="${ISL_MEAN:-4096}"
@@ -139,6 +145,7 @@ LW_MAX_DECODE_BATCH_SIZE="${LW_MAX_DECODE_BATCH_SIZE:-256}"
 LW_MAX_MODEL_LEN="${LW_MAX_MODEL_LEN:-40960}"   # >= max(LW_GEN_PAST_KV)+ctx margin
 LW_GPU_MEM_UTIL="${LW_GPU_MEM_UTIL:-0.9}"
 LW_GPUS="${LW_GPUS:-0}"                          # single GPU id for the TP-mock
+LW_LATENCY_SOURCE="${LW_LATENCY_SOURCE:-schedule_to_update}"  # P-LW1: full-step wall (=FPM domain); execute_model_gpu for GPU-only sensitivity
 
 # Align / plot.
 PLOT_PHASES="${PLOT_PHASES:-ctx,gen,mixed,allreduce}"
@@ -162,11 +169,20 @@ if [[ "$SMOKE" == "1" ]]; then
   LW_TP_LIST="1"; FPM_TP_LIST="1"; TP="1"
   LW_PHASES="both"; LW_CTX_NEW_TOKENS="1,128"; LW_GEN_BATCH_SIZES="1,4"; LW_GEN_PAST_KV="1,4096"
   LW_MAX_MODEL_LEN="8192"; LW_MAX_DECODE_BATCH_SIZE="8"
-  PARETO_NAMES=(low); PARETO_CONCURRENCY=(2); FPM_REQUESTS="8"; FPM_WARMUP_REQUESTS="1"
-  FPM_MAX_NUM_SEQS="8"; FPM_MAX_NUM_BATCHED_TOKENS="2048"; PLOT_PARETO="low"
+  PARETO_NAMES=(c2); PARETO_CONCURRENCY=(2); FPM_REQ_MIN="2"; FPM_REQ_MAX="8"; FPM_WARMUP_REQUESTS="1"
+  FPM_MAX_NUM_SEQS="8"; FPM_MAX_NUM_BATCHED_TOKENS="2048"; PLOT_PARETO="c2"
   LW_RUN_PRESET="smoke"
 fi
 LW_RUN_PRESET="${LW_RUN_PRESET:-full}"
+
+# P1: normalize pareto point names to the concurrency ladder length (auto-derive c<conc>) so
+# PARETO_CONCURRENCY can define any number of points. Previously PARETO_NAMES=(low mid high) was a
+# literal and the fpm/align loops iterate ${!PARETO_NAMES[@]}, silently dropping points beyond 3.
+if [[ "${#PARETO_NAMES[@]}" -ne "${#PARETO_CONCURRENCY[@]}" ]]; then
+  PARETO_NAMES=()
+  for _c in "${PARETO_CONCURRENCY[@]}"; do PARETO_NAMES+=("c${_c}"); done
+  PLOT_PARETO="${PLOT_PARETO_OVERRIDE:-${PARETO_NAMES[*]}}"
+fi
 
 # ============================================================================
 # Helpers
@@ -309,7 +325,8 @@ python3 -m collector.layerwise.vllm.collect \
   --system ${SYSTEM} --framework-version ${VLLM_VERSION} \
   --gpus ${LW_GPUS} --max-workers 1 \
   --max-model-len ${LW_MAX_MODEL_LEN} \
-  --gpu-memory-utilization ${LW_GPU_MEM_UTIL}
+  --gpu-memory-utilization ${LW_GPU_MEM_UTIL} \
+  --latency-source ${LW_LATENCY_SOURCE}
 EOS
 )
     run "$LOG_DIR/${unit}.log" \
@@ -343,10 +360,14 @@ stage_fpm() {
     IFS='|' read -r slug hf kind moe <<<"$m"
     for i in "${!PARETO_NAMES[@]}"; do
       local pname="${PARETO_NAMES[$i]}" conc="${PARETO_CONCURRENCY[$i]}"
+      # P2: per-point request count = clamp(FPM_REQ_MULT*conc, FPM_REQ_MIN, FPM_REQ_MAX).
+      local req=$(( FPM_REQ_MULT * conc ))
+      (( req < FPM_REQ_MIN )) && req="$FPM_REQ_MIN"
+      (( req > FPM_REQ_MAX )) && req="$FPM_REQ_MAX"
       local unit="fpm_${slug}_${pname}"
       if is_done "$unit"; then log "skip $unit (done; FORCE=1 to redo)"; continue; fi
       local rdir; rdir="$(fpm_run_dir "$slug" "$pname")"; mkdir -p "$rdir"
-      log "FPM: $hf tp=$FPM_TP_LIST pareto=$pname concurrency=$conc -> $rdir"
+      log "FPM: $hf tp=$FPM_TP_LIST pareto=$pname concurrency=$conc requests=$req -> $rdir"
 
       local extra=()
       [[ "$ALLOW_VERSION_MISMATCH" == "1" ]] && extra+=(--allow-version-mismatch --expected-vllm-version "$VLLM_VERSION")
@@ -361,7 +382,7 @@ stage_fpm() {
           --phases context,decode,mixed \
           --decode-past-kv "$DECODE_PAST_KV" \
           --real-workload \
-          --real-workload-requests "$FPM_REQUESTS" --real-workload-concurrency "$conc" \
+          --real-workload-requests "$req" --real-workload-concurrency "$conc" \
           --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE" \
           --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN" \
           --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN" \

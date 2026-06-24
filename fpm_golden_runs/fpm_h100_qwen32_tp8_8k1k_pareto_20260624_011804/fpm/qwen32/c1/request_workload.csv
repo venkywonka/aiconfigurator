@@ -1,0 +1,7 @@
+workload_label,request_index,endpoint,target_isl,target_osl,prompt_tokens,max_tokens,prompt_token_mode,shape_source
+real,4,completions,8192,1024,8192,1024,safe_ascii,synthetic_large_shape_distribution
+real,5,completions,8192,1024,8192,1024,safe_ascii,synthetic_large_shape_distribution
+real,6,completions,8192,1024,8192,1024,safe_ascii,synthetic_large_shape_distribution
+real,7,completions,8192,1024,8192,1024,safe_ascii,synthetic_large_shape_distribution
+real,8,completions,8192,1024,8192,1024,safe_ascii,synthetic_large_shape_distribution
+real,9,completions,8192,1024,8192,1024,safe_ascii,synthetic_large_shape_distribution

@@ -1,0 +1,123 @@
++ bash collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh --model Qwen/Qwen3-32B --tp-size 8 --ep-size 1 --run-dir /home/ubuntu/aic-h100-repro/fpm/qwen32/c4 --phases context,decode,mixed --contexts 128,1024,4096 --context-repeats 6 --decode-batches 1,4,16 --decode-past-kv 8192 --decode-osl 8 --decode-repeats 6 --image nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0 --request-allow-failures 0 --prompt-token-mode safe_ascii --real-workload --real-workload-requests 8 --real-workload-concurrency 4 --real-workload-dataset OpenAssistant/oasst1 --real-workload-shape-source synthetic --real-workload-isl-min 8192 --real-workload-isl-max 8192 --real-workload-isl-mean 8192.0 --real-workload-osl-min 1024 --real-workload-osl-max 1024 --real-workload-osl-mean 1024.0 --warmup-requests 4
+[00:57:35] Verifying image 'nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0' uses vLLM 0.20.1
+[00:57:53] Run directory: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4
+[00:57:53] CSV output: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/fpm_metrics.csv
+[00:57:53] FPM detail CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/fpm_metrics_detail.csv
+[00:57:53] FPM phase CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/fpm_metrics_phase.csv
+[00:57:53] Request workload CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/request_workload.csv
+[00:57:53] vLLM metadata JSON: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/vllm_metadata.json
+[00:57:53] vLLM effective config JSON: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/effective_vllm_config.json
+[00:57:53] Measured phases: context,decode,mixed
+[00:57:53] Real workload: dataset=OpenAssistant/oasst1, shape_source=synthetic, requests=8, concurrency=4, ISL=8192..8192 mean~8192.0, OSL=1024..1024 mean~1024.0
+[00:57:53] Warmup workload CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/warmup_workload.csv
+[00:57:53] Refreshing local file-discovery mtimes every 2s (pid 226650)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+INFO 06-24 00:58:17 [nixl_utils.py:20] Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare memory leak in UCX when using NIXL.
+INFO 06-24 00:58:17 [nixl_utils.py:32] NIXL is available
+INFO 06-24 00:58:17 [model.py:555] Resolved architecture: Qwen3ForCausalLM
+INFO 06-24 00:58:17 [model.py:1680] Using max model len 40960
+INFO 06-24 00:58:17 [vllm.py:840] Asynchronous scheduling is enabled.
+INFO 06-24 00:58:17 [kernel.py:205] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'])
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+INFO 06-24 00:58:21 [compilation.py:303] Enabled custom fusions: allreduce_rms
+[00:58:23] Starting frontend container dynamo-fpm-20260624-005734-225352-frontend
+9bf40c697a3a219baeb6093ea53038530b6d0d93460cbe3e1096d0e444f120fe
+[00:58:23] Starting vLLM worker container dynamo-fpm-20260624-005734-225352-worker
+5aa063122928ffb0a2386a7d3c6d0511de9a45fd475677743854f7c57f6641f7
+[00:58:24] Waiting for frontend health
+[00:58:26] Waiting for model registration (Qwen/Qwen3-32B)
+[01:00:33] Sending 4 warmup variable ISL/OSL requests at concurrency 32 (ISL 8192..8192, OSL 1024..1024)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+prompt_token_mode=safe_ascii candidate_count=90839
+prompt_token_config vocab_size=151936 excluded_token_count=14
+wrote_workload=/work/warmup_workload.csv
+request_ok index=0 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.829
+request_ok index=1 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.867
+request_ok index=2 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.896
+request_ok index=3 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=8.176
+completed=4/4 failed=0 elapsed_seconds=8.182
+[01:00:50] Waiting 1s after warmup before starting FPM collector
+[01:00:51] Starting FPM collector container dynamo-fpm-20260624-005734-225352-collector
+63c6a6c4ef8db875b94578cbdc00e0ee97077dd1e70511c175f9cfb6a2ad67b9
+[01:00:52] Sending 8 real-workload requests at concurrency 4 (dataset OpenAssistant/oasst1)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+prompt_token_mode=safe_ascii candidate_count=90839
+prompt_token_config vocab_size=151936 excluded_token_count=14
+real_workload_shapes source='synthetic_large_shape_distribution' count=8
+wrote_workload=/work/request_workload.csv
+request_ok index=4 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.487
+request_ok index=5 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.606
+request_ok index=6 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.816
+request_ok index=7 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=8.025
+request_ok index=8 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.423
+request_ok index=9 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.328
+request_ok index=10 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.141
+request_ok index=11 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=6.955
+completed=8/8 failed=0 elapsed_seconds=14.985
+[01:01:16] Collecting for 3s after requests
+[01:01:19] FPM phase rows written to /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/fpm_metrics_phase.csv
+[01:01:19] Collected 2070 FPM rows at /home/ubuntu/aic-h100-repro/fpm/qwen32/c4/fpm_metrics.csv
+[01:01:19] Phase row counts:
+  context: 4
+  mixed: 30
+  decode: 2036
+[01:01:19] First rows:
+num_context_tokens,num_decode_tokens,latency_ms
+2048,0,52.588
+2048,0,46.978
+2048,0,48.631
+2048,0,50.415
+2047,1,50.512
+2047,1,50.522
+2047,1,50.692
+2047,1,51.016
+2047,1,51.641
+2046,2,53.243
+2046,2,52.708
+[01:01:19] Done

@@ -1,0 +1,34 @@
+<!doctype html><html><head><meta charset=utf-8><title>FPM vs E2E - Qwen3-32B TP8 8k/1k 8xH100</title>
+<style>body{font-family:system-ui,Arial;margin:24px;color:#1a1a1a}table{border-collapse:collapse;margin:12px 0}
+td,th{border:1px solid #ccc;padding:6px 10px;text-align:right;font-variant-numeric:tabular-nums}th{background:#eee}
+.meta{color:#555;font-size:13px;line-height:1.6}canvas{background:#fff;border:1px solid #ddd}
+.badge{background:#1a7f37;color:#fff;padding:2px 8px;border-radius:10px;font-size:12px}</style></head><body>
+<h1>FPM (pure-decode) vs E2E (realized serving) &mdash; Qwen3-32B dense, TP=8, 8k/1k, 8&times;H100 <span class=badge>apples-to-apples</span></h1>
+<div class=meta>Identical engine (tp8/max_num_seqs128/max_num_batched_tokens2048/bf16/kv-auto/prefix-cache/cudagraph FULL_AND_PIECEWISE/maxlen40960, vLLM 0.20.1) verified from served config.
+Same workload: ISL=8192, OSL=1024 fixed, ignore_eos, closed-loop concurrency. FPM TPOT = pure full-batch decode-step latency (ZMQ); E2E TPOT/TTFT = client-side streaming (vllm bench serve).
+The FPM&rarr;E2E TPOT gap = real serving overhead (chunked-prefill interference + scheduling), ~0 at c=1, growing with concurrency.</div>
+<canvas id=cv width=760 height=440></canvas>
+<table><tr><th>concurrency</th><th>FPM TPOT (ms)</th><th>E2E TPOT p50 (ms)</th><th>&Delta; (ms)</th><th>ratio</th><th>E2E TTFT p50 (ms)</th><th>E2E E2EL p50 (ms)</th><th>FPM decode tok/s/GPU</th><th>E2E out tok/s/GPU</th><th>interactivity tok/s/user</th></tr>
+<tr><td>1</td><td>6.109</td><td>6.211</td><td>0.102</td><td>1.017</td><td>231.3</td><td>6584.5</td><td>20.5</td><td>19.5</td><td>161.0</td></tr>
+<tr><td>4</td><td>6.484</td><td>6.589</td><td>0.105</td><td>1.016</td><td>101.1</td><td>6843.7</td><td>77.1</td><td>74.5</td><td>151.8</td></tr>
+<tr><td>16</td><td>8.198</td><td>9.589</td><td>1.391</td><td>1.17</td><td>579.6</td><td>10742.5</td><td>244.0</td><td>193.9</td><td>104.3</td></tr>
+<tr><td>64</td><td>13.493</td><td>18.968</td><td>5.475</td><td>1.406</td><td>1012.6</td><td>22087.0</td><td>592.9</td><td>350.1</td><td>52.7</td></tr>
+<tr><td>128</td><td>20.306</td><td>21.097</td><td>0.791</td><td>1.039</td><td>1938.7</td><td>24711.6</td><td>787.9</td><td>503.1</td><td>47.4</td></tr></table>
+<div class=meta>Sources: FPM <code>fpm_golden_runs/fpm_h100_qwen32_tp8_8k1k_pareto_*/</code> &middot; E2E <code>artifacts/e2e/e2e_c*.json</code> &middot; Linear AIC-1181. Not browser-validated.</div>
+<script>
+const pts=[{"c": 1, "fpm": 6.109, "e2e": 6.211, "ttft": 231.3, "thr": 19.5, "fthr": "20.5"}, {"c": 4, "fpm": 6.484, "e2e": 6.589, "ttft": 101.1, "thr": 74.5, "fthr": "77.1"}, {"c": 16, "fpm": 8.198, "e2e": 9.589, "ttft": 579.6, "thr": 193.9, "fthr": "244.0"}, {"c": 64, "fpm": 13.493, "e2e": 18.968, "ttft": 1012.6, "thr": 350.1, "fthr": "592.9"}, {"c": 128, "fpm": 20.306, "e2e": 21.097, "ttft": 1938.7, "thr": 503.1, "fthr": "787.9"}];const cv=document.getElementById('cv'),x=cv.getContext('2d');
+const W=cv.width,H=cv.height,PL=70,PB=46;
+const xs=pts.map(p=>p.thr),ymax=Math.max(...pts.map(p=>p.e2e))*1.15,xmax=Math.max(...xs)*1.1;
+function X(v){return PL+(v/xmax)*(W-PL-20)}function Y(v){return H-PB-(v/ymax)*(H-PB-20)}
+x.strokeStyle='#999';x.beginPath();x.moveTo(PL,10);x.lineTo(PL,H-PB);x.lineTo(W-10,H-PB);x.stroke();
+x.fillStyle='#333';x.font='12px system-ui';x.fillText('E2E output tok/s/GPU',W/2-50,H-10);
+x.save();x.translate(16,H/2+30);x.rotate(-Math.PI/2);x.fillText('TPOT (ms)',0,0);x.restore();
+x.strokeStyle='#eee';x.fillStyle='#666';
+for(let i=0;i<=5;i++){let gx=PL+i/5*(W-PL-20);x.beginPath();x.moveTo(gx,10);x.lineTo(gx,H-PB);x.stroke();x.fillText((xmax*i/5).toFixed(0),gx-10,H-PB+15);}
+for(let i=0;i<=5;i++){let gy=H-PB-i/5*(H-PB-20);x.beginPath();x.moveTo(PL,gy);x.lineTo(W-10,gy);x.stroke();x.fillText((ymax*i/5).toFixed(1),PL-42,gy+4);}
+function line(key,col){x.strokeStyle=col;x.lineWidth=2;x.beginPath();pts.forEach((p,i)=>{let px=X(p.thr),py=Y(p[key]);i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();
+pts.forEach(p=>{x.fillStyle=col;x.beginPath();x.arc(X(p.thr),Y(p[key]),4,0,7);x.fill();});}
+line('fpm','#1a7f37');line('e2e','#1f6feb');
+x.fillStyle='#000';pts.forEach(p=>x.fillText('c='+p.c,X(p.thr)+7,Y(p.e2e)-6));
+x.fillStyle='#1a7f37';x.fillText('FPM pure-decode TPOT',W-220,24);x.fillStyle='#1f6feb';x.fillText('E2E realized TPOT p50',W-220,42);
+</script></body></html>

@@ -1,0 +1,147 @@
++ bash collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh --model Qwen/Qwen3-32B --tp-size 8 --ep-size 1 --run-dir /home/ubuntu/aic-h100-repro/fpm/qwen32/c16 --phases context,decode,mixed --contexts 128,1024,4096 --context-repeats 6 --decode-batches 1,4,16 --decode-past-kv 8192 --decode-osl 8 --decode-repeats 6 --image nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0 --request-allow-failures 0 --prompt-token-mode safe_ascii --real-workload --real-workload-requests 32 --real-workload-concurrency 16 --real-workload-dataset OpenAssistant/oasst1 --real-workload-shape-source synthetic --real-workload-isl-min 8192 --real-workload-isl-max 8192 --real-workload-isl-mean 8192.0 --real-workload-osl-min 1024 --real-workload-osl-max 1024 --real-workload-osl-mean 1024.0 --warmup-requests 4
+[01:01:22] Verifying image 'nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0' uses vLLM 0.20.1
+[01:01:40] Run directory: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16
+[01:01:40] CSV output: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/fpm_metrics.csv
+[01:01:40] FPM detail CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/fpm_metrics_detail.csv
+[01:01:40] FPM phase CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/fpm_metrics_phase.csv
+[01:01:40] Request workload CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/request_workload.csv
+[01:01:40] vLLM metadata JSON: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/vllm_metadata.json
+[01:01:40] vLLM effective config JSON: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/effective_vllm_config.json
+[01:01:40] Measured phases: context,decode,mixed
+[01:01:40] Real workload: dataset=OpenAssistant/oasst1, shape_source=synthetic, requests=32, concurrency=16, ISL=8192..8192 mean~8192.0, OSL=1024..1024 mean~1024.0
+[01:01:40] Warmup workload CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/warmup_workload.csv
+[01:01:40] Refreshing local file-discovery mtimes every 2s (pid 236995)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+INFO 06-24 01:02:04 [nixl_utils.py:20] Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare memory leak in UCX when using NIXL.
+INFO 06-24 01:02:04 [nixl_utils.py:32] NIXL is available
+INFO 06-24 01:02:04 [model.py:555] Resolved architecture: Qwen3ForCausalLM
+INFO 06-24 01:02:04 [model.py:1680] Using max model len 40960
+INFO 06-24 01:02:04 [vllm.py:840] Asynchronous scheduling is enabled.
+INFO 06-24 01:02:04 [kernel.py:205] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'])
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+INFO 06-24 01:02:09 [compilation.py:303] Enabled custom fusions: allreduce_rms
+[01:02:11] Starting frontend container dynamo-fpm-20260624-010122-235713-frontend
+7a7dd1589e39d370b2dca68be7e6a95a4818f34053d3968ff101852f04ea3090
+[01:02:11] Starting vLLM worker container dynamo-fpm-20260624-010122-235713-worker
+7ec985bcac36f306cba7cf7b8c7335cd008ca61f97c3ddafbd2e56a5d1c35635
+[01:02:11] Waiting for frontend health
+[01:02:14] Waiting for model registration (Qwen/Qwen3-32B)
+[01:04:24] Sending 4 warmup variable ISL/OSL requests at concurrency 32 (ISL 8192..8192, OSL 1024..1024)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+prompt_token_mode=safe_ascii candidate_count=90839
+prompt_token_config vocab_size=151936 excluded_token_count=14
+wrote_workload=/work/warmup_workload.csv
+request_ok index=3 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.842
+request_ok index=1 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.885
+request_ok index=2 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.913
+request_ok index=0 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=8.202
+completed=4/4 failed=0 elapsed_seconds=8.203
+[01:04:41] Waiting 1s after warmup before starting FPM collector
+[01:04:42] Starting FPM collector container dynamo-fpm-20260624-010122-235713-collector
+e9a646557df9aeaecc70d3b6c6ec0fc22d6af6e8e1a93a40c2be71747c98fad3
+[01:04:44] Sending 32 real-workload requests at concurrency 16 (dataset OpenAssistant/oasst1)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+prompt_token_mode=safe_ascii candidate_count=90839
+prompt_token_config vocab_size=151936 excluded_token_count=14
+real_workload_shapes source='synthetic_large_shape_distribution' count=32
+wrote_workload=/work/request_workload.csv
+request_ok index=4 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=11.609
+request_ok index=6 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=11.735
+request_ok index=11 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=11.947
+request_ok index=5 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=12.171
+request_ok index=12 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=12.380
+request_ok index=16 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=12.590
+request_ok index=15 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=12.807
+request_ok index=14 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=13.027
+request_ok index=8 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=13.248
+request_ok index=10 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=13.458
+request_ok index=7 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=13.673
+request_ok index=18 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=13.869
+request_ok index=19 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.080
+request_ok index=17 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.297
+request_ok index=9 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.522
+request_ok index=13 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.722
+request_ok index=20 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=11.384
+request_ok index=21 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=11.287
+request_ok index=22 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=11.101
+request_ok index=23 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=10.917
+request_ok index=24 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=10.730
+request_ok index=25 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=10.544
+request_ok index=26 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=10.359
+request_ok index=27 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=10.171
+request_ok index=28 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=9.988
+request_ok index=29 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=9.804
+request_ok index=30 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=9.619
+request_ok index=31 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=9.434
+request_ok index=32 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=9.248
+request_ok index=33 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=9.060
+request_ok index=34 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=8.872
+request_ok index=35 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=8.690
+completed=32/32 failed=0 elapsed_seconds=23.427
+[01:05:16] Collecting for 3s after requests
+[01:05:20] FPM phase rows written to /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/fpm_metrics_phase.csv
+[01:05:20] Collected 2118 FPM rows at /home/ubuntu/aic-h100-repro/fpm/qwen32/c16/fpm_metrics.csv
+[01:05:20] Phase row counts:
+  context: 4
+  mixed: 126
+  decode: 1988
+[01:05:20] First rows:
+num_context_tokens,num_decode_tokens,latency_ms
+2048,0,54.458
+2048,0,47.124
+2048,0,48.656
+2048,0,50.601
+2047,1,50.396
+2047,1,50.465
+2047,1,50.592
+2047,1,50.718
+2047,1,50.562
+2046,2,50.459
+2046,2,50.863
+[01:05:20] Done

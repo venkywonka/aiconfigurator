@@ -1,0 +1,243 @@
++ bash collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh --model Qwen/Qwen3-32B --tp-size 8 --ep-size 1 --run-dir /home/ubuntu/aic-h100-repro/fpm/qwen32/c64 --phases context,decode,mixed --contexts 128,1024,4096 --context-repeats 6 --decode-batches 1,4,16 --decode-past-kv 8192 --decode-osl 8 --decode-repeats 6 --image nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0 --request-allow-failures 0 --prompt-token-mode safe_ascii --real-workload --real-workload-requests 128 --real-workload-concurrency 64 --real-workload-dataset OpenAssistant/oasst1 --real-workload-shape-source synthetic --real-workload-isl-min 8192 --real-workload-isl-max 8192 --real-workload-isl-mean 8192.0 --real-workload-osl-min 1024 --real-workload-osl-max 1024 --real-workload-osl-mean 1024.0 --warmup-requests 4
+[01:05:22] Verifying image 'nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0' uses vLLM 0.20.1
+[01:05:40] Run directory: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64
+[01:05:40] CSV output: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/fpm_metrics.csv
+[01:05:40] FPM detail CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/fpm_metrics_detail.csv
+[01:05:40] FPM phase CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/fpm_metrics_phase.csv
+[01:05:40] Request workload CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/request_workload.csv
+[01:05:40] vLLM metadata JSON: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/vllm_metadata.json
+[01:05:40] vLLM effective config JSON: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/effective_vllm_config.json
+[01:05:40] Measured phases: context,decode,mixed
+[01:05:40] Real workload: dataset=OpenAssistant/oasst1, shape_source=synthetic, requests=128, concurrency=64, ISL=8192..8192 mean~8192.0, OSL=1024..1024 mean~1024.0
+[01:05:40] Warmup workload CSV: /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/warmup_workload.csv
+[01:05:40] Refreshing local file-discovery mtimes every 2s (pid 247384)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+INFO 06-24 01:06:04 [nixl_utils.py:20] Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare memory leak in UCX when using NIXL.
+INFO 06-24 01:06:04 [nixl_utils.py:32] NIXL is available
+INFO 06-24 01:06:04 [model.py:555] Resolved architecture: Qwen3ForCausalLM
+INFO 06-24 01:06:04 [model.py:1680] Using max model len 40960
+INFO 06-24 01:06:04 [vllm.py:840] Asynchronous scheduling is enabled.
+INFO 06-24 01:06:04 [kernel.py:205] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'])
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+INFO 06-24 01:06:09 [compilation.py:303] Enabled custom fusions: allreduce_rms
+[01:06:11] Starting frontend container dynamo-fpm-20260624-010522-246115-frontend
+59f7de4e10763396bfcbe954d2187a90a68c6d0499bdc337c527ff4c5edac78e
+[01:06:11] Starting vLLM worker container dynamo-fpm-20260624-010522-246115-worker
+a5bf67e444819912bdf78b0d2f2bf23457d9564fadb53d7c108d2f3f98e58d28
+[01:06:11] Waiting for frontend health
+[01:06:14] Waiting for model registration (Qwen/Qwen3-32B)
+[01:08:24] Sending 4 warmup variable ISL/OSL requests at concurrency 32 (ISL 8192..8192, OSL 1024..1024)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+prompt_token_mode=safe_ascii candidate_count=90839
+prompt_token_config vocab_size=151936 excluded_token_count=14
+wrote_workload=/work/warmup_workload.csv
+request_ok index=0 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.841
+request_ok index=1 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.878
+request_ok index=2 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=7.907
+request_ok index=3 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=8.190
+completed=4/4 failed=0 elapsed_seconds=8.195
+[01:08:41] Waiting 1s after warmup before starting FPM collector
+[01:08:42] Starting FPM collector container dynamo-fpm-20260624-010522-246115-collector
+30593fdcf7d15a17f2c2769070bda24f3c2331d28430f43fa44122094245df0b
+[01:08:43] Sending 128 real-workload requests at concurrency 64 (dataset OpenAssistant/oasst1)
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+prompt_token_mode=safe_ascii candidate_count=90839
+prompt_token_config vocab_size=151936 excluded_token_count=14
+real_workload_shapes source='synthetic_large_shape_distribution' count=128
+wrote_workload=/work/request_workload.csv
+request_ok index=38 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=25.354
+request_ok index=37 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=25.543
+request_ok index=31 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=25.750
+request_ok index=46 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=25.941
+request_ok index=64 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=26.127
+request_ok index=27 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=26.418
+request_ok index=42 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=26.616
+request_ok index=60 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=26.799
+request_ok index=49 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=27.046
+request_ok index=35 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=27.300
+request_ok index=34 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=27.526
+request_ok index=21 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=27.762
+request_ok index=8 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=28.010
+request_ok index=6 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=28.235
+request_ok index=7 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=28.453
+request_ok index=12 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=28.664
+request_ok index=23 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=28.873
+request_ok index=32 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=29.084
+request_ok index=47 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=29.276
+request_ok index=59 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=29.475
+request_ok index=9 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=29.789
+request_ok index=65 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=29.906
+request_ok index=62 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=30.134
+request_ok index=14 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=30.436
+request_ok index=57 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=30.587
+request_ok index=4 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=30.909
+request_ok index=61 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=31.028
+request_ok index=55 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=31.262
+request_ok index=5 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=31.569
+request_ok index=28 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=31.751
+request_ok index=22 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=31.980
+request_ok index=39 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=32.175
+request_ok index=10 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=32.500
+request_ok index=48 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=32.656
+request_ok index=19 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=32.928
+request_ok index=25 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=33.144
+request_ok index=11 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=33.382
+request_ok index=20 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=33.590
+request_ok index=45 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=33.767
+request_ok index=13 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=34.039
+request_ok index=51 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=34.198
+request_ok index=50 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=34.426
+request_ok index=30 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=34.687
+request_ok index=24 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=34.917
+request_ok index=40 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=35.119
+request_ok index=29 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=35.408
+request_ok index=67 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=35.555
+request_ok index=66 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=35.777
+request_ok index=63 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=36.007
+request_ok index=41 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=36.279
+request_ok index=52 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=36.474
+request_ok index=17 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=36.757
+request_ok index=43 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=36.944
+request_ok index=18 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=37.199
+request_ok index=15 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=37.425
+request_ok index=54 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=37.633
+request_ok index=26 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=37.911
+request_ok index=53 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=38.085
+request_ok index=58 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=38.299
+request_ok index=44 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=38.547
+request_ok index=33 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=38.795
+request_ok index=36 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=39.013
+request_ok index=16 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=39.256
+request_ok index=56 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=39.461
+request_ok index=68 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=25.007
+request_ok index=69 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=24.886
+request_ok index=70 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=24.740
+request_ok index=71 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=24.573
+request_ok index=72 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=24.406
+request_ok index=73 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=24.239
+request_ok index=74 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=24.073
+request_ok index=75 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=23.903
+request_ok index=76 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=23.745
+request_ok index=77 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=23.576
+request_ok index=78 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=23.405
+request_ok index=79 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=23.239
+request_ok index=80 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=23.069
+request_ok index=81 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=22.900
+request_ok index=82 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=22.734
+request_ok index=83 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=22.563
+request_ok index=84 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=22.409
+request_ok index=85 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=22.242
+request_ok index=86 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=22.075
+request_ok index=87 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=21.909
+request_ok index=88 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=21.735
+request_ok index=89 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=21.566
+request_ok index=90 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=21.392
+request_ok index=91 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=21.223
+request_ok index=92 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=21.045
+request_ok index=93 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=20.877
+request_ok index=94 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=20.704
+request_ok index=95 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=20.531
+request_ok index=96 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=20.362
+request_ok index=97 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=20.192
+request_ok index=98 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=20.020
+request_ok index=99 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=19.846
+request_ok index=100 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=19.609
+request_ok index=101 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=19.437
+request_ok index=102 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=19.256
+request_ok index=103 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=19.075
+request_ok index=104 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=18.898
+request_ok index=105 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=18.722
+request_ok index=106 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=18.543
+request_ok index=107 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=18.363
+request_ok index=108 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=18.178
+request_ok index=109 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=18.003
+request_ok index=110 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=17.818
+request_ok index=111 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=17.632
+request_ok index=112 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=17.445
+request_ok index=113 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=17.207
+request_ok index=114 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=17.022
+request_ok index=115 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=16.837
+request_ok index=116 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=16.645
+request_ok index=117 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=16.463
+request_ok index=118 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=16.272
+request_ok index=119 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=16.081
+request_ok index=120 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=15.890
+request_ok index=121 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=15.700
+request_ok index=122 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=15.509
+request_ok index=123 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=15.264
+request_ok index=124 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=15.067
+request_ok index=125 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.878
+request_ok index=126 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.681
+request_ok index=127 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.487
+request_ok index=128 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.290
+request_ok index=129 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=14.093
+request_ok index=130 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=13.900
+request_ok index=131 status=200 target_isl=8192 target_osl=1024 prompt_tokens=8192 elapsed_seconds=13.651
+completed=128/128 failed=0 elapsed_seconds=53.210
+[01:09:46] Collecting for 3s after requests
+[01:09:49] FPM phase rows written to /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/fpm_metrics_phase.csv
+[01:09:49] Collected 2317 FPM rows at /home/ubuntu/aic-h100-repro/fpm/qwen32/c64/fpm_metrics.csv
+[01:09:49] Phase row counts:
+  context: 4
+  mixed: 522
+  decode: 1791
+[01:09:49] First rows:
+num_context_tokens,num_decode_tokens,latency_ms
+2048,0,184.758
+2048,0,162.463
+2048,0,115.212
+2048,0,90.220
+2047,1,105.350
+2047,1,91.558
+2047,1,85.272
+2047,1,84.125
+2047,1,84.624
+2046,2,82.933
+2046,2,81.648
+[01:09:49] Done
