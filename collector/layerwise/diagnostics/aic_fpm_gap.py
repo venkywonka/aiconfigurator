@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 import statistics
 import sys
 from collections import defaultdict
@@ -233,6 +234,64 @@ def predict_decode(backend, model, database, rc, *, batch_size, past_kv, api):
     except Exception as exc:  # noqa: BLE001
         return None, "n/a", _status_for_exception(exc, api)
     return float(sum(latency.values())), _classify_source(sources), ST_OK
+
+
+# Comm kernels in AIC's layerwise latency_dict are collective ops: TP allreduce and
+# MoE expert all-to-all. Compute is the dense per-layer forward (`*_layerwise`).
+# Everything else (scheduler overhead/residual) is "other". See public layerwise op
+# naming in src/aiconfigurator/sdk/operations.
+_AIC_COMM_KEY_RE = re.compile(r"(allreduce|alltoall|all_to_all|all_gather|reduce_scatter)")
+
+
+def _split_latency(latency: dict[str, float]) -> tuple[float, float, float]:
+    """Split an AIC layerwise latency_dict into (compute_ms, comm_ms, other_ms).
+
+    compute + comm + other == sum(latency.values()) == predict_*()'s total, so the
+    split is loss-free and the downstream decomposition identity stays exact.
+    """
+    compute = comm = other = 0.0
+    for key, value in latency.items():
+        val = float(value)
+        if key.endswith("layerwise"):
+            compute += val
+        elif _AIC_COMM_KEY_RE.search(key):
+            comm += val
+        else:
+            other += val
+    return compute, comm, other
+
+
+def predict_context_breakdown(backend, model, database, rc, *, ctx_tokens, ctx_prefix_tokens, api):
+    """Like predict_context, but returns (compute_ms, comm_ms, total_ms, source, status)."""
+    try:
+        latency, _, sources = backend._get_context_step_latency(
+            model,
+            database,
+            rc,
+            ctx_tokens=ctx_tokens,
+            ctx_kv_tokens=ctx_prefix_tokens,  # batch=1
+            ctx_requests=1,
+        )
+    except Exception as exc:  # noqa: BLE001 - mapped to status, never silently dropped
+        return None, None, None, "n/a", _status_for_exception(exc, api)
+    compute, comm, other = _split_latency(latency)
+    return compute, comm, compute + comm + other, _classify_source(sources), ST_OK
+
+
+def predict_decode_breakdown(backend, model, database, rc, *, batch_size, past_kv, api):
+    """Like predict_decode, but returns (compute_ms, comm_ms, total_ms, source, status)."""
+    try:
+        latency, _, sources = backend._get_decode_step_latency(
+            model,
+            database,
+            rc,
+            batch_size=batch_size,
+            past_kv=past_kv,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, None, None, "n/a", _status_for_exception(exc, api)
+    compute, comm, other = _split_latency(latency)
+    return compute, comm, compute + comm + other, _classify_source(sources), ST_OK
 
 
 # ---------------------------------------------------------------------------
