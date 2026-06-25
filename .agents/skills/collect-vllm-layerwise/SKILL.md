@@ -33,6 +33,13 @@ Read [references/layerwise-commands.md](references/layerwise-commands.md) for th
 - For FP8 checkpoints, do not force KV FP8 unless that is the experiment. `--kv-quant fp8` forces `--kv-cache-dtype fp8`; default vLLM FP8 checkpoint behavior is measured with `--kv-quant bf16` so KV dtype remains `auto`.
 - GPT-OSS layerwise specs automatically mirror vLLM's GPT-OSS runtime defaults for FP8 KV cache, CUDA graph capture size, and stream interval. Do not pass real `--tensor-parallel-size` or `--enable-expert-parallel` through layerwise; TP/EP are simulated/added analytically. Context and decode collection use prefix caching to create arbitrary `past_kv` points.
 
+## Step Markers (Span vs FPM/Attribute)
+
+`collector/layerwise/vllm/` has two NVTX step markers, injected via `sitecustomize.py`:
+
+- `vllm_step_marker.py` (`LAYERWISE_STEP_MARKER=1`): the existing single-stream marker for the span-latency layerwise collector above.
+- `dynamo_step_marker.py` (`LAYERWISE_DYNAMO_STEP_MARKER=1`): a sibling for the FPM/attribute path, where the worker runs as `python3 -m dynamo.vllm`. It wraps `GPUModelRunner.execute_model` and emits REAL-batch labels (`bench_step::N<step>::bs<decode_batch>::past<mean_kv>`) instead of counter-mode single-stream labels. Pointer only -- the full attributed-FPM workflow lives in the `collect-fpm-ground-truth` skill.
+
 ## Smoke Validation
 
 Use the reference smoke command after collector changes. A passing Qwen3-32B TP1 smoke writes four `layerwise.csv` rows, one exported `.sqlite`, one `.nsys-rep`, and four `success` status events. With the default span latency source, `meta.attribution_source=nvtx_span` is acceptable if `attributed_kernels` and per-row `kernel_count` are nonzero. Require CUPTI-backed attribution only when collecting GPU-sum or GPU-capped latency.

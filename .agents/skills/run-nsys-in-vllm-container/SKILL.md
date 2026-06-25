@@ -57,6 +57,44 @@ For `--latency-source gpu` or `gpu_capped`, require CUPTI-backed attribution; if
 
 On this host, prefer `/opt/nvidia/nsight-systems/2025.6.3` for CUDA 12.9 containers such as `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0`. A smoke test with `/opt/nvidia/nsight-systems/2024.6.2` and `--capture-range=cudaProfilerApi` fired `cudaProfilerStart/Stop` but finalized with an empty `Generated:` line and no `.nsys-rep`; the same test with 2025.6.3 produced a valid report. Mounting 2024.6.2 into `vllm/vllm-openai:v0.20.1` made `nsys` runnable, but both with and without `LD_LIBRARY_PATH=$NSYS_HOME/target-linux-x64` the exported sqlite stayed NVTX-only. In these cases, do not use the CSV latency for layerwise data. Prefer a container/image with native Nsight/CUPTI support, or keep iterating on container privileges/CUPTI injection until the validation shows `attribution_source=cupti`.
 
+## Attributed-FPM Path (Dynamo Worker Under Nsys)
+
+The FPM real-workload attribute path (`STAGES=attribute` in `collector/layerwise/reproduce_layerwise_fpm.sh:stage_attribute`) runs the vLLM worker as `python3 -m dynamo.vllm` under nsys. It needs different nsys handling than the span-latency layerwise collector above.
+
+### The worker image has no `nsys` on PATH -- bind-mount the host Nsight install
+
+The Dynamo vLLM worker image does not ship `nsys`. Instead of relying on container PATH, the FPM shell bind-mounts the host Nsight tree into the worker and points at the host binary:
+
+- `--nsys-profile-worker` / `--nsys-cuda-profiler-window` are threaded `collector/layerwise/fpm/collect.py` (arg parsing) -> `collector/layerwise/fpm/docker.py:build_collect_command` (appends `--nsys-profile-worker` and `--nsys-cuda-profiler-window <window>`) -> `collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh`.
+- `NSYS_BIN` (the nsys binary path inside the worker, e.g. `$NSYS_ROOT/bin/nsys`) and `NSYS_HOST_DIR` (the Nsight root to mount, e.g. `$NSYS_ROOT`) are read by `collect_fpm_metrics.sh` (defaults: `NSYS_BIN=nsys`, `NSYS_HOST_DIR=`). When `NSYS_HOST_DIR` is set it is bind-mounted read-only into the worker (`-v "${NSYS_HOST_DIR}:${NSYS_HOST_DIR}:ro"`); if `NSYS_HOST_DIR` is empty and `NSYS_BIN` is an absolute path, the shell derives the host dir from `dirname "${NSYS_BIN}"`.
+- The driver propagates these as plain env (`NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT`), and `collect.py` runs the inner shell with `os.environ.copy()` (`collector/layerwise/fpm/collect.py:144`), so the env reaches `collect_fpm_metrics.sh` without explicit flags.
+
+### Per-step NVTX is a Dynamo-side `execute_model` wrapper, not the counter-mode marker
+
+For real multi-request FPM traffic, use `collector/layerwise/vllm/dynamo_step_marker.py`, NOT `vllm_step_marker.py`:
+
+- `dynamo_step_marker.py` monkeypatches `vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model` (the GPU forward) and reads the REAL per-step batch state from the `scheduler_output` arg, emitting labels `bench_step::N<step:07d>::bs<decode_batch>::past<mean_kv:06d>`.
+- It is injected via `collector/layerwise/vllm/sitecustomize.py` when `LAYERWISE_DYNAMO_STEP_MARKER=1` and the repo dir is on `PYTHONPATH` (so the interpreter imports `sitecustomize` at startup inside the `python3 -m dynamo.vllm` worker).
+- Do NOT use `vllm_step_marker.py` here: in the Dynamo launch context it is never imported, and its counter-mode label assumes `isl=1` single-stream (`past_kv = n - 1`), which is wrong for a real multi-request workload. (See the docstring in `dynamo_step_marker.py` for the Phase-0 finding.)
+
+### Capture is session-gated, not `-c cudaProfilerApi`
+
+`collect_fpm_metrics.sh` defaults `NSYS_PROFILE_TRAFFIC_ONLY=1` and gates the capture with `nsys start --session` / `nsys stop --session` around the real workload, NOT `--capture-range=cudaProfilerApi`. Consequences:
+
+- The `--nsys-cuda-profiler-window` window only LABELS steps (via the NVTX marker); it does NOT bound capture. ALL traffic steps are captured.
+- Trace size is therefore governed by OSL / number of requests. Keep OSL short to bound `.nsys-rep` / `.sqlite` size -- box disk is the binding constraint on 8xh100-layerwise.
+
+### Export `.nsys-rep` -> `.sqlite` before decompose
+
+The decompose reads a `.sqlite`, not the raw `.nsys-rep`. The driver (and the manual fallback) export with:
+
+```bash
+nsys export --type sqlite --force-overwrite true -o OUT.sqlite RUN.nsys-rep
+python -m collector.layerwise.diagnostics.aic_fpm_attribute --sqlite OUT.sqlite --fpm-run <attribute dir> --tp 8 ...
+```
+
+`aic_fpm_attribute.py` loads the sqlite via `collector/layerwise/diagnostics/analyze_nsys_comm_overlap.py`. If `stage_attribute` aborts after a valid capture, run these two steps manually rather than re-collecting.
+
 ## Notes For This Repo
 
 - The vLLM collector launches `nsys profile` from inside the scheduler process, so `nsys` must be visible inside the container that runs `python -m collector.layerwise.vllm.collect`.
