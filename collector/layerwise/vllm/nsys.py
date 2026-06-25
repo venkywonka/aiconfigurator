@@ -79,29 +79,31 @@ def _aggregate_step_rows(rows: list[dict[str, Any]]) -> dict[tuple[int, int, int
 def _filter_boundary_discards(
     rows: list[dict[str, Any]], discard_first_n: int = 3
 ) -> list[dict[str, Any]]:
-    """Drop the first ``discard_first_n`` steps of each capture cohort.
+    """Drop the first ``discard_first_n`` steps of the capture, CHRONOLOGICALLY.
 
-    A windowed nsys capture opens with ``cudaProfilerStart`` followed by
-    ``torch.cuda.synchronize()`` (worker.py ``_cuda_profiler_call``), which drains
-    the GPU pipeline. The first few steps after that sync start from an empty
-    pipeline, so their kernel occupancy/overlap is a drain artifact, not steady
-    state. We discard them per ``(batch_size, past_kv, measure_run)`` cohort,
-    relative to each cohort's minimum step ordinal -- the ordinal ``N`` comes from
-    the ``bench_step::N...`` NVTX label, so the window boundary is implicit in the
-    step sequence (no explicit window-index field exists in the row).
+    The capture opens with a session/profiler start + ``torch.cuda.synchronize()``
+    (worker.py ``_cuda_profiler_call``), which drains the GPU pipeline. The first few
+    steps after that sync start from an empty pipeline, so their kernel occupancy /
+    overlap is a drain artifact, not steady state. The drain is CHRONOLOGICAL (the
+    earliest steps of the capture), so we discard by global step ordinal per
+    ``measure_run`` -- NOT per ``(batch_size, past_kv)`` shape. Per-shape cohorting is
+    wrong for continuous concurrent decode, where every step is a UNIQUE
+    ``(decode_batch, mean_kv)`` shape: each shape would be a 1-step cohort and a
+    nonzero discard would wipe the entire dataset (conc>1 yielded 0 shapes). Sequential
+    (conc1) decode happens to repeat shapes across requests, which masked this.
     """
     if discard_first_n <= 0:
         return list(rows)
-    cohort_min: dict[tuple[int, int, int], int] = {}
+    run_min: dict[int, int] = {}
     for row in rows:
-        cohort = (row["batch_size"], row["past_kv"], int(row.get("measure_run", 0)))
+        run = int(row.get("measure_run", 0))
         step = int(row["step"])
-        if cohort not in cohort_min or step < cohort_min[cohort]:
-            cohort_min[cohort] = step
+        if run not in run_min or step < run_min[run]:
+            run_min[run] = step
     kept: list[dict[str, Any]] = []
     for row in rows:
-        cohort = (row["batch_size"], row["past_kv"], int(row.get("measure_run", 0)))
-        if int(row["step"]) >= cohort_min[cohort] + discard_first_n:
+        run = int(row.get("measure_run", 0))
+        if int(row["step"]) >= run_min[run] + discard_first_n:
             kept.append(row)
     return kept
 

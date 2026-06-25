@@ -17,18 +17,28 @@ sys.modules.setdefault("torch.cuda", mock.Mock())
 sys.modules.setdefault("torch.cuda.nvtx", mock.Mock())
 
 
-def test_filter_boundary_discards_drops_first_n_per_cohort():
+def test_filter_boundary_discards_chronological_per_measure_run():
     from collector.layerwise.vllm.nsys import _filter_boundary_discards
 
+    # Discard is CHRONOLOGICAL per measure_run (NOT per (bs,past) shape): run_min[0]=0,
+    # keep step>=3 for BOTH shapes regardless of their own first step.
     rows = [{"step": s, "batch_size": 32, "past_kv": 100, "measure_run": 0} for s in range(10)]
     rows += [{"step": s, "batch_size": 64, "past_kv": 200, "measure_run": 0} for s in range(5, 12)]
     kept = _filter_boundary_discards(rows, discard_first_n=3)
-    a = [r for r in kept if r["batch_size"] == 32]
-    b = [r for r in kept if r["batch_size"] == 64]
-    # cohort A: min step 0 -> keep step>=3 (steps 3..9 = 7 rows)
-    assert min(r["step"] for r in a) == 3 and len(a) == 7
-    # cohort B: min step 5 -> keep step>=8 (steps 8..11 = 4 rows)
-    assert min(r["step"] for r in b) == 8 and len(b) == 4
+    assert all(r["step"] >= 3 for r in kept)
+    assert len([r for r in kept if r["batch_size"] == 32]) == 7   # steps 3..9
+    assert len([r for r in kept if r["batch_size"] == 64]) == 7   # steps 5..11 (all >=3)
+
+
+def test_filter_boundary_discards_keeps_unique_per_step_shapes():
+    # Regression for the conc>1 bug: continuous concurrent decode emits a UNIQUE
+    # (bs, past) every step. Per-shape cohorting would make each a 1-step cohort and
+    # wipe everything; chronological discard keeps all but the first N steps.
+    from collector.layerwise.vllm.nsys import _filter_boundary_discards
+
+    rows = [{"step": s, "batch_size": 16, "past_kv": 8000 + s, "measure_run": 0} for s in range(20)]
+    kept = _filter_boundary_discards(rows, discard_first_n=5)
+    assert len(kept) == 15 and min(r["step"] for r in kept) == 5
 
 
 def test_filter_boundary_discards_zero_is_noop():
