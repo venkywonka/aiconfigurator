@@ -161,3 +161,76 @@ def write_decomposition_csv(rows: list[dict[str, Any]], out_path: str) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({col: row.get(col, "") for col in cols})
+
+
+def _main(argv=None):
+    """CLI entry for the `attribute` driver stage: build AIC's layerwise predictor,
+    load the clean-lane FPM wall, reduce the profiled nsys lane, join + decompose,
+    and write the per-shape decomposition CSV.
+
+    All AIC wiring goes through aic_fpm_gap (symbols confirmed against the in-tree
+    module + the working slop/h100-dense-gap-analysis/make_ctx_concurrency_chart.py
+    usage): G._import_repo / G.DEFAULT_REPO_ROOT / G.build_model_and_db /
+    G.predict_decode_breakdown / G.MODEL_NAME / G.ST_OK are module-level on G, while
+    VLLMBackend / vllm_backend / RuntimeConfig / _load_fpm / _aggregate are in the
+    api dict returned by _import_repo. _DECODE_COMPUTE_BATCH_CAL stays 0.0 (matches
+    the headline 'layerwise' track), per spec.
+    """
+    import argparse
+    from pathlib import Path
+    import collector.layerwise.diagnostics.aic_fpm_gap as G
+
+    p = argparse.ArgumentParser(description="Attributed-FPM gap decomposition")
+    p.add_argument("--sqlite", required=True)
+    p.add_argument("--fpm-run", required=True, help="clean golden FPM run dir (authoritative wall)")
+    p.add_argument("--system", default="h100_sxm")
+    p.add_argument("--model", required=True)
+    p.add_argument("--tp", type=int, default=8)
+    p.add_argument("--discard-first-n", type=int, default=3)
+    p.add_argument("--out", required=True)
+    args = p.parse_args(argv)
+
+    api = G._import_repo(Path(G.DEFAULT_REPO_ROOT))
+    G.MODEL_NAME = args.model  # build_model_and_db + the decode KV-snap read this module global
+    backend = api["VLLMBackend"]()
+    api["vllm_backend"]._USE_LAYERWISE = True
+    api["vllm_backend"]._DECODE_COMPUTE_BATCH_CAL = 0.0
+    model, db, err = G.build_model_and_db(
+        "layerwise", True, None, "0.20.1", args.tp,
+        system=args.system, backend="vllm", comm_version="0.19.0",
+        systems_root=str(Path(G.DEFAULT_REPO_ROOT) / "src/aiconfigurator/systems"),
+        layerwise_csv=str(Path(G.DEFAULT_REPO_ROOT)
+                          / f"src/aiconfigurator/systems/data/{args.system}/vllm/0.20.1/layerwise_perf.csv"),
+        api=api,
+    )
+    if err:
+        raise SystemExit(f"AIC model/db build failed: {err}")
+    rc = api["RuntimeConfig"](vllm_max_num_batched_tokens=8192, vllm_max_num_seqs=None)
+
+    # clean-lane FPM wall per decode shape (batch_size, mean_kv) from the golden run.
+    # Per-pareto-point FPM runs land flat (fpm_metrics_phase.csv); fall back to the
+    # H100 concurrency layout (fpm/qwen32/c*/) via _resolve_fpm_source if absent.
+    fpm_run = Path(args.fpm_run)
+    fpm_csv = fpm_run / "fpm_metrics_phase.csv"
+    if not fpm_csv.exists():
+        fpm_csv, _subdir = G._resolve_fpm_source(fpm_run, args.tp, Path(args.out).resolve().parent)
+    _ctx, decode, _mix = api["_load_fpm"](fpm_csv, workload_segment="real")
+    fpm_wall = {key: api["_aggregate"](samples, "median") for key, samples in decode.items()}
+
+    def aic_predict(batch_size, past_kv):
+        compute, comm, total, _src, status = G.predict_decode_breakdown(
+            backend, model, db, rc, batch_size=batch_size, past_kv=past_kv, api=api
+        )
+        return (compute, comm, total) if status == G.ST_OK else (None, None, None)
+
+    rows = run_decode_attribution(
+        sqlite_path=args.sqlite, profiled_rows=None,
+        fpm_wall_by_shape=fpm_wall, aic_predict=aic_predict,
+        discard_first_n=args.discard_first_n,
+    )
+    write_decomposition_csv(rows, args.out)
+    print(f"[attribute] wrote {len(rows)} shapes -> {args.out}")
+
+
+if __name__ == "__main__":
+    _main()

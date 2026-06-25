@@ -132,6 +132,13 @@ FPM_DATASET="${FPM_DATASET:-OpenAssistant/oasst1}"
 FPM_SHAPE_SOURCE="${FPM_SHAPE_SOURCE:-scaled_dataset}"
 FPM_WARMUP_REQUESTS="${FPM_WARMUP_REQUESTS:-4}"
 
+# Attribute stage: windowed nsys capture (cudaProfilerStart/Stop) + decomposition.
+# ATTRIBUTE_WINDOW is "lo-hi[,lo-hi...]" step ordinals (the marker's NVTX bench_step::N
+# label step) passed through to --nsys-cuda-profiler-window; ATTRIBUTE_DISCARD_N drops
+# the first N sync-drained boundary steps of each cohort before reducing.
+ATTRIBUTE_WINDOW="${ATTRIBUTE_WINDOW:-100-115}"
+ATTRIBUTE_DISCARD_N="${ATTRIBUTE_DISCARD_N:-3}"
+
 # Scheduler parity: forced via env so FPM shell + align agree (shell reads $MAX_NUM_SEQS).
 FPM_MAX_NUM_SEQS="${FPM_MAX_NUM_SEQS:-256}"
 FPM_MAX_NUM_BATCHED_TOKENS="${FPM_MAX_NUM_BATCHED_TOKENS:-2048}"
@@ -475,6 +482,58 @@ report() {
 }
 
 # ============================================================================
+# Stage: attribute (nsys windowed capture of the real FPM workload + decompose)
+# ============================================================================
+# Two lanes joined by shape: the profiled lane (nsys windowed capture -> per-step
+# compute/comm/busy) supplies composition only; the clean lane (the existing FPM
+# golden run dir) supplies the authoritative per-shape wall. aic_fpm_attribute.py
+# joins {profiled composition + clean wall + AIC layerwise prediction} and writes
+# the gap decomposition CSV.
+stage_attribute() {
+  local slug hf kind moe m i
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r slug hf kind moe <<<"$m"
+    for i in "${!PARETO_NAMES[@]}"; do
+      local pname="${PARETO_NAMES[$i]}" conc="${PARETO_CONCURRENCY[$i]}"
+      local req=$(( FPM_REQ_MULT * conc ))
+      (( req < FPM_REQ_MIN )) && req="$FPM_REQ_MIN"
+      (( req > FPM_REQ_MAX )) && req="$FPM_REQ_MAX"
+      local unit="attribute_${slug}_${pname}"
+      if is_done "$unit"; then log "skip $unit (done; FORCE=1 to redo)"; continue; fi
+      local rdir; rdir="$(fpm_run_dir "$slug" "$pname")/attribute"; mkdir -p "$rdir"
+      log "Attribute: $hf tp=$FPM_TP_LIST pareto=$pname conc=$conc req=$req window=$ATTRIBUTE_WINDOW -> $rdir"
+
+      # (a) FPM real workload under nsys windowed capture (reuses the FPM collector path)
+      run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value)" \
+        "$LOG_DIR/${unit}.log" \
+        python3 -m collector.layerwise.fpm.collect \
+          --model "$hf" --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
+          --phases context,decode,mixed --decode-past-kv "$DECODE_PAST_KV" \
+          --real-workload --real-workload-requests "$req" --real-workload-concurrency "$conc" \
+          --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE" \
+          --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN" \
+          --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN" \
+          --prompt-token-mode safe_ascii --warmup-requests "$FPM_WARMUP_REQUESTS" \
+          --image "$DYNAMO_VLLM_IMAGE" --run-dir "$rdir" \
+          --nsys-profile-worker --nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW"
+
+      # (b) reduce + decompose on the captured sqlite (clean wall from the existing fpm run dir)
+      local sqlite; sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1)"
+      if [ -z "$sqlite" ]; then warn "no .sqlite under $rdir/nsys; skipping decompose"; mark_done "$unit"; continue; fi
+      run_env "" "$LOG_DIR/${unit}_decompose.log" \
+        python3 -m collector.layerwise.diagnostics.aic_fpm_attribute \
+          --sqlite "$sqlite" \
+          --fpm-run "$(fpm_run_dir "$slug" "$pname")" \
+          --system "$SYSTEM" --model "$hf" --tp "$TP" \
+          --discard-first-n "$ATTRIBUTE_DISCARD_N" \
+          --out "$rdir/decomposition.csv"
+
+      mark_done "$unit"
+    done
+  done
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -485,8 +544,9 @@ main() {
     case "$stage" in
       layerwise) log "== STAGE layerwise =="; stage_layerwise;;
       fpm)       log "== STAGE fpm =="; stage_fpm;;
+      attribute) log "== STAGE attribute =="; stage_attribute;;
       align)     log "== STAGE align =="; stage_align;;
-      *) die "unknown stage: $stage (valid: layerwise fpm align)";;
+      *) die "unknown stage: $stage (valid: layerwise fpm attribute align)";;
     esac
   done
   report
