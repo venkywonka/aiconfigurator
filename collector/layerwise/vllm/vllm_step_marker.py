@@ -51,6 +51,43 @@ _MATCHED_ONCE_KEYS = set()
 _LAST_DECODE_MATCH_META: dict[str, object] = {}
 _LAST_CTX_MATCH_META: dict[str, object] = {}
 
+# Windowed cudaProfilerStart/Stop gating. nsys must NOT fence every step
+# (worker._cuda_profiler_call syncs before each fence, which would destroy
+# CPU-GPU overlap), so we open the profiler once at a window's first step and
+# close once at its last. See public Nsight Systems --capture-range=cudaProfilerApi.
+_PROFILER_STATE = {"active": False}
+
+
+def _parse_profiler_window(raw):
+    """Parse "lo-hi[,lo-hi...]" (step ordinals) into a list of (lo, hi) int pairs."""
+    if not raw:
+        return []
+    parts = raw.split(",") if isinstance(raw, str) else raw
+    spans = []
+    for part in parts:
+        if isinstance(part, (list, tuple)):
+            lo, hi = part
+        else:
+            lo, hi = str(part).split("-")
+        spans.append((int(lo), int(hi)))
+    return spans
+
+
+def _advance_profiler_window(label_step, spans, state, call):
+    """Open the profiler at a window's first step, close at its last. Idempotent."""
+    if not spans:
+        return
+    for lo, hi in spans:
+        if label_step == lo and not state["active"]:
+            call("start")
+            state["active"] = True
+            return
+    for lo, hi in spans:
+        if label_step == hi and state["active"]:
+            call("stop")
+            state["active"] = False
+            return
+
 
 def _read_control() -> dict:
     path = os.environ.get("LAYERWISE_CONTROL_FILE")
@@ -419,6 +456,12 @@ def _run_marked_step(
         **progress_extra,
     )
     nvtx.range_push(label)
+    _profiler_spans = _parse_profiler_window(
+        control.get("cuda_profiler_window") or os.environ.get("LAYERWISE_CUDA_PROFILER_WINDOW")
+    )
+    if _profiler_spans:
+        from collector.layerwise.vllm.worker import _cuda_profiler_call as _prof_call
+        _advance_profiler_window(label_step, _profiler_spans, _PROFILER_STATE, _prof_call)
     try:
         measure_gpu_time = bool(control.get("measure_execute_model_gpu_time"))
         start_event = end_event = None
@@ -454,6 +497,9 @@ def _run_marked_step(
         )
         return ret
     finally:
+        if _profiler_spans:
+            from collector.layerwise.vllm.worker import _cuda_profiler_call as _prof_call
+            _advance_profiler_window(label_step, _profiler_spans, _PROFILER_STATE, _prof_call)
         nvtx.range_pop()
 
 

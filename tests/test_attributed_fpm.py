@@ -1,7 +1,20 @@
 # tests/test_attributed_fpm.py
+import os
+import sys
+from unittest import mock
+
 import pytest
 
 pytestmark = pytest.mark.unit
+
+# The step marker imports torch at module load and runs _install() as a side
+# effect; stub torch and disable the install so the pure-logic helpers
+# (_advance_profiler_window / _parse_profiler_window) are importable without a
+# GPU/torch runtime. Mirrors tests/test_vllm_step_marker.py.
+os.environ.setdefault("LAYERWISE_STEP_MARKER", "0")
+sys.modules.setdefault("torch", mock.Mock())
+sys.modules.setdefault("torch.cuda", mock.Mock())
+sys.modules.setdefault("torch.cuda.nvtx", mock.Mock())
 
 
 def test_filter_boundary_discards_drops_first_n_per_cohort():
@@ -116,3 +129,28 @@ def test_run_decode_attribution_joins_three_lanes():
     terms = (r["term_compute_err"] + r["term_comm_err"] + r["term_aic_other"]
              + r["term_overlap"] + r["term_neg_overhead"])
     assert abs(terms - r["gap_ms"]) < 1e-9
+
+
+def test_advance_profiler_window_opens_once_closes_once():
+    from collector.layerwise.vllm.vllm_step_marker import _advance_profiler_window
+
+    calls = []
+    state = {"active": False}
+    spans = [(3, 6)]
+    for step in range(0, 9):
+        _advance_profiler_window(step, spans, state, lambda action: calls.append((step, action)))
+    # start exactly at step 3, stop exactly at step 6, nothing else
+    assert calls == [(3, "start"), (6, "stop")]
+    assert state["active"] is False
+
+
+def test_advance_profiler_window_two_windows():
+    from collector.layerwise.vllm.vllm_step_marker import _advance_profiler_window, _parse_profiler_window
+
+    spans = _parse_profiler_window("3-6,10-12")
+    assert spans == [(3, 6), (10, 12)]
+    calls = []
+    state = {"active": False}
+    for step in range(0, 14):
+        _advance_profiler_window(step, spans, state, lambda a: calls.append((step, a)))
+    assert calls == [(3, "start"), (6, "stop"), (10, "start"), (12, "stop")]

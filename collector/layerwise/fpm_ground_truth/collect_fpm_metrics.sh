@@ -120,6 +120,7 @@ NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx}"
 NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE:-node}"
 NSYS_PROFILE_TRAFFIC_ONLY="${NSYS_PROFILE_TRAFFIC_ONLY:-1}"
 NSYS_SESSION_NAME="${NSYS_SESSION_NAME:-fpm_worker}"
+NSYS_CUDA_PROFILER_WINDOW="${NSYS_CUDA_PROFILER_WINDOW:-}"
 
 RUN_ID="${RUN_ID:-dynamo-fpm-$(date +%Y%m%d-%H%M%S)-$$}"
 NAME_PREFIX="${NAME_PREFIX:-${RUN_ID}}"
@@ -231,6 +232,7 @@ Options:
   --nsys-host-dir DIR           Optional host directory to mount read-only at the same path for --nsys-bin
   --nsys-trace CSV              nsys --trace value when profiling worker (default: ${NSYS_TRACE})
   --nsys-cuda-graph-trace MODE  nsys --cuda-graph-trace value when profiling worker (default: ${NSYS_CUDA_GRAPH_TRACE})
+  --nsys-cuda-profiler-window SPEC  Windowed cudaProfilerStart/Stop gating; "lo-hi[,lo-hi...]" step ordinals -> LAYERWISE_CUDA_PROFILER_WINDOW
   --nsys-full-worker            Profile from worker start instead of only measured traffic
   --max-tokens N                Fixed-workload max_tokens (default: ${MAX_TOKENS})
   --prompt-token-seed N         Seed for reproducible random prompt token IDs (default: random)
@@ -568,6 +570,7 @@ while [[ $# -gt 0 ]]; do
         --nsys-host-dir) NSYS_HOST_DIR="$2"; shift 2 ;;
         --nsys-trace) NSYS_TRACE="$2"; shift 2 ;;
         --nsys-cuda-graph-trace) NSYS_CUDA_GRAPH_TRACE="$2"; shift 2 ;;
+        --nsys-cuda-profiler-window) NSYS_CUDA_PROFILER_WINDOW="$2"; shift 2 ;;
         --nsys-full-worker) NSYS_PROFILE_TRAFFIC_ONLY=0; shift ;;
         --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
         --prompt-token-seed) PROMPT_TOKEN_SEED="$2"; shift 2 ;;
@@ -700,6 +703,11 @@ WORKER_DOCKER_ENV+=(
 if [[ -n "${VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8:-}" ]]; then
     WORKER_DOCKER_ENV+=(
         -e "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=${VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8}"
+    )
+fi
+if [ -n "$NSYS_CUDA_PROFILER_WINDOW" ]; then
+    WORKER_DOCKER_ENV+=(
+        -e "LAYERWISE_CUDA_PROFILER_WINDOW=$NSYS_CUDA_PROFILER_WINDOW"
     )
 fi
 NSYS_DOCKER_MOUNTS=()
