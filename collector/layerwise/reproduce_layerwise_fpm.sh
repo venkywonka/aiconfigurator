@@ -560,10 +560,14 @@ stage_attribute() {
       # Guard the decompose so a failure (e.g. AIC has no layerwise data for this model)
       # warns + retains the .nsys-rep/.sqlite for manual decompose instead of aborting the
       # driver under `set -e` -- the expensive capture must never be lost to a downstream step.
+      # --fpm-run is THIS attribute run's dir ($rdir), where the collector wrote
+      # fpm_metrics_phase.csv (the clean-lane wall) -- NOT fpm_run_dir's parent, which
+      # holds no CSV and sends _load_fpm down the nested tp{T}_ep{E}_past{K} fallback
+      # that does not exist for the attribute run (FileNotFoundError -> decompose fails).
       run_env "" "$LOG_DIR/${unit}_decompose.log" \
         python3 -m collector.layerwise.diagnostics.aic_fpm_attribute \
           --sqlite "$sqlite" \
-          --fpm-run "$(fpm_run_dir "$slug" "$pname")" \
+          --fpm-run "$rdir" \
           --system "$SYSTEM" --model "$hf" --tp "$TP" \
           --discard-first-n "$ATTRIBUTE_DISCARD_N" \
           --out "$rdir/decomposition.csv" \
