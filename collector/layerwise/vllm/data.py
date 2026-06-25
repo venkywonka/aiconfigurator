@@ -142,5 +142,8 @@ class WorkUnit:
                 "batch_size": dp.batch_size,
                 "new_tokens": dp.new_tokens,
                 "past_kv": dp.past_kv,
+                "prefill_tokens": dp.prefill_tokens,
+                "decode_requests": dp.decode_requests,
+                "decode_past_kv": dp.decode_past_kv,
             })
         return rows
