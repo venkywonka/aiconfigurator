@@ -17,11 +17,19 @@ class DataPoint:
     batch_size: int
     new_tokens: int
     past_kv: int
+    prefill_tokens: int = 0
+    decode_requests: int = 0
+    decode_past_kv: int = 0
 
     @property
     def shape_key(self) -> str:
         """Return the stable shape label used in status and manifest IDs."""
 
+        if self.phase == "mixed":
+            return (
+                f"mixed:P{self.prefill_tokens}:"
+                f"B{self.decode_requests}:K{self.decode_past_kv}"
+            )
         return (
             f"{self.phase}:bs{self.batch_size}:"
             f"new{self.new_tokens}:past{self.past_kv}"
