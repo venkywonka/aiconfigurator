@@ -534,7 +534,7 @@ stage_attribute() {
           --image "$DYNAMO_VLLM_IMAGE" --run-dir "$rdir" \
           --nsys-profile-worker --nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW" || collect_rc=$?
 
-      local nsysrep; nsysrep="$(ls -1 "$rdir"/nsys/*.nsys-rep 2>/dev/null | head -1)"
+      local nsysrep; nsysrep="$(ls -1 "$rdir"/nsys/*.nsys-rep 2>/dev/null | head -1 || true)"
       if [[ "$DRY_RUN" != "1" && -z "$nsysrep" ]]; then
         die "collect produced no .nsys-rep under $rdir/nsys (rc=$collect_rc); attribute capture failed for $unit"
       fi
@@ -545,7 +545,7 @@ stage_attribute() {
       # (b) reduce + decompose on the captured sqlite (clean wall from the existing fpm run dir).
       # If a .nsys-rep exists but no .sqlite yet, export it host-side before the sqlite lookup
       # (warn+continue on export failure so the lookup below can still find a pre-existing sqlite).
-      local existing_sqlite; existing_sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1)"
+      local existing_sqlite; existing_sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1 || true)"
       if [ -z "$existing_sqlite" ]; then
         local sqlite_base="${nsysrep%.nsys-rep}"
         log "Exporting nsys report to sqlite: $nsysrep -> ${sqlite_base}.sqlite"
@@ -555,7 +555,7 @@ stage_attribute() {
           || warn "nsys export failed for $nsysrep (rc=$?); decompose may have no sqlite to read"
       fi
 
-      local sqlite; sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1)"
+      local sqlite; sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1 || true)"
       if [ -z "$sqlite" ]; then warn "no .sqlite under $rdir/nsys; skipping decompose"; mark_done "$unit"; continue; fi
       # Guard the decompose so a failure (e.g. AIC has no layerwise data for this model)
       # warns + retains the .nsys-rep/.sqlite for manual decompose instead of aborting the
