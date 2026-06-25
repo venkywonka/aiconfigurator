@@ -507,6 +507,11 @@ stage_attribute() {
       # NSYS_BIN/NSYS_HOST_DIR propagate (collect.py runs the inner shell with os.environ.copy()) so
       # collect_fpm_metrics.sh mounts the host Nsight install ro into the worker container and execs the
       # absolute nsys path there (the worker image has no nsys on PATH -> bare `nsys` exits 127).
+      # The collector can exit nonzero (e.g. 2) on a non-fatal per-request case failure even when the
+      # nsys capture succeeded (Phase-0 smoke: DRIVER_EXIT=2 but fpm_worker.nsys-rep was produced). So
+      # capture the rc without letting `set -e` abort the driver, and gate continuation on a .nsys-rep
+      # existing rather than on rc==0; only a total collection failure (NO .nsys-rep) fails the unit.
+      local collect_rc=0
       run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
@@ -518,9 +523,29 @@ stage_attribute() {
           --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN" \
           --prompt-token-mode safe_ascii --warmup-requests "$FPM_WARMUP_REQUESTS" \
           --image "$DYNAMO_VLLM_IMAGE" --run-dir "$rdir" \
-          --nsys-profile-worker --nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW"
+          --nsys-profile-worker --nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW" || collect_rc=$?
 
-      # (b) reduce + decompose on the captured sqlite (clean wall from the existing fpm run dir)
+      local nsysrep; nsysrep="$(ls -1 "$rdir"/nsys/*.nsys-rep 2>/dev/null | head -1)"
+      if [[ "$DRY_RUN" != "1" && -z "$nsysrep" ]]; then
+        die "collect produced no .nsys-rep under $rdir/nsys (rc=$collect_rc); attribute capture failed for $unit"
+      fi
+      if [[ "$DRY_RUN" != "1" && "$collect_rc" != "0" ]]; then
+        warn "collect exited rc=$collect_rc but .nsys-rep was produced ($nsysrep); proceeding to decompose for $unit"
+      fi
+
+      # (b) reduce + decompose on the captured sqlite (clean wall from the existing fpm run dir).
+      # If a .nsys-rep exists but no .sqlite yet, export it host-side before the sqlite lookup
+      # (warn+continue on export failure so the lookup below can still find a pre-existing sqlite).
+      local existing_sqlite; existing_sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1)"
+      if [ -z "$existing_sqlite" ]; then
+        local sqlite_base="${nsysrep%.nsys-rep}"
+        log "Exporting nsys report to sqlite: $nsysrep -> ${sqlite_base}.sqlite"
+        run_env "" "$LOG_DIR/${unit}_export.log" \
+          "$NSYS_ROOT/bin/nsys" export --type sqlite --force-overwrite true \
+            -o "${sqlite_base}.sqlite" "$nsysrep" \
+          || warn "nsys export failed for $nsysrep (rc=$?); decompose may have no sqlite to read"
+      fi
+
       local sqlite; sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1)"
       if [ -z "$sqlite" ]; then warn "no .sqlite under $rdir/nsys; skipping decompose"; mark_done "$unit"; continue; fi
       run_env "" "$LOG_DIR/${unit}_decompose.log" \
