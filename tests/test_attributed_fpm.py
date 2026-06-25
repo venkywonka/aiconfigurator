@@ -194,3 +194,102 @@ def test_collect_omits_nsys_flags_when_unset():
     argv = D.build_collect_command(args, case, __import__("pathlib").Path("/tmp/x")).argv
     assert "--nsys-profile-worker" not in argv
     assert "--nsys-cuda-profiler-window" not in argv
+
+
+# ---------------------------------------------------------------------------
+# TASK A: dynamo_step_marker pure-logic helpers
+# ---------------------------------------------------------------------------
+#
+# These cover the DYNAMO-side per-step NVTX marker for the FPM/attribute path:
+# a hook on InstrumentedScheduler.update_from_output that reads the REAL
+# per-step batch state (decode_batch + mean past_kv) and emits a label in the
+# EXACT format the existing nsys parser keys on. Pure helpers only; the
+# monkeypatch effect needs torch+dynamo and is validated on hardware.
+
+
+def _fake_scheduler_output(req_ids, num_computed_tokens, context_phase_ids):
+    """Build a fake SchedulerOutput-like object.
+
+    scheduled_cached_reqs mirrors vLLM's CachedRequestData: parallel lists
+    .req_ids / .num_computed_tokens, plus an .is_context_phase(req_id) method.
+    """
+    import types
+
+    ctx = set(context_phase_ids)
+    cached = types.SimpleNamespace(
+        req_ids=list(req_ids),
+        num_computed_tokens=list(num_computed_tokens),
+        is_context_phase=lambda req_id: req_id in ctx,
+    )
+    return types.SimpleNamespace(scheduled_cached_reqs=cached)
+
+
+def test_decode_batch_and_kv_mixed_prefill_and_decode():
+    from collector.layerwise.vllm.dynamo_step_marker import _decode_batch_and_kv
+
+    # 4 cached reqs: r0 prefill (context phase), r1/r2/r3 decode.
+    # decode num_computed = [100, 200, 300] -> mean 200.
+    so = _fake_scheduler_output(
+        req_ids=["r0", "r1", "r2", "r3"],
+        num_computed_tokens=[5, 100, 200, 300],
+        context_phase_ids=["r0"],
+    )
+    decode_batch, mean_kv = _decode_batch_and_kv(so)
+    assert decode_batch == 3
+    assert mean_kv == 200
+
+
+def test_decode_batch_and_kv_all_decode_rounds_mean():
+    from collector.layerwise.vllm.dynamo_step_marker import _decode_batch_and_kv
+
+    # all-decode batch; num_computed = [100, 101] -> mean 100.5 -> round 100
+    so = _fake_scheduler_output(
+        req_ids=["a", "b"],
+        num_computed_tokens=[100, 101],
+        context_phase_ids=[],
+    )
+    decode_batch, mean_kv = _decode_batch_and_kv(so)
+    assert decode_batch == 2
+    assert mean_kv == 100
+
+
+def test_decode_batch_and_kv_no_decode_reqs_is_zero():
+    from collector.layerwise.vllm.dynamo_step_marker import _decode_batch_and_kv
+
+    # all reqs in context/prefill phase -> no decode reqs -> (0, 0)
+    so = _fake_scheduler_output(
+        req_ids=["p0", "p1"],
+        num_computed_tokens=[3, 7],
+        context_phase_ids=["p0", "p1"],
+    )
+    decode_batch, mean_kv = _decode_batch_and_kv(so)
+    assert decode_batch == 0
+    assert mean_kv == 0
+
+
+def test_decode_batch_and_kv_tolerates_missing_attrs():
+    import types
+
+    from collector.layerwise.vllm.dynamo_step_marker import _decode_batch_and_kv
+
+    # scheduler_output with no scheduled_cached_reqs at all -> degrade to (0, 0)
+    so = types.SimpleNamespace()
+    assert _decode_batch_and_kv(so) == (0, 0)
+
+
+def test_bench_step_label_exact_format():
+    from collector.layerwise.vllm.dynamo_step_marker import _bench_step_label
+
+    assert _bench_step_label(16, 128, 15) == "bench_step::N0000016::bs128::past000015"
+
+
+def test_bench_step_label_roundtrips_through_parser_regex():
+    from collector.layerwise.vllm.dynamo_step_marker import _bench_step_label
+    from collector.layerwise.common.parse_nsys_step_sweep import _BENCH_STEP_RE
+
+    label = _bench_step_label(42, 64, 4096)
+    m = _BENCH_STEP_RE.search(label)
+    assert m is not None
+    assert int(m.group(1)) == 42
+    assert int(m.group(2)) == 64
+    assert int(m.group(3)) == 4096

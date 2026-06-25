@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""DYNAMO-side per-step NVTX marker for the FPM / attribute path.
+
+Why this exists (Phase-0 finding)
+----------------------------------
+The FPM worker is launched as ``python3 -m dynamo.vllm`` under nsys. In that
+launch context ``vllm_step_marker.py`` is NEVER imported (no repo mount /
+sitecustomize on PYTHONPATH), and even if it were, its counter-mode label
+assumes ``isl=1`` single-stream (``past_kv = n - 1``) which is WRONG for a real
+multi-request FPM workload.
+
+So per-step NVTX for the FPM/attribute path must come from a DYNAMO-side hook on
+``InstrumentedScheduler.update_from_output`` that reads the REAL per-step batch
+state and emits a label in the EXACT format the existing nsys parser
+(``collector/layerwise/common/parse_nsys_step_sweep.py`` /
+``collector/layerwise/diagnostics/analyze_nsys_comm_overlap.py``) keys on.
+
+Label format (must match ``vllm_step_marker.py:_run_marked_step``)::
+
+    bench_step::N<step:07d>::bs<decode_batch>::past<mean_kv:06d>
+
+Injection is from the aiconfigurator side via monkeypatch (no edits to the
+dynamo source tree). Enable with ``LAYERWISE_DYNAMO_STEP_MARKER=1``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+# Reuse the windowed cudaProfilerStart/Stop gating helpers from the existing
+# step marker. Do NOT duplicate them: a single implementation keeps the window
+# semantics identical across the two markers.
+from collector.layerwise.vllm.vllm_step_marker import (
+    _PROFILER_STATE,
+    _advance_profiler_window,
+    _parse_profiler_window,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pure-logic helpers (unit-testable without torch / dynamo)
+# ---------------------------------------------------------------------------
+
+
+def _decode_batch_and_kv(scheduler_output) -> tuple[int, int]:
+    """Extract ``(decode_batch, mean_kv)`` from a vLLM ``SchedulerOutput``.
+
+    A request is a DECODE request iff it is NOT in the context (prefill) phase.
+
+    ``decode_batch`` is the count of scheduled cached requests in decode phase;
+    ``mean_kv`` is the rounded mean of their ``num_computed_tokens`` (the
+    per-request KV context length), or ``0`` when there are no decode requests.
+
+    Tolerates missing attributes (uses ``getattr``) so it degrades safely to
+    ``(0, 0)`` rather than crashing the worker hot path.
+    """
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached is None:
+        return 0, 0
+
+    req_ids = getattr(cached, "req_ids", None)
+    num_computed_tokens = getattr(cached, "num_computed_tokens", None)
+    is_context_phase = getattr(cached, "is_context_phase", None)
+    if req_ids is None or num_computed_tokens is None or is_context_phase is None:
+        return 0, 0
+
+    decode_kv: list[int] = []
+    for i, req_id in enumerate(req_ids):
+        try:
+            if is_context_phase(req_id):
+                continue
+        except Exception:
+            # If phase classification fails for a request, treat it as
+            # non-decode so we never over-count the decode batch.
+            continue
+        if i < len(num_computed_tokens):
+            decode_kv.append(int(num_computed_tokens[i]))
+
+    decode_batch = len(decode_kv)
+    if decode_batch == 0:
+        return 0, 0
+    mean_kv = round(sum(decode_kv) / decode_batch)
+    return decode_batch, int(mean_kv)
+
+
+def _bench_step_label(step: int, decode_batch: int, mean_kv: int) -> str:
+    """Return the EXACT ``bench_step::...`` NVTX label the parser keys on.
+
+    Format mirrors ``vllm_step_marker.py:_run_marked_step``: 7-digit zero-padded
+    step, unpadded batch size, 6-digit zero-padded past_kv.
+    """
+    return f"bench_step::N{step:07d}::bs{decode_batch}::past{mean_kv:06d}"
+
+
+# ---------------------------------------------------------------------------
+# Monkeypatch installer (validated on hardware; not unit-tested here)
+# ---------------------------------------------------------------------------
+
+
+def _install() -> None:
+    """Monkeypatch ``InstrumentedScheduler.update_from_output`` to emit NVTX.
+
+    No-op unless ``LAYERWISE_DYNAMO_STEP_MARKER=1``. Wrapped in try/except so a
+    missing dynamo / torch import (or any patch failure) never crashes worker
+    startup -- it only logs to stderr.
+    """
+    if os.environ.get("LAYERWISE_DYNAMO_STEP_MARKER") != "1":
+        return
+
+    try:
+        import torch.cuda.nvtx as nvtx
+
+        from dynamo.vllm.instrumented_scheduler import InstrumentedScheduler
+
+        orig = InstrumentedScheduler.update_from_output
+
+        def patched(self, scheduler_output, model_runner_output):
+            # Read the REAL per-step batch state BEFORE the original call.
+            decode_batch, mean_kv = _decode_batch_and_kv(scheduler_output)
+
+            n = getattr(self, "_layerwise_step_n", 0) + 1
+            self._layerwise_step_n = n
+
+            label = _bench_step_label(n, decode_batch, mean_kv)
+            spans = _parse_profiler_window(
+                os.environ.get("LAYERWISE_CUDA_PROFILER_WINDOW")
+            )
+
+            nvtx.range_push(label)
+            if spans:
+                from collector.layerwise.vllm.worker import (
+                    _cuda_profiler_call as _prof_call,
+                )
+
+                _advance_profiler_window(n, spans, _PROFILER_STATE, _prof_call)
+            try:
+                return orig(self, scheduler_output, model_runner_output)
+            finally:
+                if spans:
+                    from collector.layerwise.vllm.worker import (
+                        _cuda_profiler_call as _prof_call,
+                    )
+
+                    _advance_profiler_window(n, spans, _PROFILER_STATE, _prof_call)
+                nvtx.range_pop()
+
+        InstrumentedScheduler.update_from_output = patched
+        logger.warning(
+            "[dynamo-step-marker] installed InstrumentedScheduler.update_from_output wrapper"
+        )
+    except Exception as exc:  # never crash worker startup
+        print(
+            f"[dynamo-step-marker] install failed (continuing without marker): {exc}",
+            file=sys.stderr,
+        )
+
+
+_install()
