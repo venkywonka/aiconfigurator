@@ -126,6 +126,7 @@ def run_decode_attribution(
     aic_predict,
     discard_first_n: int = 3,
     aggregate: str = "median",
+    ranks: int = 1,
 ) -> list[dict[str, Any]]:
     """Join profiled composition + clean FPM wall + AIC breakdown per decode shape.
 
@@ -158,13 +159,19 @@ def run_decode_attribution(
         if aic_compute is None:
             continue
         comp = profiled[key]
+        # TP>1: analyze_sqlite sums kernel durations across ALL ranks captured in the
+        # single nsys report, but `wall` and the AIC layerwise prediction are single-rank.
+        # For a balanced dense TP run each rank does ~1/ranks of the compute and one
+        # allreduce per collective, so the per-rank value is the sum / ranks. gpu_busy
+        # (interval union) is left as-is: ranks run in wall-clock lockstep, so the union
+        # already collapses to ~one rank's wall (empirically gpu_busy ≈ wall at TP=8).
         row = decompose_shape(
             wall_ms=fpm_wall_binned[key],
             aic_compute_ms=aic_compute,
             aic_comm_ms=aic_comm,
             aic_other_ms=aic_total - aic_compute - aic_comm,
-            gpu_compute_ms=comp["gpu_compute_ms"],
-            gpu_comm_ms=comp["gpu_comm_ms"],
+            gpu_compute_ms=comp["gpu_compute_ms"] / ranks,
+            gpu_comm_ms=comp["gpu_comm_ms"] / ranks,
             gpu_busy_ms=comp["gpu_busy_ms"],
         )
         row["phase"] = "decode"
@@ -272,6 +279,7 @@ def _main(argv=None):
         sqlite_path=args.sqlite, profiled_rows=None,
         fpm_wall_by_shape=fpm_wall, aic_predict=aic_predict,
         discard_first_n=args.discard_first_n,
+        ranks=args.tp,
     )
     write_decomposition_csv(rows, args.out)
     print(f"[attribute] wrote {len(rows)} shapes -> {args.out}")

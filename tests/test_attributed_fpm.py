@@ -346,3 +346,28 @@ def test_bench_step_label_roundtrips_through_parser_regex():
     assert int(m.group(1)) == 42
     assert int(m.group(2)) == 64
     assert int(m.group(3)) == 4096
+
+
+def test_run_decode_attribution_divides_profiled_by_ranks():
+    """TP>1: analyze_sqlite sums kernels across all ranks, but wall+AIC are single-rank.
+    ranks= divides the profiled compute/comm SUMS to per-rank; gpu_busy (union) stays."""
+    from collector.layerwise.diagnostics.aic_fpm_attribute import run_decode_attribution
+
+    profiled_rows = [
+        {"step": s, "batch_size": 4, "past_kv": 8000, "measure_run": 0,
+         "compute_gpu_us": 40000.0, "comm_gpu_us": 8000.0, "total_union_us": 6500.0}
+        for s in range(5)
+    ]
+    fpm_wall = {(4, 8000.0): 6.6}
+    aic = lambda bs, kv: (6.9, 0.37, 7.27)
+    rows = run_decode_attribution(
+        sqlite_path="X", profiled_rows=profiled_rows, fpm_wall_by_shape=fpm_wall,
+        aic_predict=aic, discard_first_n=2, ranks=8,
+    )
+    r = rows[0]
+    assert r["gpu_compute_ms"] == 5.0   # 40000us -> 40.0ms / 8 ranks
+    assert r["gpu_comm_ms"] == 1.0      # 8000us  -> 8.0ms  / 8 ranks
+    assert r["gpu_busy_ms"] == 6.5      # union NOT divided
+    terms = (r["term_compute_err"] + r["term_comm_err"] + r["term_aic_other"]
+             + r["term_overlap"] + r["term_neg_overhead"])
+    assert abs(terms - r["gap_ms"]) < 1e-9
