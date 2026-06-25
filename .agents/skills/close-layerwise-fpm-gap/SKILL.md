@@ -128,3 +128,84 @@ Interpretation (carries the Core Rule + step 6):
   < layerwise(0.20.1) **7.9%** < empirical 28.9% < SOL 48.4% — op-wise wins on H100 (opposite of
   B300), mainly because layerwise over-predicts low-batch decode via the H100 comm-table fallback
   (`custom_allreduce` substituting for the missing fused `allreduce_rms`).
+
+## Attributed-FPM (nsys gap decomposition)
+
+The multi-track analyzer above tells you *which track* is closest to FPM, but FPM is one number
+per step (`wall` ≈ GPU forward via CPU–GPU overlap; no internal breakdown), so it cannot tell you
+*which term* of a track is wrong: compute model, comm model, or effects AIC structurally can't see
+(compute–comm overlap, exposed-CPU/host overhead). Attributed-FPM re-runs the FPM input space under
+nsys, attributes each captured step's GPU activity, and decomposes the layerwise-vs-FPM gap per shape.
+Spec: `slop/fpm-nsys-attribution/spec.md`.
+
+**Two lanes, joined by shape.** The nsys lane is composition only, NEVER a timing source:
+- **Clean lane (authoritative timing):** the existing golden FPM run = source of truth for per-shape
+  `wall`. Reused, not re-run.
+- **Profiled lane (composition only):** a new nsys windowed capture. Supplies the granularity of GPU
+  work — CUPTI kernel *durations* are accurate, but the profiled *wall/span* is perturbed and untrusted.
+
+Per shape, the profiled lane maps directly to the existing `analyze_sqlite` per-step columns:
+`gpu_compute = compute_gpu_us`, `gpu_comm = comm_gpu_us`, `gpu_busy = total_union_us` (union of kernel
+intervals, accounts for overlap). Derived: `overlap = (gpu_compute + gpu_comm) − gpu_busy` and the
+cross-lane residual `overhead = wall − gpu_busy` (real wall not explained by GPU kernels).
+
+**Decomposition identity (exact, algebraic — not a fit):**
+> aic_total − wall = (aic_compute − gpu_compute) + (aic_comm − gpu_comm) + aic_other + overlap − overhead
+
+Each `term_*` names a cause: AIC compute-model error, AIC comm-model error, AIC scheduler/residual
+(≈0 for dense TP), the compute–comm overlap AIC double-counts, and the engine overhead AIC can't model.
+This resolves the two open puzzles: high-C context → if profiled `gpu_compute` is small but clean
+`wall` is large, `overhead` dominates (exposed-CPU/overlap-loss), not GPU contention; low-C decode →
+`aic_comm − gpu_comm` measures the synthesized `custom_allreduce` error vs the real allreduce kernels.
+
+**Windowed-capture rule (HARD).** nsys must NOT profile every step. `_cuda_profiler_call`
+(`collector/layerwise/vllm/worker.py`) does `torch.cuda.synchronize()` before *every*
+`cudaProfilerStart`/`Stop` fence, so per-step fencing would drain the GPU pipeline at each step boundary
+and destroy the exact CPU–GPU overlap we measure. Instead, open the profiler once at a window's first
+step and close once at its last (one sync-pair amortized over N steps), then discard the sync-drained
+boundary steps. Per-step *attribution* uses NVTX `bench_step::N` ranges (no sync), via public Nsight
+`--capture-range=cudaProfilerApi`. See spec §3.
+
+**Reuse map (no new reducer):**
+- `collector/layerwise/diagnostics/analyze_nsys_comm_overlap.py` (`analyze_sqlite`) — reduces the
+  captured `.sqlite` into per-step rows keyed `(step, batch_size, past_kv, measure_run)` with
+  `compute_gpu_us`/`comm_gpu_us`/`total_union_us` (microseconds).
+- `collector/layerwise/common/parse_nsys_step_sweep.py` — per-step NVTX correlation, including the
+  cuda-graph `originalGraphNodeId` JOIN for cudagraph decode steps.
+- `collector/layerwise/vllm/vllm_step_marker.py` — the `bench_step::N` NVTX marker plus the new
+  windowed `_parse_profiler_window` / `_advance_profiler_window` gating (open-once / close-once).
+- `collector/layerwise/vllm/nsys.py` — `_filter_boundary_discards` drops the first N steps of each
+  `(batch_size, past_kv, measure_run)` cohort (the sync-drained boundary steps).
+- `collector/layerwise/diagnostics/aic_fpm_gap.py` — `_split_latency` + `predict_context_breakdown` /
+  `predict_decode_breakdown` expose AIC's layerwise compute/comm split (compute = `*_layerwise`,
+  comm = allreduce/alltoall collectives, other = scheduler/residual); the split is loss-free
+  (`compute + comm + other == predict_*()`'s total).
+
+**The join/decompose layer.** `collector/layerwise/diagnostics/aic_fpm_attribute.py` is a thin 3-way
+joiner (NOT a reducer): `decompose_shape(...)` computes the §2 identity for one shape (the five
+`term_*` fields sum exactly to `gap_ms`); `aggregate_profiled_by_shape(...)` reduces `analyze_sqlite`
+rows to per-shape composition (us→ms) after `_filter_boundary_discards`; `run_decode_attribution(...)`
+joins profiled composition ⊕ clean FPM wall ⊕ AIC breakdown per decode shape and emits one
+`decompose_shape` dict each; `write_decomposition_csv(...)` writes the stable-column CSV. Timing always
+comes from the clean lane; the profiled lane only supplies composition.
+
+**The `attribute` stage.** `collector/layerwise/reproduce_layerwise_fpm.sh` adds a `STAGES=attribute`
+stage that, per model × pareto point, (a) runs the FPM real workload under nsys windowed capture (via
+`collect_fpm_metrics.sh --nsys-profile-worker --nsys-cuda-profiler-window`, which exports
+`LAYERWISE_CUDA_PROFILER_WINDOW` into the worker), then (b) reduces + decomposes the captured `.sqlite`.
+Env knobs: `ATTRIBUTE_WINDOW` (default `100-115`, `lo-hi[,lo-hi...]` step ordinals) and
+`ATTRIBUTE_DISCARD_N` (default `3`). Run on `8xh100-layerwise` (real 8×H100 SXM, TP=8):
+
+```bash
+STAGES=attribute \
+PARETO_NAMES="low mid high" PARETO_CONCURRENCY="16 64 128" \
+ATTRIBUTE_WINDOW="100-115" ATTRIBUTE_DISCARD_N=3 \
+bash collector/layerwise/reproduce_layerwise_fpm.sh
+```
+
+**Confidentiality (HARD).** aiconfigurator is PUBLIC Apache-2.0. The loi-deep submodules (`dlb`,
+`dlb-ai-agent`, `trtllm-agent-toolkit`, loi skills, `aibroom`) are confidential and **learn-from-only**:
+never copy their source/docstrings/schema into this repo and never take a runtime/build dependency on
+them. Only public Nsight facts (nsys CLI flags, the CUPTI/NVTX table schema) may inform new code, cited
+in comments. `dlb` is permitted ONLY as a dev-time validation oracle invoked from `slop/`
+(`slop/fpm-nsys-attribution/dlb_oracle_check.py`), never entering the public dependency graph.
