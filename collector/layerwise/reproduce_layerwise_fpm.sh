@@ -557,13 +557,17 @@ stage_attribute() {
 
       local sqlite; sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1)"
       if [ -z "$sqlite" ]; then warn "no .sqlite under $rdir/nsys; skipping decompose"; mark_done "$unit"; continue; fi
+      # Guard the decompose so a failure (e.g. AIC has no layerwise data for this model)
+      # warns + retains the .nsys-rep/.sqlite for manual decompose instead of aborting the
+      # driver under `set -e` -- the expensive capture must never be lost to a downstream step.
       run_env "" "$LOG_DIR/${unit}_decompose.log" \
         python3 -m collector.layerwise.diagnostics.aic_fpm_attribute \
           --sqlite "$sqlite" \
           --fpm-run "$(fpm_run_dir "$slug" "$pname")" \
           --system "$SYSTEM" --model "$hf" --tp "$TP" \
           --discard-first-n "$ATTRIBUTE_DISCARD_N" \
-          --out "$rdir/decomposition.csv"
+          --out "$rdir/decomposition.csv" \
+        || warn "decompose failed for $unit (rc=$?); .nsys-rep + .sqlite retained under $rdir/nsys for manual decompose"
 
       mark_done "$unit"
     done
