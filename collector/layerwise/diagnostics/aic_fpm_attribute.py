@@ -91,11 +91,38 @@ def aggregate_profiled_by_shape(
     return out
 
 
+def _bin_fpm_wall_to_profiled_key(
+    fpm_wall_by_shape: dict[tuple[int, float], float],
+) -> dict[tuple[int, int], float]:
+    """Re-key the clean FPM decode wall into the profiled-lane integer key space.
+
+    The two decode lanes are keyed differently:
+      * profiled (analyze_sqlite): (batch_size, past_kv) where past_kv is the NVTX
+        ``bench_step`` label = ``round(mean(num_computed_tokens))`` -> an INTEGER
+        (collector/layerwise/vllm/dynamo_step_marker._decode_batch_and_kv).
+      * clean FPM (_load_fpm decode): (decode_requests, mean_decode_kv_tokens) where
+        mean_kv is a RAW FLOAT straight off the CSV.
+
+    A plain ``set(profiled) & set(fpm)`` only matches when the FPM mean_kv is an exact
+    integer (100.0 == 100), silently dropping every fractional-mean shape (100.4).
+    Bin the FPM float key with the SAME ``round()`` the marker uses so a profiled row
+    at past_kv=K joins to the FPM shape whose mean_kv rounds to K. Collisions (two FPM
+    floats rounding to the same int) are aggregated by mean so the wall stays a single
+    representative value per integer shape.
+    """
+    from collections import defaultdict as _dd
+
+    binned: dict[tuple[int, int], list[float]] = _dd(list)
+    for (batch_size, mean_kv), wall_ms in fpm_wall_by_shape.items():
+        binned[(int(batch_size), int(round(mean_kv)))].append(float(wall_ms))
+    return {key: statistics.fmean(walls) for key, walls in binned.items()}
+
+
 def run_decode_attribution(
     *,
     sqlite_path: str,
     profiled_rows: list[dict[str, Any]] | None,
-    fpm_wall_by_shape: dict[tuple[int, int], float],
+    fpm_wall_by_shape: dict[tuple[int, float], float],
     aic_predict,
     discard_first_n: int = 3,
     aggregate: str = "median",
@@ -105,12 +132,14 @@ def run_decode_attribution(
     Args:
       sqlite_path: nsys .sqlite to reduce (ignored if profiled_rows is given).
       profiled_rows: pre-loaded analyze_sqlite rows (test seam); else analyze_sqlite is called.
-      fpm_wall_by_shape: {(batch_size, past_kv): wall_ms} from the CLEAN golden run.
+      fpm_wall_by_shape: {(batch_size, mean_kv): wall_ms} from the CLEAN golden run.
+        mean_kv is the raw FPM float; it is binned to the profiled integer past_kv via
+        _bin_fpm_wall_to_profiled_key before joining (NVTX uses round(mean)).
       aic_predict: callable(batch_size, past_kv) -> (compute_ms, comm_ms, total_ms)
                    (wrap aic_fpm_gap.predict_decode_breakdown with bound backend/model/db/rc).
-    Returns one decompose_shape() dict per shape present in ALL THREE lanes; shapes
-    missing from a lane are skipped and recorded in the 'skipped' list on each row's
-    'join' field is omitted -- callers can diff keys to find one-lane-only shapes.
+                   past_kv is the integer profiled key (post-binning), matching the NVTX label.
+    Returns one decompose_shape() dict per shape present in ALL THREE lanes (profiled,
+    binned-FPM, AIC); shapes missing from a lane (or AIC-unpredictable) are skipped.
     """
     if profiled_rows is None:
         from collector.layerwise.diagnostics.analyze_nsys_comm_overlap import analyze_sqlite
@@ -119,15 +148,18 @@ def run_decode_attribution(
     profiled = aggregate_profiled_by_shape(
         profiled_rows, discard_first_n=discard_first_n, aggregate=aggregate
     )
+    # Bin the clean-lane float mean_kv onto the profiled integer past_kv key space so
+    # the join below is over a single, consistent integer key space.
+    fpm_wall_binned = _bin_fpm_wall_to_profiled_key(fpm_wall_by_shape)
     out: list[dict[str, Any]] = []
-    for key in sorted(set(profiled) & set(fpm_wall_by_shape)):
+    for key in sorted(set(profiled) & set(fpm_wall_binned)):
         batch_size, past_kv = key
         aic_compute, aic_comm, aic_total = aic_predict(batch_size, past_kv)
         if aic_compute is None:
             continue
         comp = profiled[key]
         row = decompose_shape(
-            wall_ms=fpm_wall_by_shape[key],
+            wall_ms=fpm_wall_binned[key],
             aic_compute_ms=aic_compute,
             aic_comm_ms=aic_comm,
             aic_other_ms=aic_total - aic_compute - aic_comm,
@@ -214,12 +246,25 @@ def _main(argv=None):
     fpm_csv = fpm_run / "fpm_metrics_phase.csv"
     if not fpm_csv.exists():
         fpm_csv, _subdir = G._resolve_fpm_source(fpm_run, args.tp, Path(args.out).resolve().parent)
-    _ctx, decode, _mix = api["_load_fpm"](fpm_csv, workload_segment="real")
+    # _load_fpm returns (context, decode, filtered_rows); we only need decode here.
+    # decode keys are (batch_size, mean_kv) with a RAW FLOAT mean_kv; run_decode_attribution
+    # bins them to the profiled integer past_kv (NVTX round(mean)) before joining.
+    _ctx, decode, _filtered = api["_load_fpm"](fpm_csv, workload_segment="real")
     fpm_wall = {key: api["_aggregate"](samples, "median") for key, samples in decode.items()}
 
     def aic_predict(batch_size, past_kv):
+        # Snap the (integer, profiled) past_kv to the nearest COLLECTED layerwise decode
+        # KV before predicting -- the layerwise GEN grid is exact-lookup, so an off-grid
+        # KV would raise/miss and drop the shape. This mirrors the headline 'layerwise'
+        # track in aic_fpm_gap.run() (which snaps via _nearest_available_generation_kv).
+        snapped = api["_nearest_available_generation_kv"](
+            db.layerwise, model=G.MODEL_NAME, tp_size=args.tp,
+            requested_kv=int(past_kv), max_distance=float("inf"),
+        )
+        if snapped is None:
+            return (None, None, None)
         compute, comm, total, _src, status = G.predict_decode_breakdown(
-            backend, model, db, rc, batch_size=batch_size, past_kv=past_kv, api=api
+            backend, model, db, rc, batch_size=batch_size, past_kv=snapped, api=api
         )
         return (compute, comm, total) if status == G.ST_OK else (None, None, None)
 

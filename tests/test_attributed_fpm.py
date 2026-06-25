@@ -131,6 +131,59 @@ def test_run_decode_attribution_joins_three_lanes():
     assert abs(terms - r["gap_ms"]) < 1e-9
 
 
+def test_run_decode_attribution_rounds_float_fpm_kv_to_profiled_past_kv():
+    """KEY-SPACE ALIGNMENT (TASK C step 2).
+
+    Profiled lane keys decode rows by (batch_size, past_kv) where past_kv is the
+    NVTX label = ``round(mean(num_computed_tokens))`` -> an INTEGER (see
+    dynamo_step_marker._decode_batch_and_kv). The clean FPM lane (_load_fpm decode)
+    keys by (batch_size, mean_decode_kv_tokens) where mean_kv is a RAW FLOAT. A naive
+    ``set(profiled) & set(fpm)`` join therefore drops every FPM shape whose mean_kv is
+    not an exact integer (e.g. 100.4), because (32, 100) != (32, 100.4).
+
+    Aligning the two means binning the FPM float key with the SAME round() the NVTX
+    marker uses, so a profiled row at past_kv=K joins to an FPM shape at mean_kv≈K.
+    """
+    from collector.layerwise.diagnostics.aic_fpm_attribute import run_decode_attribution
+
+    profiled_rows = [
+        {"step": s, "batch_size": 32, "past_kv": 100, "measure_run": 0,
+         "compute_gpu_us": 4000.0, "comm_gpu_us": 1000.0, "total_union_us": 4500.0}
+        for s in range(5)
+    ]
+    # FPM mean_kv is a non-integer float that rounds to the profiled past_kv (100).
+    fpm_wall = {(32, 100.4): 6.0}
+    aic = lambda bs, kv: (5.5, 0.8, 6.3) if (bs, kv) == (32, 100) else (None, None, None)
+
+    rows = run_decode_attribution(
+        sqlite_path="UNUSED", profiled_rows=profiled_rows,
+        fpm_wall_by_shape=fpm_wall, aic_predict=aic, discard_first_n=2,
+    )
+    assert len(rows) == 1, "float FPM mean_kv must bin to the integer profiled past_kv"
+    r = rows[0]
+    assert (r["batch_size"], r["past_kv"]) == (32, 100)
+    assert r["wall_ms"] == 6.0
+    # aic_predict is invoked with the integer profiled past_kv (100), not the float.
+    assert r["aic_total_ms"] == 6.3
+
+
+def test_bin_fpm_wall_to_profiled_key_rounds_and_aggregates_collisions():
+    """_bin_fpm_wall_to_profiled_key locks the FPM->profiled key transform: float
+    mean_kv -> int(round(mean_kv)) (the NVTX marker's round), and two FPM floats that
+    round to the same integer bin are aggregated (mean) into one wall."""
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _bin_fpm_wall_to_profiled_key
+
+    binned = _bin_fpm_wall_to_profiled_key({
+        (32, 100.4): 6.0,   # -> (32, 100)
+        (32, 99.7): 8.0,    # -> (32, 100), collides with the above -> mean(6,8)=7
+        (16, 4096.0): 3.0,  # exact integer float -> (16, 4096)
+    })
+    assert binned[(32, 100)] == 7.0
+    assert binned[(16, 4096)] == 3.0
+    # keys are pure ints (not floats), matching the profiled (batch_size, past_kv) space
+    assert all(isinstance(b, int) and isinstance(k, int) for (b, k) in binned)
+
+
 def test_advance_profiler_window_opens_once_closes_once():
     from collector.layerwise.vllm.vllm_step_marker import _advance_profiler_window
 
