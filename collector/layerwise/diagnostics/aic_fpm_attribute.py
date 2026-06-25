@@ -181,6 +181,83 @@ def run_decode_attribution(
     return out
 
 
+def aggregate_profiled_context(
+    rows: list[dict[str, Any]],
+    *,
+    discard_first_n: int = 3,
+    aggregate: str = "median",
+    ranks: int = 1,
+) -> dict[str, float]:
+    """Aggregate the PURE-CONTEXT profiled steps into one composition, in ms.
+
+    Context chunks are UNIFORM 2048-token prefill steps (FPM_MAX_NUM_BATCHED_TOKENS),
+    so they aggregate cleanly without per-shape keys (unlike decode, which varies by
+    (batch, past_kv)). PURE-CONTEXT steps are those the dynamo marker labels bs0 --
+    a step with NO decode requests (decode_batch == 0 -> ``batch_size == 0``); any
+    bs>0 row is a (possibly mixed) step with decode work and is excluded.
+
+    us->ms; compute/comm are divided by ranks (per-rank, same TP rationale as decode --
+    analyze_sqlite sums kernel durations across all captured ranks while wall + AIC are
+    single-rank); gpu_busy (interval union) is left as-is (ranks run in lockstep)."""
+    from collector.layerwise.vllm.nsys import _filter_boundary_discards
+
+    ctx_rows = [row for row in rows if int(row["batch_size"]) == 0]
+    ctx_rows = _filter_boundary_discards(ctx_rows, discard_first_n=discard_first_n)
+    compute = [float(row["compute_gpu_us"]) / 1000.0 for row in ctx_rows]
+    comm = [float(row["comm_gpu_us"]) / 1000.0 for row in ctx_rows]
+    busy = [float(row["total_union_us"]) / 1000.0 for row in ctx_rows]
+    reduce = statistics.median if aggregate == "median" else statistics.fmean
+    return {
+        "gpu_compute_ms": float(reduce(compute)) / ranks,
+        "gpu_comm_ms": float(reduce(comm)) / ranks,
+        "gpu_busy_ms": float(reduce(busy)),
+    }
+
+
+def run_context_attribution(
+    *,
+    sqlite_path: str,
+    profiled_rows: list[dict[str, Any]] | None,
+    fpm_ctx_wall_ms: float,
+    aic_ctx_predict,
+    discard_first_n: int = 3,
+    aggregate: str = "median",
+    ranks: int = 1,
+) -> dict[str, Any]:
+    """Join the profiled pure-context composition + clean FPM context wall + AIC ctx
+    breakdown into ONE aggregate decomposition (the 2048-token chunk shape is uniform,
+    so there is a single context decomposition, not a per-shape list like decode).
+
+    Args:
+      sqlite_path: nsys .sqlite to reduce (ignored if profiled_rows is given).
+      profiled_rows: pre-loaded analyze_sqlite rows (test seam); else analyze_sqlite is called.
+      fpm_ctx_wall_ms: the CLEAN FPM context-phase wall (median of the FPM 'context'
+                       phase latency_ms for the 2048-token single-request chunk).
+      aic_ctx_predict: callable() -> (compute_ms, comm_ms, total_ms) (caller wraps
+                       aic_fpm_gap.predict_context_breakdown for the 2048-token ctx chunk).
+    Returns one decompose_shape() dict tagged phase='context'.
+    """
+    if profiled_rows is None:
+        from collector.layerwise.diagnostics.analyze_nsys_comm_overlap import analyze_sqlite
+
+        profiled_rows, _meta = analyze_sqlite(sqlite_path)
+    comp = aggregate_profiled_context(
+        profiled_rows, discard_first_n=discard_first_n, aggregate=aggregate, ranks=ranks
+    )
+    aic_compute, aic_comm, aic_total = aic_ctx_predict()
+    row = decompose_shape(
+        wall_ms=fpm_ctx_wall_ms,
+        aic_compute_ms=aic_compute,
+        aic_comm_ms=aic_comm,
+        aic_other_ms=aic_total - aic_compute - aic_comm,
+        gpu_compute_ms=comp["gpu_compute_ms"],
+        gpu_comm_ms=comp["gpu_comm_ms"],
+        gpu_busy_ms=comp["gpu_busy_ms"],
+    )
+    row["phase"] = "context"
+    return row
+
+
 def write_decomposition_csv(rows: list[dict[str, Any]], out_path: str) -> None:
     """Write decomposition rows to CSV (stable column order)."""
     import csv
@@ -216,6 +293,7 @@ def _main(argv=None):
     the headline 'layerwise' track), per spec.
     """
     import argparse
+    import sys
     from pathlib import Path
     import collector.layerwise.diagnostics.aic_fpm_gap as G
 
@@ -253,10 +331,11 @@ def _main(argv=None):
     fpm_csv = fpm_run / "fpm_metrics_phase.csv"
     if not fpm_csv.exists():
         fpm_csv, _subdir = G._resolve_fpm_source(fpm_run, args.tp, Path(args.out).resolve().parent)
-    # _load_fpm returns (context, decode, filtered_rows); we only need decode here.
-    # decode keys are (batch_size, mean_kv) with a RAW FLOAT mean_kv; run_decode_attribution
-    # bins them to the profiled integer past_kv (NVTX round(mean)) before joining.
-    _ctx, decode, _filtered = api["_load_fpm"](fpm_csv, workload_segment="real")
+    # _load_fpm returns (context, decode, filtered_rows). decode keys are
+    # (batch_size, mean_kv) with a RAW FLOAT mean_kv; run_decode_attribution bins them to
+    # the profiled integer past_kv (NVTX round(mean)) before joining. context keys are
+    # (ctx_requests, ctx_tokens, ctx_prefix) and feed the context-phase attribution below.
+    context, decode, _filtered = api["_load_fpm"](fpm_csv, workload_segment="real")
     fpm_wall = {key: api["_aggregate"](samples, "median") for key, samples in decode.items()}
 
     def aic_predict(batch_size, past_kv):
@@ -275,12 +354,52 @@ def _main(argv=None):
         )
         return (compute, comm, total) if status == G.ST_OK else (None, None, None)
 
+    # Reduce the nsys lane once; both decode and context phases share the profiled rows
+    # (decode keys on per-(batch,kv) rows, context aggregates the bs0 pure-prefill rows).
+    from collector.layerwise.diagnostics.analyze_nsys_comm_overlap import analyze_sqlite
+    profiled_rows, _meta = analyze_sqlite(args.sqlite)
+
     rows = run_decode_attribution(
-        sqlite_path=args.sqlite, profiled_rows=None,
+        sqlite_path=args.sqlite, profiled_rows=profiled_rows,
         fpm_wall_by_shape=fpm_wall, aic_predict=aic_predict,
         discard_first_n=args.discard_first_n,
         ranks=args.tp,
     )
+
+    # --- context phase (the high-C context puzzle) ---
+    # Context chunks are UNIFORM 2048-token single-request prefill steps. Pick the
+    # DOMINANT FPM context key (most-sampled) so the AIC ctx_prefix matches the real
+    # chunk, median its latency for the clean wall, and decompose the single aggregate
+    # context shape. Skip gracefully (warn, keep decode rows) if either side is missing.
+    try:
+        ctx_2048 = {k: v for k, v in context.items() if int(k[1]) == 2048}
+        ctx_pool = ctx_2048 or context
+        if not ctx_pool:
+            raise ValueError("no FPM context-phase shapes found")
+        dom_key = max(ctx_pool.items(), key=lambda kv: len(kv[1]))[0]
+        ctx_requests, ctx_tokens, ctx_prefix = dom_key
+        fpm_ctx_wall_ms = api["_aggregate"](ctx_pool[dom_key], "median")
+
+        def aic_ctx_predict():
+            compute, comm, total, _src, status = G.predict_context_breakdown(
+                backend, model, db, rc,
+                ctx_tokens=int(ctx_tokens), ctx_prefix_tokens=int(ctx_prefix), api=api,
+            )
+            if status != G.ST_OK or compute is None:
+                raise ValueError(f"AIC context predict unavailable (status={status})")
+            return (compute, comm, total)
+
+        ctx_row = run_context_attribution(
+            sqlite_path=args.sqlite, profiled_rows=profiled_rows,
+            fpm_ctx_wall_ms=fpm_ctx_wall_ms, aic_ctx_predict=aic_ctx_predict,
+            discard_first_n=args.discard_first_n, ranks=args.tp,
+        )
+        ctx_row["batch_size"] = ""
+        ctx_row["past_kv"] = int(ctx_tokens)
+        rows.append(ctx_row)
+    except Exception as exc:  # noqa: BLE001 - never crash _main; decode rows still written
+        print(f"[attribute] context phase skipped: {exc}", file=sys.stderr)
+
     write_decomposition_csv(rows, args.out)
     print(f"[attribute] wrote {len(rows)} shapes -> {args.out}")
 

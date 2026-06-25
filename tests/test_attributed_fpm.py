@@ -371,3 +371,66 @@ def test_run_decode_attribution_divides_profiled_by_ranks():
     terms = (r["term_compute_err"] + r["term_comm_err"] + r["term_aic_other"]
              + r["term_overlap"] + r["term_neg_overhead"])
     assert abs(terms - r["gap_ms"]) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# TASK A: CONTEXT-PHASE attribution (the high-C context puzzle).
+# Context chunks are UNIFORM 2048-token prefill steps (FPM_MAX_NUM_BATCHED_TOKENS),
+# so PURE-CONTEXT profiled steps (decode_batch==0 -> bs0 in the dynamo marker label)
+# aggregate cleanly without per-shape keys.
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_profiled_context_selects_bs0_and_divides_by_ranks():
+    """aggregate_profiled_context picks ONLY pure-context profiled steps (batch_size==0,
+    the dynamo marker's bs0 pure-prefill label), converts us->ms, and divides
+    compute/comm by ranks (per-rank, like decode); gpu_busy (union) is left as-is."""
+    from collector.layerwise.diagnostics.aic_fpm_attribute import aggregate_profiled_context
+
+    # mix: 5 pure-context steps (bs0) + 3 decode steps (bs>0) that MUST be ignored.
+    rows = [
+        {"step": s, "batch_size": 0, "past_kv": 0, "measure_run": 0,
+         "compute_gpu_us": 320000.0, "comm_gpu_us": 16000.0, "total_union_us": 48000.0}
+        for s in range(5)
+    ]
+    rows += [
+        {"step": 100 + s, "batch_size": 32, "past_kv": 100, "measure_run": 0,
+         "compute_gpu_us": 4000.0, "comm_gpu_us": 1000.0, "total_union_us": 4500.0}
+        for s in range(3)
+    ]
+    out = aggregate_profiled_context(rows, discard_first_n=2, aggregate="median", ranks=8)
+    # only the bs0 cohort, discard first 2 -> median over steps 2,3,4 (all identical).
+    assert out["gpu_compute_ms"] == 40.0   # 320000us -> 320.0ms / 8 ranks
+    assert out["gpu_comm_ms"] == 2.0       # 16000us  -> 16.0ms  / 8 ranks
+    assert out["gpu_busy_ms"] == 48.0      # 48000us -> 48.0ms; union NOT divided
+
+
+def test_run_context_attribution_identity_holds():
+    """run_context_attribution produces a single aggregate context decompose_shape row
+    whose five attributed terms sum exactly to the gap, tagged phase='context'."""
+    from collector.layerwise.diagnostics.aic_fpm_attribute import run_context_attribution
+
+    profiled_rows = [
+        {"step": s, "batch_size": 0, "past_kv": 0, "measure_run": 0,
+         "compute_gpu_us": 320000.0, "comm_gpu_us": 16000.0, "total_union_us": 48000.0}
+        for s in range(5)
+    ]
+    # high-C context puzzle: FPM wall (219) far exceeds GPU busy (48) -> overhead dominates.
+    fpm_ctx_wall_ms = 219.0
+    aic_ctx_predict = lambda: (50.0, 8.0, 58.0)  # (compute, comm, total)
+
+    row = run_context_attribution(
+        sqlite_path="UNUSED", profiled_rows=profiled_rows,
+        fpm_ctx_wall_ms=fpm_ctx_wall_ms, aic_ctx_predict=aic_ctx_predict,
+        discard_first_n=2, ranks=8,
+    )
+    assert row["phase"] == "context"
+    assert row["wall_ms"] == 219.0
+    assert row["aic_total_ms"] == 58.0
+    assert row["gpu_compute_ms"] == 40.0   # 320.0ms / 8
+    assert row["gpu_comm_ms"] == 2.0       # 16.0ms / 8
+    assert row["gpu_busy_ms"] == 48.0      # union, undivided
+    assert row["overhead_ms"] == 171.0     # 219 - 48
+    terms = (row["term_compute_err"] + row["term_comm_err"] + row["term_aic_other"]
+             + row["term_overlap"] + row["term_neg_overhead"])
+    assert abs(terms - row["gap_ms"]) < 1e-9
