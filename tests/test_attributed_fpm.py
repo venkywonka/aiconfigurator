@@ -154,3 +154,43 @@ def test_advance_profiler_window_two_windows():
     for step in range(0, 14):
         _advance_profiler_window(step, spans, state, lambda a: calls.append((step, a)))
     assert calls == [(3, "start"), (6, "stop"), (10, "start"), (12, "stop")]
+
+
+def test_collect_threads_nsys_flags_to_inner_shell():
+    """stage_attribute -> collect.py -> docker.build_collect_command -> collect_fpm_metrics.sh.
+    The nsys flags must be parsed by collect.py and threaded into the inner shell argv."""
+    import types
+    from collector.layerwise.fpm import collect as C
+    from collector.layerwise.fpm import docker as D
+
+    case = types.SimpleNamespace(tp_size=1, ep_size=1, decode_past_kv=4096)
+
+    # with flags: collect.py must accept them, docker must forward them to the inner shell
+    args = C._build_arg_parser().parse_args(
+        ["--model", "Qwen/Qwen3-0.6B", "--nsys-profile-worker",
+         "--nsys-cuda-profiler-window", "20-30"]
+    )
+    assert args.nsys_profile_worker is True
+    assert args.nsys_cuda_profiler_window == "20-30"
+    argv = D.build_collect_command(args, case, __import__("pathlib").Path("/tmp/x")).argv
+    assert argv[1].endswith("collect_fpm_metrics.sh")
+    assert "--nsys-profile-worker" in argv
+    i = argv.index("--nsys-cuda-profiler-window")
+    assert argv[i + 1] == "20-30"
+    # the cuda-profiler-window must precede any '--' extra-vllm-arg separator
+    if "--" in argv:
+        assert i < argv.index("--")
+
+
+def test_collect_omits_nsys_flags_when_unset():
+    import types
+    from collector.layerwise.fpm import collect as C
+    from collector.layerwise.fpm import docker as D
+
+    case = types.SimpleNamespace(tp_size=1, ep_size=1, decode_past_kv=4096)
+    args = C._build_arg_parser().parse_args(["--model", "Qwen/Qwen3-0.6B"])
+    assert args.nsys_profile_worker is False
+    assert args.nsys_cuda_profiler_window is None
+    argv = D.build_collect_command(args, case, __import__("pathlib").Path("/tmp/x")).argv
+    assert "--nsys-profile-worker" not in argv
+    assert "--nsys-cuda-profiler-window" not in argv

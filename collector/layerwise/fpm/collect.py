@@ -95,6 +95,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Forward to the FPM shell as --allow-version-mismatch: warn instead of failing if "
         "the image's vLLM version differs from the expected version.",
     )
+    advanced.add_argument(
+        "--nsys-profile-worker",
+        action="store_true",
+        help="Forward to the FPM shell as --nsys-profile-worker: wrap the vLLM worker in nsys "
+        "profile and write reports under RUN_DIR/nsys (used by the attributed-FPM 'attribute' stage).",
+    )
+    advanced.add_argument(
+        "--nsys-cuda-profiler-window",
+        default=None,
+        help="Forward to the FPM shell as --nsys-cuda-profiler-window: windowed "
+        'cudaProfilerStart/Stop gating "lo-hi[,lo-hi...]" step ordinals.',
+    )
     return parser
 
 
