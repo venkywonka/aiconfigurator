@@ -33,6 +33,10 @@ def _write_csv_header_if_needed(path: Path) -> None:
         csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
 
 def _append_success_row(path: Path, row: dict[str, Any]) -> None:
+    # The row dict is re-projected onto exactly CSV_COLUMNS: unknown keys are
+    # silently dropped and missing keys are blanked. This is what keeps the main
+    # CSV at a stable 30 columns even for phase="mixed" rows, whose per-cell
+    # M/C/D values live in the mixed_steps.jsonl side-artifact, not here.
     with path.open("a", newline="") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
