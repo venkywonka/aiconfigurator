@@ -503,8 +503,11 @@ stage_attribute() {
       local rdir; rdir="$(fpm_run_dir "$slug" "$pname")/attribute"; mkdir -p "$rdir"
       log "Attribute: $hf tp=$FPM_TP_LIST pareto=$pname conc=$conc req=$req window=$ATTRIBUTE_WINDOW -> $rdir"
 
-      # (a) FPM real workload under nsys windowed capture (reuses the FPM collector path)
-      run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value)" \
+      # (a) FPM real workload under nsys windowed capture (reuses the FPM collector path).
+      # NSYS_BIN/NSYS_HOST_DIR propagate (collect.py runs the inner shell with os.environ.copy()) so
+      # collect_fpm_metrics.sh mounts the host Nsight install ro into the worker container and execs the
+      # absolute nsys path there (the worker image has no nsys on PATH -> bare `nsys` exits 127).
+      run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
