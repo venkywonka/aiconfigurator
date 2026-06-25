@@ -721,9 +721,13 @@ REPO_IN_CTR=/aic-src
 NSYS_REPO_DOCKER_MOUNTS=()
 if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
     NSYS_REPO_DOCKER_MOUNTS=(-v "${REPO_HOST}:${REPO_IN_CTR}:ro")
+    # Only the DYNAMO marker (real-batch labels). NOT LAYERWISE_STEP_MARKER: that
+    # activates vllm_step_marker, which also wraps GPUModelRunner.execute_model and
+    # would double-wrap the forward + emit single-stream counter-mode labels. The
+    # dynamo marker imports vllm_step_marker for shared window helpers, but that
+    # module's _install() no-ops when LAYERWISE_STEP_MARKER is unset.
     WORKER_DOCKER_ENV+=(
         -e "PYTHONPATH=${REPO_IN_CTR}/collector/layerwise/vllm:${REPO_IN_CTR}"
-        -e "LAYERWISE_STEP_MARKER=1"
         -e "LAYERWISE_DYNAMO_STEP_MARKER=1"
     )
 fi

@@ -11,11 +11,19 @@ sitecustomize on PYTHONPATH), and even if it were, its counter-mode label
 assumes ``isl=1`` single-stream (``past_kv = n - 1``) which is WRONG for a real
 multi-request FPM workload.
 
-So per-step NVTX for the FPM/attribute path must come from a DYNAMO-side hook on
-``InstrumentedScheduler.update_from_output`` that reads the REAL per-step batch
-state and emits a label in the EXACT format the existing nsys parser
-(``collector/layerwise/common/parse_nsys_step_sweep.py`` /
+So per-step NVTX for the FPM/attribute path must wrap the GPU forward
+(``GPUModelRunner.execute_model``) -- reading the REAL per-step batch state from
+the ``scheduler_output`` arg -- and emit a label in the EXACT format the existing
+nsys parser (``collector/layerwise/common/parse_nsys_step_sweep.py`` /
 ``collector/layerwise/diagnostics/analyze_nsys_comm_overlap.py``) keys on.
+
+NOTE (Phase-0 smoke #5): an earlier version hooked
+``InstrumentedScheduler.update_from_output``, but in vLLM v1 the per-step order is
+``schedule() -> execute_model() [GPU kernels] -> update_from_output()``. NVTX around
+``update_from_output`` brackets only post-step CPU bookkeeping (~0 kernels inside the
+window), so kernels were attributed to no step. We MUST wrap ``execute_model`` (the
+forward) -- the same method ``vllm_step_marker`` wraps -- but with REAL-batch labels
+instead of its single-stream counter-mode labels.
 
 Label format (must match ``vllm_step_marker.py:_run_marked_step``)::
 
@@ -104,11 +112,14 @@ def _bench_step_label(step: int, decode_batch: int, mean_kv: int) -> str:
 
 
 def _install() -> None:
-    """Monkeypatch ``InstrumentedScheduler.update_from_output`` to emit NVTX.
+    """Monkeypatch ``GPUModelRunner.execute_model`` to emit per-step NVTX.
 
-    No-op unless ``LAYERWISE_DYNAMO_STEP_MARKER=1``. Wrapped in try/except so a
-    missing dynamo / torch import (or any patch failure) never crashes worker
-    startup -- it only logs to stderr.
+    Wraps the GPU FORWARD (where the step's kernels run), reading the REAL
+    per-step batch state from the ``scheduler_output`` arg. NOT
+    ``update_from_output`` -- that runs after the forward and would bracket no
+    kernels (see module docstring / Phase-0 smoke #5). No-op unless
+    ``LAYERWISE_DYNAMO_STEP_MARKER=1``; wrapped in try/except so a missing
+    torch/vllm import (or any patch failure) never crashes worker startup.
     """
     if os.environ.get("LAYERWISE_DYNAMO_STEP_MARKER") != "1":
         return
@@ -116,16 +127,17 @@ def _install() -> None:
     try:
         import torch.cuda.nvtx as nvtx
 
-        from dynamo.vllm.instrumented_scheduler import InstrumentedScheduler
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-        orig = InstrumentedScheduler.update_from_output
+        orig = GPUModelRunner.execute_model
+        state = {"n": 0}
 
-        def patched(self, scheduler_output, model_runner_output):
-            # Read the REAL per-step batch state BEFORE the original call.
+        def patched(self, scheduler_output, *args, **kwargs):
+            # Read the REAL per-step batch state BEFORE running the forward.
             decode_batch, mean_kv = _decode_batch_and_kv(scheduler_output)
 
-            n = getattr(self, "_layerwise_step_n", 0) + 1
-            self._layerwise_step_n = n
+            state["n"] += 1
+            n = state["n"]
 
             label = _bench_step_label(n, decode_batch, mean_kv)
             spans = _parse_profiler_window(
@@ -140,7 +152,7 @@ def _install() -> None:
 
                 _advance_profiler_window(n, spans, _PROFILER_STATE, _prof_call)
             try:
-                return orig(self, scheduler_output, model_runner_output)
+                return orig(self, scheduler_output, *args, **kwargs)
             finally:
                 if spans:
                     from collector.layerwise.vllm.worker import (
@@ -150,9 +162,9 @@ def _install() -> None:
                     _advance_profiler_window(n, spans, _PROFILER_STATE, _prof_call)
                 nvtx.range_pop()
 
-        InstrumentedScheduler.update_from_output = patched
+        GPUModelRunner.execute_model = patched
         logger.warning(
-            "[dynamo-step-marker] installed InstrumentedScheduler.update_from_output wrapper"
+            "[dynamo-step-marker] installed GPUModelRunner.execute_model wrapper (real-batch labels)"
         )
     except Exception as exc:  # never crash worker startup
         print(
