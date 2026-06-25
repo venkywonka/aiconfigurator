@@ -27,3 +27,6 @@ if os.environ.get("LAYERWISE_SCHEDULER_TIMING", "0") == "1":
 
 if os.environ.get("LAYERWISE_STEP_MARKER") == "1":
     _try_import("vllm_step_marker")
+
+if os.environ.get("LAYERWISE_DYNAMO_STEP_MARKER") == "1":
+    _try_import("dynamo_step_marker")

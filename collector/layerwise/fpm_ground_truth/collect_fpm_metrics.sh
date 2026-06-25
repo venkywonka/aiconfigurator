@@ -711,6 +711,22 @@ if [ -n "$NSYS_CUDA_PROFILER_WINDOW" ]; then
     )
 fi
 NSYS_DOCKER_MOUNTS=()
+# When the worker is profiled under nsys, bind-mount the aiconfigurator repo
+# read-only and put it on PYTHONPATH so the spawned `python3 -m dynamo.vllm`
+# worker auto-imports sitecustomize (collector/layerwise/vllm), which installs
+# the dynamo per-step NVTX marker (dynamo_step_marker). Gated so non-profiled
+# FPM runs are unchanged.
+REPO_HOST="$(pwd)"
+REPO_IN_CTR=/aic-src
+NSYS_REPO_DOCKER_MOUNTS=()
+if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
+    NSYS_REPO_DOCKER_MOUNTS=(-v "${REPO_HOST}:${REPO_IN_CTR}:ro")
+    WORKER_DOCKER_ENV+=(
+        -e "PYTHONPATH=${REPO_IN_CTR}/collector/layerwise/vllm:${REPO_IN_CTR}"
+        -e "LAYERWISE_STEP_MARKER=1"
+        -e "LAYERWISE_DYNAMO_STEP_MARKER=1"
+    )
+fi
 HF_TOKEN_FILE_HOST="${HF_TOKEN_FILE:-/home/shadeform/hf.token}"
 HF_TOKEN_DOCKER_MOUNTS=()
 HF_TOKEN_CONTAINER_PREFIX=()
@@ -1367,6 +1383,7 @@ run docker run -d \
     -v "${VLLM_CACHE_HOST}:/root/.cache/vllm" \
     "${HF_TOKEN_DOCKER_MOUNTS[@]}" \
     "${NSYS_DOCKER_MOUNTS[@]}" \
+    "${NSYS_REPO_DOCKER_MOUNTS[@]}" \
     "${WORKER_DOCKER_ENV[@]}" \
     -e "DYN_FORWARDPASS_METRIC_PORT=${FPM_PORT}" \
     -e "DYN_SYSTEM_PORT=${SYSTEM_PORT}" \
