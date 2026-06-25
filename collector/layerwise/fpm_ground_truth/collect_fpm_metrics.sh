@@ -757,7 +757,7 @@ mkdir -p \
     "${HF_HOME_HOST}" \
     "${VLLM_CACHE_HOST}" \
     "${VLLM_CACHE_HOST}/tilelang/tmp"
-chmod a+rwx "${RUN_DIR}" "${RUN_DIR}/discovery" "${VLLM_CACHE_HOST}" "${VLLM_CACHE_HOST}/tilelang" "${VLLM_CACHE_HOST}/tilelang/tmp"
+chmod a+rwx "${RUN_DIR}" "${RUN_DIR}/discovery" "${RUN_DIR}/nsys" "${VLLM_CACHE_HOST}" "${VLLM_CACHE_HOST}/tilelang" "${VLLM_CACHE_HOST}/tilelang/tmp"
 if [[ "${HF_HOME_HOST_IS_RUN_LOCAL}" == "1" ]]; then
     chmod a+rwx "${HF_HOME_HOST}"
 fi
