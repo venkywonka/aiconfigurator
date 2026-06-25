@@ -180,6 +180,15 @@ if [[ "$SMOKE" == "1" ]]; then
   FPM_MAX_NUM_SEQS="8"; FPM_MAX_NUM_BATCHED_TOKENS="2048"; PLOT_PARETO="c2"
   LW_RUN_PRESET="smoke"
 fi
+
+# Env override: a caller-supplied MODEL (e.g. the autocollector's AIC_LAYERWISE_MODELS)
+# wins over the hardcoded/smoke default so the model is actually selectable. SMOKE
+# still scales the shapes; only the model identity is overridden here. Optional
+# MODEL_SLUG / MODEL_KIND / MOE_PERF_FILE refine the single-entry matrix.
+if [[ -n "${MODEL:-}" ]]; then
+  _model_slug="${MODEL_SLUG:-${MODEL//\//-}}"
+  MODELS=("${_model_slug}|${MODEL}|${MODEL_KIND:-dense}|${MOE_PERF_FILE:-}")
+fi
 LW_RUN_PRESET="${LW_RUN_PRESET:-full}"
 
 # P1: normalize pareto point names to the concurrency ladder length (auto-derive c<conc>) so
