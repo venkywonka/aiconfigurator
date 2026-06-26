@@ -50,6 +50,7 @@ _FORCED_STEP_META = {"step": None, "bs": None, "past": None, "run": None}
 _MATCHED_ONCE_KEYS = set()
 _LAST_DECODE_MATCH_META: dict[str, object] = {}
 _LAST_CTX_MATCH_META: dict[str, object] = {}
+_LAST_MIXED_MATCH_META: dict[str, object] = {}
 
 # Windowed cudaProfilerStart/Stop gating. nsys must NOT fence every step
 # (worker._cuda_profiler_call syncs before each fence, which would destroy
@@ -118,7 +119,23 @@ def clear_forced_step_meta():
     _FORCED_STEP_META.update({"step": None, "bs": None, "past": None, "run": None})
 
 
-def _progress_datapoint_id(work_unit_id, phase, batch_size, step, past_kv):
+def _progress_datapoint_id(
+    work_unit_id,
+    phase,
+    batch_size,
+    step,
+    past_kv,
+    *,
+    prefill_tokens=0,
+    decode_requests=0,
+    decode_past_kv=0,
+):
+    if phase == "mixed":
+        # Mirror DataPoint.shape_key for the mixed phase exactly.
+        return (
+            f"{work_unit_id}:mixed:"
+            f"P{int(prefill_tokens)}:B{int(decode_requests)}:K{int(decode_past_kv)}"
+        )
     new_tokens = step if phase == "ctx" else 1
     return f"{work_unit_id}:{phase}:bs{batch_size}:new{new_tokens}:past{past_kv}"
 
@@ -135,10 +152,20 @@ def _write_progress(event, *, step, batch_size, past_kv, phase=None, **extra):
     phase = phase or os.environ.get("LAYERWISE_PROGRESS_PHASE")
     if not path or not work_unit_id or not phase:
         return
+    datapoint_id = _progress_datapoint_id(
+        work_unit_id,
+        phase,
+        batch_size,
+        step,
+        past_kv,
+        prefill_tokens=extra.get("prefill_tokens", 0),
+        decode_requests=extra.get("decode_requests", 0),
+        decode_past_kv=extra.get("decode_past_kv", 0),
+    )
     row = {
         "event": event,
         "work_unit_id": work_unit_id,
-        "datapoint_id": _progress_datapoint_id(work_unit_id, phase, batch_size, step, past_kv),
+        "datapoint_id": datapoint_id,
         "phase": phase,
         "batch_size": int(batch_size),
         "new_tokens": int(step if phase == "ctx" else 1),
@@ -396,6 +423,79 @@ def _ctx_chunk_match(runner, scheduler_output, control: dict) -> tuple[bool, int
     return True, int(target_new), len(scheduled), past_kv
 
 
+def _mixed_match(runner, scheduler_output, control: dict) -> tuple[bool, int, int, int]:
+    """Return whether this iteration is the target fused mixed step.
+
+    The mixed step co-schedules exactly ONE freshly added prefill request taking
+    its full (un-chunked) ``P`` tokens alongside exactly ``B`` cached decode
+    requests, each scheduled for a single token and each having already computed
+    exactly ``K`` KV tokens. This is the additive-vs-fused probe forward.
+
+    Reject chunked-P (prefill scheduled for < P, or computed >= prompt_len),
+    wrong B, wrong K, pure-ctx (no decodes), and pure-gen (no new prefill).
+    Returns ``(matched, P, B, K)``; sets ``_LAST_MIXED_MATCH_META`` on match.
+    """
+
+    global _LAST_MIXED_MATCH_META
+    _LAST_MIXED_MATCH_META = {}
+
+    target_p = control.get("prefill_tokens")
+    target_b = control.get("decode_bs")
+    target_k = control.get("past")
+    if target_p is None or target_b is None or target_k is None:
+        return False, 0, 0, 0
+    target_p = int(target_p)
+    target_b = int(target_b)
+    target_k = int(target_k)
+
+    new_reqs = list(scheduler_output.scheduled_new_reqs)
+    # Exactly one new (prefill) request.
+    if len(new_reqs) != 1:
+        return False, 0, 0, 0
+
+    scheduled = scheduler_output.num_scheduled_tokens
+    cached = scheduler_output.scheduled_cached_reqs
+    cached_ids = list(cached.req_ids)
+    # Exactly B cached (decode) requests, and exactly B+1 scheduled reqs total.
+    if len(cached_ids) != target_b:
+        return False, 0, 0, 0
+    if len(scheduled) != target_b + 1:
+        return False, 0, 0, 0
+
+    prefill = new_reqs[0]
+    prefill_id = getattr(prefill, "req_id", None)
+    if prefill_id is None or prefill_id not in scheduled:
+        return False, 0, 0, 0
+    # The prefill must be scheduled UN-CHUNKED for its full P tokens, and must
+    # not have already computed its prompt (i.e. it is a genuine prefill).
+    if int(scheduled[prefill_id]) != target_p:
+        return False, 0, 0, 0
+    prompt_len = _request_prompt_len(prefill)
+    if prompt_len is None:
+        return False, 0, 0, 0
+    prefill_computed = int(getattr(prefill, "num_computed_tokens", 0))
+    if prefill_computed >= int(prompt_len):
+        return False, 0, 0, 0
+
+    # Each cached decode req: exactly one scheduled token, computed == K.
+    computed_by_req = _cached_num_computed_tokens(scheduler_output)
+    for req_id in cached_ids:
+        if req_id == prefill_id:
+            return False, 0, 0, 0
+        if int(scheduled.get(req_id, 0)) != 1:
+            return False, 0, 0, 0
+        computed = computed_by_req.get(req_id)
+        if computed is None or int(computed) != target_k:
+            return False, 0, 0, 0
+
+    _LAST_MIXED_MATCH_META = {
+        "prefill_tokens": target_p,
+        "decode_bs": target_b,
+        "past": target_k,
+    }
+    return True, target_p, target_b, target_k
+
+
 def _run_marked_step(
     orig,
     runner,
@@ -431,6 +531,17 @@ def _run_marked_step(
                 "actual_step": int(step),
                 "actual_batch_size": int(batch_size),
                 "actual_past_kv": int(past_kv),
+            }
+        )
+    elif control.get("trigger") == "mixed":
+        # P/B/K identify the mixed datapoint; they also drive the mixed
+        # shape_key in _progress_datapoint_id (via _write_progress).
+        progress_extra.update(
+            {
+                "prefill_tokens": int(control.get("prefill_tokens", 0)),
+                "decode_requests": int(control.get("decode_bs", 0)),
+                "decode_past_kv": int(control.get("past", 0)),
+                "role": control.get("role", "M"),
             }
         )
     if control.get("trigger"):
@@ -503,6 +614,97 @@ def _run_marked_step(
         nvtx.range_pop()
 
 
+def _dispatch_trigger(orig, runner, scheduler_output, intermediate_tensors, control):
+    """Route an explicit ``trigger`` (decode_only / ctx_chunk / mixed) control.
+
+    Returns ``(handled, ret)``. ``handled`` is True whenever a recognized
+    ``trigger`` key is present (the call is fully owned by this dispatcher,
+    either by running the marked step or by passing the call through to ``orig``
+    when the iteration does not match). ``handled`` is False only when no trigger
+    is set, so the caller can fall back to its env-driven counting path.
+    """
+
+    trigger = control.get("trigger")
+    if trigger == "decode_only":
+        matched, step, batch_size, past_kv = _decode_only_match(runner, scheduler_output, control)
+        if not matched:
+            return True, orig(runner, scheduler_output, intermediate_tensors)
+        if control.get("match_once"):
+            once_key = (
+                control.get("phase"),
+                control.get("run"),
+                control.get("bs"),
+                control.get("past"),
+            )
+            if once_key in _MATCHED_ONCE_KEYS:
+                return True, orig(runner, scheduler_output, intermediate_tensors)
+            _MATCHED_ONCE_KEYS.add(once_key)
+        return True, _run_marked_step(
+            orig,
+            runner,
+            scheduler_output,
+            intermediate_tensors,
+            step=step,
+            batch_size=batch_size,
+            past_kv=past_kv,
+            control=control,
+        )
+    if trigger == "ctx_chunk":
+        matched, step, batch_size, past_kv = _ctx_chunk_match(runner, scheduler_output, control)
+        if not matched:
+            return True, orig(runner, scheduler_output, intermediate_tensors)
+        if control.get("match_once"):
+            once_key = (
+                control.get("phase"),
+                control.get("run"),
+                control.get("bs"),
+                control.get("step"),
+                control.get("past"),
+            )
+            if once_key in _MATCHED_ONCE_KEYS:
+                return True, orig(runner, scheduler_output, intermediate_tensors)
+            _MATCHED_ONCE_KEYS.add(once_key)
+        return True, _run_marked_step(
+            orig,
+            runner,
+            scheduler_output,
+            intermediate_tensors,
+            step=step,
+            batch_size=batch_size,
+            past_kv=past_kv,
+            control=control,
+        )
+    if trigger == "mixed":
+        matched, prefill_tokens, decode_bs, past = _mixed_match(runner, scheduler_output, control)
+        if not matched:
+            return True, orig(runner, scheduler_output, intermediate_tensors)
+        if control.get("match_once"):
+            once_key = (
+                control.get("phase"),
+                control.get("run"),
+                "mixed",
+                int(prefill_tokens),
+                int(decode_bs),
+                int(past),
+            )
+            if once_key in _MATCHED_ONCE_KEYS:
+                return True, orig(runner, scheduler_output, intermediate_tensors)
+            _MATCHED_ONCE_KEYS.add(once_key)
+        # step/batch_size/past_kv feed the NVTX label only; the unique
+        # datapoint_id is built from P/B/K in _run_marked_step's mixed branch.
+        return True, _run_marked_step(
+            orig,
+            runner,
+            scheduler_output,
+            intermediate_tensors,
+            step=int(past) + 1,
+            batch_size=int(decode_bs),
+            past_kv=int(past),
+            control=control,
+        )
+    return False, None
+
+
 def _install():
     if os.environ.get("LAYERWISE_STEP_MARKER", "1") != "1":
         logger.info("[step-marker] disabled via LAYERWISE_STEP_MARKER=0")
@@ -524,55 +726,9 @@ def _install():
         """Wrapped execute_model that emits NVTX markers for selected steps."""
 
         control = _read_control()
-        if control.get("trigger") == "decode_only":
-            matched, step, batch_size, past_kv = _decode_only_match(self, scheduler_output, control)
-            if not matched:
-                return orig(self, scheduler_output, intermediate_tensors)
-            if control.get("match_once"):
-                once_key = (
-                    control.get("phase"),
-                    control.get("run"),
-                    control.get("bs"),
-                    control.get("past"),
-                )
-                if once_key in _MATCHED_ONCE_KEYS:
-                    return orig(self, scheduler_output, intermediate_tensors)
-                _MATCHED_ONCE_KEYS.add(once_key)
-            return _run_marked_step(
-                orig,
-                self,
-                scheduler_output,
-                intermediate_tensors,
-                step=step,
-                batch_size=batch_size,
-                past_kv=past_kv,
-                control=control,
-            )
-        if control.get("trigger") == "ctx_chunk":
-            matched, step, batch_size, past_kv = _ctx_chunk_match(self, scheduler_output, control)
-            if not matched:
-                return orig(self, scheduler_output, intermediate_tensors)
-            if control.get("match_once"):
-                once_key = (
-                    control.get("phase"),
-                    control.get("run"),
-                    control.get("bs"),
-                    control.get("step"),
-                    control.get("past"),
-                )
-                if once_key in _MATCHED_ONCE_KEYS:
-                    return orig(self, scheduler_output, intermediate_tensors)
-                _MATCHED_ONCE_KEYS.add(once_key)
-            return _run_marked_step(
-                orig,
-                self,
-                scheduler_output,
-                intermediate_tensors,
-                step=step,
-                batch_size=batch_size,
-                past_kv=past_kv,
-                control=control,
-            )
+        handled, ret = _dispatch_trigger(orig, self, scheduler_output, intermediate_tensors, control)
+        if handled:
+            return ret
 
         # Ignore pre-bench calls (profile_run, single-req sanity) entirely —
         # only start counting once we see a prefill with ≥ min_new new reqs.
