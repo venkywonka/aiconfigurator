@@ -143,6 +143,66 @@ class DynamoStepMarkerFailClosedTests(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    # (d) idempotency --------------------------------------------------------
+    def test_install_is_idempotent_no_double_wrap(self):
+        """Two _install() calls (success path) must wrap execute_model ONCE.
+
+        In production, sitecustomize imports the module (running _install at
+        import) AND _try_import(required=True) re-invokes _install -- so
+        _install runs twice. A non-idempotent install double-wraps
+        ``GPUModelRunner.execute_model``, emitting two nested ``bench_step::``
+        NVTX ranges per step and corrupting attribution. _install must be
+        idempotent: the second call is a no-op, so exactly one NVTX range is
+        pushed per step.
+        """
+        import types
+
+        os.environ["LAYERWISE_DYNAMO_STEP_MARKER"] = "1"
+
+        # Fake the vllm patch target so the SUCCESS path runs (vllm is normally
+        # absent in this venv). torch is already stubbed at module load, so the
+        # ``import torch.cuda.nvtx`` inside _install succeeds; the patched
+        # forward is never CALLED here -- we only compare the installed method
+        # identity, which is independent of NVTX/torch resolution.
+        class _FakeRunner:
+            def execute_model(self, scheduler_output, *args, **kwargs):
+                return "real-forward"
+
+        fake_gmr = types.ModuleType("vllm.v1.worker.gpu_model_runner")
+        fake_gmr.GPUModelRunner = _FakeRunner
+        fake_pkgs = {
+            "vllm": types.ModuleType("vllm"),
+            "vllm.v1": types.ModuleType("vllm.v1"),
+            "vllm.v1.worker": types.ModuleType("vllm.v1.worker"),
+            "vllm.v1.worker.gpu_model_runner": fake_gmr,
+        }
+        saved_modules = {name: sys.modules.get(name) for name in fake_pkgs}
+        sys.modules.update(fake_pkgs)
+        try:
+            original = _FakeRunner.execute_model
+            dsm._install()
+            wrapped_once = _FakeRunner.execute_model
+            self.assertIsNot(
+                wrapped_once, original, "first _install should wrap execute_model"
+            )
+
+            dsm._install()  # second call must be a no-op (idempotent)
+            wrapped_twice = _FakeRunner.execute_model
+            self.assertIs(
+                wrapped_twice,
+                wrapped_once,
+                "second _install re-wrapped execute_model (non-idempotent) -> "
+                "two nested bench_step:: NVTX ranges per step; _install must be "
+                "idempotent so re-invocation (import + _try_import) wraps once",
+            )
+        finally:
+            # Restore sys.modules so later tests' "vllm absent" precondition holds.
+            for name, mod in saved_modules.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -129,6 +129,15 @@ def _install() -> None:
 
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+        # Idempotent: in production the marker is installed twice (once at module
+        # import, once when ``sitecustomize._try_import(required=True)``
+        # re-invokes _install for the fail-closed cached-module path). Re-wrapping
+        # an already-wrapped ``execute_model`` would emit two nested
+        # ``bench_step::`` NVTX ranges per step and corrupt attribution, so bail
+        # out if our wrapper is already installed.
+        if getattr(GPUModelRunner.execute_model, "_layerwise_dynamo_marked", False):
+            return
+
         orig = GPUModelRunner.execute_model
         state = {"n": 0}
 
@@ -162,6 +171,7 @@ def _install() -> None:
                     _advance_profiler_window(n, spans, _PROFILER_STATE, _prof_call)
                 nvtx.range_pop()
 
+        patched._layerwise_dynamo_marked = True
         GPUModelRunner.execute_model = patched
         logger.warning(
             "[dynamo-step-marker] installed GPUModelRunner.execute_model wrapper (real-batch labels)"
