@@ -329,7 +329,14 @@ def _main(argv=None):
     )
     if err:
         raise SystemExit(f"AIC model/db build failed: {err}")
-    rc = api["RuntimeConfig"](vllm_max_num_batched_tokens=8192, vllm_max_num_seqs=None)
+    # Build the predictor's RuntimeConfig from the run's effective config rather
+    # than a hardcoded literal (F3). vllm_max_num_seqs stays None: GEN rows carry
+    # an empty max_num_seqs, so None selects the primary index on the layerwise track.
+    run_rc = G._read_runtime_config(Path(args.fpm_run))
+    rc = api["RuntimeConfig"](
+        vllm_max_num_batched_tokens=run_rc["vllm_max_num_batched_tokens"],
+        vllm_max_num_seqs=None,
+    )
 
     # clean-lane FPM wall per decode shape (batch_size, mean_kv) from the golden run.
     # Per-pareto-point FPM runs land flat (fpm_metrics_phase.csv); fall back to the

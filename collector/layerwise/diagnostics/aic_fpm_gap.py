@@ -626,16 +626,38 @@ def run(repo_root: Path, fpm_run: Path, out_dir: Path, *, system: str, backend_n
 
 
 def _read_runtime_config(subdir: Path) -> dict:
-    """Pull max_num_batched_tokens / max_num_seqs from the FPM effective config."""
+    """Pull max_num_batched_tokens / max_num_seqs from the FPM effective config.
+
+    The real effective_vllm_config.json uses FLATTENED dotted keys
+    (e.g. "scheduler_config.max_num_batched_tokens"); the top-level and
+    nested-object reads are kept as fallbacks. Warn loudly when we cannot read
+    the config and fall back to the 2048/128 constants.
+    """
     import json
+    import logging
     cfg_path = subdir / "effective_vllm_config.json"
     mnbt, mns = 2048, 128
     try:
         cfg = json.loads(cfg_path.read_text())
-        mnbt = int(cfg.get("max_num_batched_tokens") or cfg.get("scheduler_config", {}).get("max_num_batched_tokens") or mnbt)
-        mns = int(cfg.get("max_num_seqs") or cfg.get("scheduler_config", {}).get("max_num_seqs") or mns)
+        scheduler = cfg.get("scheduler_config") or {}
+        mnbt = int(
+            cfg.get("scheduler_config.max_num_batched_tokens")
+            or cfg.get("max_num_batched_tokens")
+            or scheduler.get("max_num_batched_tokens")
+            or mnbt
+        )
+        mns = int(
+            cfg.get("scheduler_config.max_num_seqs")
+            or cfg.get("max_num_seqs")
+            or scheduler.get("max_num_seqs")
+            or mns
+        )
     except Exception:  # noqa: BLE001 - fall back to known FPM-run constants
-        pass
+        logging.warning(
+            "_read_runtime_config: could not read %s; falling back to "
+            "max_num_batched_tokens=%d / max_num_seqs=%d constants",
+            cfg_path, mnbt, mns,
+        )
     return {"vllm_max_num_batched_tokens": mnbt, "vllm_max_num_seqs": mns}
 
 
