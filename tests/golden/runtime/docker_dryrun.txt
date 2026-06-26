@@ -1,0 +1,17 @@
+[16:46:02] Run directory: /tmp/dynamo-fpm-20260625-164602-2889583
+[16:46:02] CSV output: /tmp/dynamo-fpm-20260625-164602-2889583/fpm_metrics.csv
+[16:46:02] FPM detail CSV: /tmp/dynamo-fpm-20260625-164602-2889583/fpm_metrics_detail.csv
+[16:46:02] FPM phase CSV: /tmp/dynamo-fpm-20260625-164602-2889583/fpm_metrics_phase.csv
+[16:46:02] Request workload CSV: /tmp/dynamo-fpm-20260625-164602-2889583/request_workload.csv
+[16:46:02] vLLM metadata JSON: /tmp/dynamo-fpm-20260625-164602-2889583/vllm_metadata.json
+[16:46:02] vLLM effective config JSON: /tmp/dynamo-fpm-20260625-164602-2889583/effective_vllm_config.json
+[16:46:02] Measured phases: context,decode
+[16:46:03] Starting frontend container dynamo-fpm-20260625-164602-2889583-frontend
++ docker run -d --name dynamo-fpm-20260625-164602-2889583-frontend --network host -v /tmp/dynamo-fpm-20260625-164602-2889583:/work -e DYN_DISCOVERY_BACKEND=file -e DYN_REQUEST_PLANE=tcp -e DYN_EVENT_PLANE=zmq -e DYN_FILE_KV=/work/discovery -e DYN_NAMESPACE=dynamo -e DYN_HTTP_PORT=8000 dynamo:latest-vllm python3 -m dynamo.frontend --http-port 8000 --discovery-backend file --request-plane tcp --event-plane zmq
+[16:46:03] Starting vLLM worker container dynamo-fpm-20260625-164602-2889583-worker
++ docker run -d --name dynamo-fpm-20260625-164602-2889583-worker --network host --gpus \"device=0\,1\,2\,3\,4\,5\,6\,7\" -v /tmp/dynamo-fpm-20260625-164602-2889583:/work -v /home/gvenkatarama/.cache/huggingface:/work/hf-home -v /home/gvenkatarama/.cache/aic-vllm:/home/dynamo/.cache/vllm -v /home/gvenkatarama/.cache/aic-vllm:/root/.cache/vllm -e DYN_DISCOVERY_BACKEND=file -e DYN_REQUEST_PLANE=tcp -e DYN_EVENT_PLANE=zmq -e DYN_FILE_KV=/work/discovery -e DYN_NAMESPACE=dynamo -e TILELANG_CACHE_DIR=/home/dynamo/.cache/vllm/tilelang -e TILELANG_TMP_DIR=/home/dynamo/.cache/vllm/tilelang/tmp -e DYN_FORWARDPASS_METRIC_PORT=20380 -e DYN_SYSTEM_PORT=8081 -e HF_HOME=/work/hf-home -e HF_HUB_CACHE=/work/hf-home/hub -e TRANSFORMERS_CACHE=/work/hf-home/transformers dynamo:latest-vllm python3 -m dynamo.vllm --model Qwen/Qwen3-32B --gpu-memory-utilization 0.9 --tensor-parallel-size 8 --skip-mm-profiling --limit-mm-per-prompt \{\"image\":0\,\"video\":0\} --generation-config vllm --discovery-backend file --request-plane tcp --event-plane zmq --kv-events-config \{\"enable_kv_cache_events\":\ false\}
+[16:46:03] Starting FPM collector container dynamo-fpm-20260625-164602-2889583-collector
++ docker run -d --name dynamo-fpm-20260625-164602-2889583-collector --network host -v /tmp/dynamo-fpm-20260625-164602-2889583:/work dynamo:latest-vllm python3 /work/fpm_collect.py --port 20380 --output /work/fpm_metrics.csv --detail-output /work/fpm_metrics_detail.csv --segment-file /work/fpm_segment.txt
+[16:46:03] Skipping sample requests. Collector is running; send traffic to http://127.0.0.1:8000.
+[16:46:03] Done
+[16:46:03] Dry run complete; no containers were started.

@@ -957,8 +957,6 @@ class Scheduler:
         _append_default_vllm_args(extra_vllm_args)
         has_ctx = any(dp.phase == "ctx" for dp in pending)
         has_gen = any(dp.phase == "gen" for dp in pending)
-        mixed_datapoints = [dp for dp in pending if dp.phase == "mixed"]
-        has_mixed = bool(mixed_datapoints)
         gen_datapoints = [dp for dp in pending if dp.phase == "gen"]
         live_step_gen_min_past_kv = _unit_live_step_gen_min_past_kv(unit, self.args)
         live_step_gen_min_batch_size = _unit_live_step_gen_min_batch_size(unit, self.args)
@@ -1032,28 +1030,16 @@ class Scheduler:
             or prefix_cache_gen_step_marker
             or (enable_layer_patch and self.args.nsys_capture != "none")
         )
-        # Co-scheduled (mixed) cells run one prefill of ``prefill_tokens`` (P)
-        # alongside ``decode_requests`` (B) decode rows in a single step, so the
-        # engine must admit at least B+1 sequences and budget at least P+B tokens
-        # in one scheduler step (per Task 0 co-schedule findings).
-        mixed_prefill_tokens = max((dp.prefill_tokens for dp in mixed_datapoints), default=0)
-        mixed_decode_requests = max((dp.decode_requests for dp in mixed_datapoints), default=0)
-        mixed_token_floor = mixed_prefill_tokens + mixed_decode_requests
-        max_num_seqs = unit.max_num_seqs
-        if has_mixed:
-            max_num_seqs = max(int(max_num_seqs or 0), mixed_decode_requests + 1)
         max_num_batched_tokens = unit.max_num_batched_tokens
-        if max_num_batched_tokens is None and (has_ctx or live_step_gen_deployment or has_mixed):
+        if max_num_batched_tokens is None and (has_ctx or live_step_gen_deployment):
             max_num_batched_tokens = _get_vllm_deployment_max_num_batched_tokens(
                 model=unit.row_base["model"],
                 tensor_parallel_size=int(unit.row_base["attn_tp"]),
-                max_num_seqs=max_num_seqs,
+                max_num_seqs=unit.max_num_seqs,
                 max_model_len=unit.max_model_len,
                 gpu_memory_utilization=unit.gpu_memory_utilization,
                 extra_args=tuple(extra_vllm_args),
             )
-        if has_mixed:
-            max_num_batched_tokens = max(int(max_num_batched_tokens or 0), mixed_token_floor)
         cache_block_size = unit.cache_block_size
 
         return {
@@ -1066,7 +1052,7 @@ class Scheduler:
             "moe_noop": unit.moe_noop,
             "moe_weight_mode": unit.moe_weight_mode,
             "datapoints": [asdict(dp) for dp in pending],
-            "max_num_seqs": max_num_seqs,
+            "max_num_seqs": unit.max_num_seqs,
             "max_num_batched_tokens": max_num_batched_tokens,
             "cache_block_size": cache_block_size,
             "max_model_len": unit.max_model_len,
