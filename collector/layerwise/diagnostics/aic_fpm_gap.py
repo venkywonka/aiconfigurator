@@ -426,17 +426,31 @@ def _merge_fpm_phase_csvs(paths: list[Path], out_path: Path) -> Path:
 def _resolve_fpm_source(fpm_run: Path, tp: int, out_dir: Path):
     """Return (fpm_csv_path, runtime_config_subdir) for one TP, handling both FPM layouts.
 
-    H100: merge fpm/qwen32/c*/fpm_metrics_phase.csv -> one csv (config from the first c-dir).
+    H100: merge fpm/<model>/c*/fpm_metrics_phase.csv -> one csv (config from the first c-dir).
     B300: tp{tp}_ep1_past4096/fpm_metrics_phase.csv directly.
+
+    The concurrency-layout model dir is discovered, not hardcoded: it is whatever single dir
+    under fpm/ holds c*/fpm_metrics_phase.csv (e.g. 'qwen32' for the golden runs, or an
+    autocollector model slug like 'Qwen-Qwen3-32B'). Hardcoding 'qwen32' silently produced a
+    zero-row gap for any other model.
     """
-    conc_base = fpm_run / "fpm" / "qwen32"
+    fpm_base = fpm_run / "fpm"
+    conc_base = None
+    if fpm_base.is_dir():
+        model_dirs = sorted(
+            d for d in fpm_base.iterdir()
+            if d.is_dir() and any((c / "fpm_metrics_phase.csv").exists() for c in d.glob("c*"))
+        )
+        if model_dirs:
+            conc_base = model_dirs[0]
     cdirs = ([d for d in conc_base.glob("c*") if (d / "fpm_metrics_phase.csv").exists()]
-             if conc_base.is_dir() else [])
+             if conc_base is not None else [])
     cdirs.sort(key=lambda d: int(d.name[1:]) if d.name[1:].isdigit() else 0)
     if cdirs:
         merged = _merge_fpm_phase_csvs([d / "fpm_metrics_phase.csv" for d in cdirs],
                                        out_dir / "merged_fpm_metrics_phase.csv")
-        print(f"[fpm] H100 concurrency layout: merged {[d.name for d in cdirs]} (tp={tp})", file=sys.stderr)
+        print(f"[fpm] concurrency layout ({conc_base.name}): merged {[d.name for d in cdirs]} (tp={tp})",
+              file=sys.stderr)
         return merged, cdirs[0]
     subdir = fpm_run / f"tp{tp}_ep1_past4096"
     return subdir / "fpm_metrics_phase.csv", subdir
