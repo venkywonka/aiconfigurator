@@ -166,11 +166,17 @@ def _install() -> None:
         logger.warning(
             "[dynamo-step-marker] installed GPUModelRunner.execute_model wrapper (real-batch labels)"
         )
-    except Exception as exc:  # never crash worker startup
+    except Exception as exc:
+        # Fail CLOSED: the marker was explicitly required (env == '1'), so a
+        # patch/import failure must abort the worker rather than produce an
+        # unattributable (unmarked) trace. Raise SystemExit -- a BaseException
+        # that escapes the surrounding ``except Exception`` fail-open layer in
+        # ``sitecustomize._try_import`` so the hole cannot be silently reopened.
         print(
-            f"[dynamo-step-marker] install failed (continuing without marker): {exc}",
+            f"[dynamo-step-marker] install failed (LAYERWISE_DYNAMO_STEP_MARKER=1, aborting worker): {exc}",
             file=sys.stderr,
         )
+        raise SystemExit(1) from exc
 
 
 _install()
