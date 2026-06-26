@@ -31,11 +31,6 @@ _LAYERWISE_GEN_SINGLE_GPU_COMM = True
 # tp). Use the collected fused `allreduce_residual_rms` timings instead of the
 # standalone custom all-reduce. Set False to use standalone custom all-reduce.
 _LAYERWISE_USE_FUSED_ALLREDUCE_RMS = True
-# The single-GPU decode-compute microbenchmark grows too gently with batch vs real
-# serving (paged attention over fragmented/variable KV + per-sequence overhead).
-# Scale the per-step decode COMPUTE (layerwise) by (1 + k*batch); comm is modeled
-# separately via the fused all-reduce so it is NOT scaled here. k fit against FPM.
-# Set to 0.0 to disable.
 _DECODE_COMPUTE_BATCH_CAL = 0.0
 
 
