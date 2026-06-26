@@ -259,11 +259,18 @@ def run_context_attribution(
 
 
 def write_decomposition_csv(rows: list[dict[str, Any]], out_path: str) -> None:
-    """Write decomposition rows to CSV (stable column order)."""
+    """Write decomposition rows to CSV (stable column order).
+
+    Raises ``ValueError`` on empty input so an empty join cannot pass silently
+    (the ``.done`` gate / shell ``|| warn`` only fires on a real failure signal).
+    """
     import csv
 
     if not rows:
-        return
+        raise ValueError(
+            f"write_decomposition_csv: no decomposition rows to write to {out_path} "
+            "(empty join -- profiled/FPM/AIC lanes had no shape in common)."
+        )
     cols = [
         "phase", "batch_size", "past_kv", "wall_ms", "aic_total_ms",
         "aic_compute_ms", "aic_comm_ms", "aic_other_ms",

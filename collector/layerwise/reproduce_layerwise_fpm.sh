@@ -556,7 +556,10 @@ stage_attribute() {
       fi
 
       local sqlite; sqlite="$(ls -1 "$rdir"/nsys/*.sqlite 2>/dev/null | head -1 || true)"
-      if [ -z "$sqlite" ]; then warn "no .sqlite under $rdir/nsys; skipping decompose"; mark_done "$unit"; continue; fi
+      # Fail closed: a missing .sqlite means there is nothing to attribute, so the
+      # unit must NOT be stamped .done (the .nsys-rep is retained on disk for manual
+      # export+decompose). Aborting loudly forces the run to be fixed and re-attempted.
+      if [ -z "$sqlite" ]; then die "no .sqlite under $rdir/nsys for $unit; capture retained, refusing to mark done"; fi
       # Guard the decompose so a failure (e.g. AIC has no layerwise data for this model)
       # warns + retains the .nsys-rep/.sqlite for manual decompose instead of aborting the
       # driver under `set -e` -- the expensive capture must never be lost to a downstream step.
@@ -572,6 +575,19 @@ stage_attribute() {
           --discard-first-n "$ATTRIBUTE_DISCARD_N" \
           --out "$rdir/decomposition.csv" \
         || warn "decompose failed for $unit (rc=$?); .nsys-rep + .sqlite retained under $rdir/nsys for manual decompose"
+
+      # Fail-closed attribution-validity gate (spec Fix 2): a unit is only stamped
+      # .done when attribution is real -- >=1 CUPTI kernel row, >=1 bench_step:: NVTX
+      # range, and >=1 decomposition.csv data row. On any miss, die (the named check
+      # pinpoints the broken stage); the .nsys-rep/.sqlite/csv stay on disk for manual
+      # decompose, and the unit re-runs on the next pass (no FORCE=1 needed).
+      if [[ "$DRY_RUN" != "1" ]]; then
+        run_env "" "$LOG_DIR/${unit}_assert.log" \
+          python3 -m collector.layerwise.diagnostics.assert_attribution_valid \
+            --sqlite "$sqlite" \
+            --decomposition "$rdir/decomposition.csv" \
+          || die "attribution-validity gate failed for $unit; artifacts retained under $rdir, refusing to mark done"
+      fi
 
       mark_done "$unit"
     done
