@@ -245,6 +245,263 @@ def analyze_sqlite(
     }
 
 
+def _load_kernel_rows(
+    sqlite_path: str | Path,
+    *,
+    batch_size: int | None = None,
+    past_kv: int | None = None,
+    whole_trace: bool = False,
+) -> list[dict]:
+    """Load per-kernel rows for the per-barrier extractor.
+
+    Returns one dict per (step, pid) kernel with keys:
+      step (the (n, bs, past, run) tuple), pid (rank = tid & _GLOBAL_PID_MASK),
+      kernel_start, kernel_end, runtime_start (host cudaLaunchKernel = launch_ts),
+      name. Step attribution + dedup mirror analyze_sqlite exactly.
+    """
+    path = Path(sqlite_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    cur = con.cursor()
+    step_wins_by_tid: dict[int, list[tuple[int, int, tuple[int, int, int, int]]]] = defaultdict(list)
+    if not whole_trace:
+        step_wins_by_tid, _module_intervals = _build_nvtx_lookups(cur)
+        if not step_wins_by_tid:
+            raise RuntimeError("no bench_step NVTX ranges found; retry with --whole-trace for a coarse summary")
+    (
+        step_wins_by_pid,
+        all_step_wins,
+        step_starts_by_tid,
+        step_starts_by_pid,
+        all_step_starts,
+    ) = _build_step_indexes(step_wins_by_tid)
+
+    cur.execute("SELECT id, value FROM StringIds")
+    string_ids = dict(cur.fetchall())
+
+    seen = set()
+    out: list[dict] = []
+    for row in _query_kernels(cur):
+        cid, graph_node_id, kernel_start, kernel_end, short_name_id, tid, runtime_start, _cap_s, _cap_e = row
+        key = (tid, cid, graph_node_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        if whole_trace:
+            step = _WHOLE_TRACE_STEP
+        else:
+            step = _find_step(
+                tid,
+                runtime_start,
+                step_wins_by_tid=step_wins_by_tid,
+                step_wins_by_pid=step_wins_by_pid,
+                all_step_wins=all_step_wins,
+                step_starts_by_tid=step_starts_by_tid,
+                step_starts_by_pid=step_starts_by_pid,
+                all_step_starts=all_step_starts,
+            )
+            if step is None:
+                continue
+        _step_n, bs, past, _run = step
+        if batch_size is not None and bs != batch_size:
+            continue
+        if past_kv is not None and past != past_kv:
+            continue
+        name = string_ids.get(short_name_id, str(short_name_id))
+        out.append(
+            {
+                "step": step,
+                "pid": tid & _GLOBAL_PID_MASK,
+                "kernel_start": int(kernel_start),
+                "kernel_end": int(kernel_end),
+                "runtime_start": int(runtime_start),
+                "name": name,
+            }
+        )
+    con.close()
+    return out
+
+
+def extract_per_barrier(
+    sqlite_path: str | Path,
+    *,
+    comm_re: re.Pattern[str] = _DEFAULT_COMM_RE,
+    batch_size: int | None = None,
+    past_kv: int | None = None,
+    whole_trace: bool = False,
+    kernel_rows: list[dict] | None = None,
+) -> tuple[list[dict], list[dict], dict]:
+    """Per-barrier arrival-skew decomposition (design.md §0, the decisive instrument).
+
+    For each (step, pid=rank): order kernels by kernel_start, classify comm via
+    comm_re; the i-th comm kernel (0-based) is barrier_index i for that rank.
+      arrival_ts(i) = kernel_end of the last COMPUTE kernel before that comm
+                      kernel within (step, pid); if none precedes, arrival =
+                      the comm kernel's runtime_start (launch) and the row is
+                      flagged arrival_is_fallback=True.
+      launch_ts(i)  = runtime_start of the comm kernel.
+      ar_start(i)   = kernel_start; ar_end(i) = kernel_end.
+
+    A logical barrier = (step, barrier_index) across all ranks. A barrier with
+    fewer than the step's max rank-count instances is matched=False and EXCLUDED
+    from spread aggregates (spreads/transfer/spin set to None).
+
+    Returns (per_rank_rows, per_barrier_rows, meta). `kernel_rows` is a test seam
+    (pre-loaded rows in the _load_kernel_rows shape); if None, the sqlite is read.
+    """
+    if kernel_rows is None:
+        kernel_rows = _load_kernel_rows(
+            sqlite_path,
+            batch_size=batch_size,
+            past_kv=past_kv,
+            whole_trace=whole_trace,
+        )
+
+    # group kernels by (step, pid)
+    by_step_pid: dict[tuple, list[dict]] = defaultdict(list)
+    for kr in kernel_rows:
+        by_step_pid[(kr["step"], kr["pid"])].append(kr)
+
+    per_rank_rows: list[dict] = []
+    arrival_fallbacks = 0
+    for (step, pid), kerns in by_step_pid.items():
+        kerns_sorted = sorted(kerns, key=lambda k: (k["kernel_start"], k["kernel_end"]))
+        last_compute_end: int | None = None
+        barrier_index = 0
+        for k in kerns_sorted:
+            is_comm = bool(comm_re.search(k["name"]))
+            if not is_comm:
+                last_compute_end = k["kernel_end"]
+                continue
+            if last_compute_end is None:
+                arrival_ts = k["runtime_start"]
+                arrival_is_fallback = True
+                arrival_fallbacks += 1
+            else:
+                arrival_ts = last_compute_end
+                arrival_is_fallback = False
+            per_rank_rows.append(
+                {
+                    "step": step[0] if isinstance(step, tuple) else step,
+                    "step_key": step,
+                    "barrier_index": barrier_index,
+                    "rank": pid,
+                    "arrival_ts": arrival_ts,
+                    "launch_ts": k["runtime_start"],
+                    "ar_start_ts": k["kernel_start"],
+                    "ar_end_ts": k["kernel_end"],
+                    "arrival_is_fallback": arrival_is_fallback,
+                }
+            )
+            barrier_index += 1
+
+    # expected n_ranks per step = max distinct ranks observed in that step
+    ranks_per_step: dict[object, set] = defaultdict(set)
+    for r in per_rank_rows:
+        ranks_per_step[r["step_key"]].add(r["rank"])
+    expected_ranks = {sk: len(ranks) for sk, ranks in ranks_per_step.items()}
+
+    # group per-rank rows into logical barriers (step_key, barrier_index)
+    by_barrier: dict[tuple, list[dict]] = defaultdict(list)
+    for r in per_rank_rows:
+        by_barrier[(r["step_key"], r["barrier_index"])].append(r)
+
+    per_barrier_rows: list[dict] = []
+    unmatched_barriers = 0
+    spin_by_rankrow: dict[int, int] = {}
+    for (step_key, bidx), members in by_barrier.items():
+        n_ranks = len(members)
+        expected = expected_ranks.get(step_key, n_ranks)
+        matched = n_ranks == expected
+        barrier_complete = max(m["ar_end_ts"] for m in members)
+        row = {
+            "step": step_key[0] if isinstance(step_key, tuple) else step_key,
+            "step_key": step_key,
+            "barrier_index": bidx,
+            "n_ranks": n_ranks,
+            "matched": matched,
+        }
+        if matched:
+            launches = [m["launch_ts"] for m in members]
+            arrivals = [m["arrival_ts"] for m in members]
+            transfers = [m["ar_end_ts"] - m["ar_start_ts"] for m in members]
+            spins = []
+            for m in members:
+                spin = barrier_complete - m["arrival_ts"]
+                spins.append(spin)
+                spin_by_rankrow[id(m)] = spin
+            row.update(
+                {
+                    "launch_spread": max(launches) - min(launches),
+                    "arrival_spread": max(arrivals) - min(arrivals),
+                    "transfer": min(transfers),
+                    "barrier_complete": barrier_complete,
+                    "spin_mean": sum(spins) / len(spins),
+                    "spin_max": max(spins),
+                    "spin_per_rank": sorted(
+                        ((m["rank"], barrier_complete - m["arrival_ts"]) for m in members),
+                        key=lambda t: t[0],
+                    ),
+                }
+            )
+        else:
+            unmatched_barriers += 1
+            row.update(
+                {
+                    "launch_spread": None,
+                    "arrival_spread": None,
+                    "transfer": None,
+                    "barrier_complete": barrier_complete,
+                    "spin_mean": None,
+                    "spin_max": None,
+                    "spin_per_rank": None,
+                }
+            )
+        per_barrier_rows.append(row)
+
+    # annotate per-rank rows with spin (None for unmatched barriers)
+    for r in per_rank_rows:
+        r["spin"] = spin_by_rankrow.get(id(r))
+
+    # per-rank comm-kernel counts per step: a detectable signal that ranks
+    # disagree on how many barriers they hit (ordinal mismatch). Without this
+    # a missing/extra allreduce on one rank would silently mis-align logical
+    # barriers across ranks instead of being caught.
+    comm_counts_per_rank: dict[object, dict[int, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+    for r in per_rank_rows:
+        comm_counts_per_rank[r["step_key"]][r["rank"]] += 1
+    comm_counts_per_rank = {
+        sk: dict(counts) for sk, counts in comm_counts_per_rank.items()
+    }
+    comm_count_mismatch_steps = [
+        sk
+        for sk, counts in comm_counts_per_rank.items()
+        if len(set(counts.values())) > 1
+    ]
+
+    per_rank_rows.sort(
+        key=lambda r: (str(r["step_key"]), r["barrier_index"], r["rank"])
+    )
+    per_barrier_rows.sort(
+        key=lambda r: (str(r["step_key"]), r["barrier_index"])
+    )
+    meta = {
+        "sqlite": str(sqlite_path),
+        "barriers": len(per_barrier_rows),
+        "matched_barriers": len(per_barrier_rows) - unmatched_barriers,
+        "unmatched_barriers": unmatched_barriers,
+        "arrival_fallbacks": arrival_fallbacks,
+        "per_rank_rows": len(per_rank_rows),
+        "comm_counts_per_rank": comm_counts_per_rank,
+        "comm_count_mismatch_steps": comm_count_mismatch_steps,
+    }
+    return per_rank_rows, per_barrier_rows, meta
+
+
 def _print_table(rows: list[dict], metadata: dict) -> None:
     print(
         f"[overlap] groups={metadata['groups']} kernels={metadata['deduped_kernels']} "
@@ -270,6 +527,80 @@ def _print_table(rows: list[dict], metadata: dict) -> None:
         )
 
 
+_PER_RANK_FIELDS = [
+    "step",
+    "barrier_index",
+    "rank",
+    "arrival_ts",
+    "launch_ts",
+    "ar_start_ts",
+    "ar_end_ts",
+    "arrival_is_fallback",
+    "spin",
+]
+_PER_BARRIER_FIELDS = [
+    "step",
+    "barrier_index",
+    "n_ranks",
+    "matched",
+    "launch_spread",
+    "arrival_spread",
+    "transfer",
+    "barrier_complete",
+    "spin_mean",
+    "spin_max",
+]
+
+
+def _write_csv(path: str | None, fieldnames: list[str], rows: list[dict]) -> None:
+    fh = open(path, "w", newline="") if path else sys.stdout
+    try:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    finally:
+        if path:
+            fh.close()
+
+
+def _run_per_barrier(args) -> int:
+    per_rank_rows, per_barrier_rows, meta = extract_per_barrier(
+        args.sqlite_path,
+        comm_re=re.compile(args.comm_regex, re.IGNORECASE),
+        batch_size=args.batch_size,
+        past_kv=args.past_kv,
+        whole_trace=args.whole_trace,
+    )
+
+    # meta sanity to stderr
+    print(
+        f"[per-barrier] matched_barriers={meta['matched_barriers']}/{meta['barriers']} "
+        f"arrival_fallbacks={meta['arrival_fallbacks']} "
+        f"unmatched_barriers={meta['unmatched_barriers']} "
+        f"per_rank_rows={meta['per_rank_rows']}",
+        file=sys.stderr,
+    )
+    mismatch_steps = meta.get("comm_count_mismatch_steps") or []
+    if mismatch_steps:
+        print(
+            f"[per-barrier] WARNING: per-rank comm-count mismatch in "
+            f"{len(mismatch_steps)} step(s) (ordinal mis-alignment); affected "
+            f"barriers are matched=False and excluded from spread aggregates. "
+            f"steps={mismatch_steps}",
+            file=sys.stderr,
+        )
+
+    # per-rank CSV defaults to stdout when no explicit path is given.
+    _write_csv(args.per_rank_csv, _PER_RANK_FIELDS, per_rank_rows)
+    if args.per_barrier_csv:
+        _write_csv(args.per_barrier_csv, _PER_BARRIER_FIELDS, per_barrier_rows)
+    else:
+        # no separate barrier path: emit a delimiter + barrier table to stderr
+        print("[per-barrier] per-barrier rows (no --per-barrier-csv given):", file=sys.stderr)
+        _write_csv(None, _PER_BARRIER_FIELDS, per_barrier_rows)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sqlite_path")
@@ -279,7 +610,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--whole-trace", action="store_true")
     parser.add_argument("--comm-regex", default=_DEFAULT_COMM_RE.pattern)
     parser.add_argument("--format", choices=("table", "csv"), default="table")
+    parser.add_argument(
+        "--per-barrier",
+        action="store_true",
+        help="Per-barrier arrival-skew decomposition (writes per-rank + "
+        "per-barrier CSVs) instead of the overlap summary.",
+    )
+    parser.add_argument(
+        "--per-rank-csv",
+        help="Output path for per-rank rows (--per-barrier mode); "
+        "defaults to stdout.",
+    )
+    parser.add_argument(
+        "--per-barrier-csv",
+        help="Output path for per-barrier rows (--per-barrier mode); "
+        "if omitted, printed to stdout after the per-rank CSV.",
+    )
     args = parser.parse_args(argv)
+
+    if args.per_barrier:
+        return _run_per_barrier(args)
 
     rows, metadata = analyze_sqlite(
         args.sqlite_path,

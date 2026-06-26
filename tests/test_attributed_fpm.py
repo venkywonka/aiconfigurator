@@ -415,6 +415,73 @@ def test_aggregate_profiled_context_selects_bs0_and_divides_by_ranks():
     assert out["gpu_busy_ms"] == 48.0      # 48000us -> 48.0ms; union NOT divided
 
 
+def test_run_decode_attribution_per_pid_preserves_each_rank_undivided():
+    """per_pid=True: feed SYNTHETIC per-PID analyze_sqlite rows (8 ranks of ONE
+    (bs,past_kv) with UNEQUAL compute to model TP skew) and assert:
+      (i)  each rank's compute/comm is preserved UN-divided (NO /ranks),
+      (ii) rows are keyed PER RANK -> cross-rank variance survives (not medianed
+           to a single value),
+      (iii) the existing per_pid=False aggregate for the SAME input is unchanged
+            (cross-rank SUM /ranks, cross-rank-union gpu_busy).
+    """
+    from collector.layerwise.diagnostics.aic_fpm_attribute import run_decode_attribution
+
+    # 8 ranks, one shape (4, 8000). Per-rank compute SKEWED: rank r contributes
+    # (40000 + 1000*r) us. Repeat each rank over 5 steps (same value) so the
+    # per-(rank,shape) median is well-defined. comm uniform 8000us, busy 6500us.
+    profiled_rows = []
+    for r in range(8):
+        for s in range(5):
+            profiled_rows.append({
+                "step": s, "batch_size": 4, "past_kv": 8000, "measure_run": 0,
+                "pid": r,
+                "compute_gpu_us": 40000.0 + 1000.0 * r,
+                "comm_gpu_us": 8000.0,
+                "total_union_us": 6500.0,
+            })
+    fpm_wall = {(4, 8000.0): 6.6}
+    aic = lambda bs, kv: (6.9, 0.37, 7.27)
+
+    rows = run_decode_attribution(
+        sqlite_path="X", profiled_rows=profiled_rows, fpm_wall_by_shape=fpm_wall,
+        aic_predict=aic, discard_first_n=2, ranks=8, per_pid=True,
+    )
+
+    # one aggregate row (pid empty) + 8 per-rank rows.
+    per_rank = sorted((r for r in rows if r.get("pid") not in (None, "")),
+                      key=lambda r: r["pid"])
+    assert len(per_rank) == 8, "must emit one row per captured rank"
+    # (i) + (ii): each rank's compute is its OWN value (un-divided, not medianed).
+    for r in per_rank:
+        rank = int(r["pid"])
+        assert r["gpu_compute_ms"] == 40.0 + rank, f"rank {rank} compute must be undivided"
+        assert r["gpu_comm_ms"] == 8.0           # 8000us, undivided
+        assert r["gpu_busy_ms"] == 6.5           # this rank's own union
+        assert (r["batch_size"], r["past_kv"]) == (4, 8000)
+        terms = (r["term_compute_err"] + r["term_comm_err"] + r["term_aic_other"]
+                 + r["term_overlap"] + r["term_neg_overhead"])
+        assert abs(terms - r["gap_ms"]) < 1e-9
+    # variance survives: 8 distinct compute values, not a single medianed one.
+    assert len({r["gpu_compute_ms"] for r in per_rank}) == 8
+
+    # (iii) the aggregate row alongside MUST equal the old per_pid=False numbers.
+    # per_pid=False sees the SAME per-rank rows as a single merged cohort, so the
+    # cross-rank SUM /ranks reproduces today's behavior. Build the aggregate-only
+    # input by summing per-rank compute/comm per step (the merged-lane semantics).
+    agg = [r for r in rows if r.get("pid") in (None, "")]
+    assert len(agg) == 1
+    ar = agg[0]
+    # aggregate is computed from the per_pid=False reduction (sum across ranks /ranks).
+    # sum_r (40000+1000r) = 320000 + 1000*28 = 348000us -> 348.0ms /8 = 43.5ms
+    assert ar["gpu_compute_ms"] == 43.5
+    # comm sum = 8*8000 = 64000us -> 64.0ms /8 = 8.0ms
+    assert ar["gpu_comm_ms"] == 8.0
+    assert ar["pid"] in (None, "")
+    aterms = (ar["term_compute_err"] + ar["term_comm_err"] + ar["term_aic_other"]
+              + ar["term_overlap"] + ar["term_neg_overhead"])
+    assert abs(aterms - ar["gap_ms"]) < 1e-9
+
+
 def test_run_context_attribution_identity_holds():
     """run_context_attribution produces a single aggregate context decompose_shape row
     whose five attributed terms sum exactly to the gap, tagged phase='context'."""

@@ -55,6 +55,24 @@
 #             ./collector/layerwise/reproduce_layerwise_fpm.sh        # full dense Qwen3-32B tp8 H100
 #   STAGES="align" FORCE=1 ./...reproduce_layerwise_fpm.sh            # re-plot only
 #   STAGES="layerwise" ./...reproduce_layerwise_fpm.sh               # just the 1xH100 collection
+#
+# DECODE-ONLY CONCURRENCY SWEEP ARM (design.md v3 §5 PRIMARY clean testbed)
+#   Capture the clean decode sweep C in {1,4,16,64,128} at TP=8, fixed past_kv=4096,
+#   under nsys windowed capture + per-rank decompose:
+#
+#     STAGES="attribute" \
+#     ATTRIBUTE_PHASES="decode" ATTRIBUTE_REAL_WORKLOAD=0 \
+#     DECODE_BATCH_SIZES="1,4,16,64,128" DECODE_PAST_KV=4096 \
+#     ATTRIBUTE_PER_PID=1 \
+#     TP=8 FPM_TP_LIST=8 PARETO_CONCURRENCY="1" \
+#     ./collector/layerwise/reproduce_layerwise_fpm.sh
+#
+#   The static decode sweep sends each DECODE_BATCH_SIZES value as BOTH the request
+#   count and the concurrency (so the value IS the resident decode population for that
+#   point); the whole {1,4,16,64,128} ladder runs inside ONE deployment, so pin
+#   PARETO_CONCURRENCY to a single value (one pareto point) to avoid re-running the
+#   identical sweep per pareto name. The windowed nsys/per-rank capture
+#   applies to every decode point in the sweep.
 # =============================================================================
 set -euo pipefail
 
@@ -113,6 +131,10 @@ EP="${EP:-1}"
 LW_TP_LIST="${LW_TP_LIST:-$TP}"          # layerwise TP sizes (single-GPU mock); default = focus TP
 FPM_TP_LIST="${FPM_TP_LIST:-$TP}"        # FPM real-deployment TP sizes
 DECODE_PAST_KV="${DECODE_PAST_KV:-4096}" # -> FPM subdir tp{T}_ep{E}_past4096 (matches PRIMARY_CASES)
+DECODE_OSL="${DECODE_OSL:-}"             # static decode-only arm: override decode OSL to SUSTAIN the target in-flight
+                                         # batch (empty = collect.py default 8). With OSL=8 a "batch 64" run peaks at
+                                         # in-flight bs~37 (requests finish before 64 accumulate) -> no bs=64 steps to
+                                         # capture. Long OSL (e.g. 512) keeps all N requests resident -> batch reaches N.
 
 # [low, mid, high] throughput-latency pareto = real-workload concurrency sweep.
 PARETO_NAMES=(low mid high)
@@ -138,6 +160,23 @@ FPM_WARMUP_REQUESTS="${FPM_WARMUP_REQUESTS:-4}"
 # the first N sync-drained boundary steps of each cohort before reducing.
 ATTRIBUTE_WINDOW="${ATTRIBUTE_WINDOW:-100-115}"
 ATTRIBUTE_DISCARD_N="${ATTRIBUTE_DISCARD_N:-3}"
+# ATTRIBUTE_PER_PID=1 passes --per-pid to aic_fpm_attribute so the decomposition CSV
+# carries accurate per-rank rows (pid column) ALONGSIDE the cross-rank aggregate
+# (per design.md v3 §0.2: per-rank variance is preserved for the arrival-skew
+# decomposition). Set to 0 for the aggregate-only legacy behavior.
+ATTRIBUTE_PER_PID="${ATTRIBUTE_PER_PID:-1}"
+
+# Attribute-stage workload selection (design.md v3 §5 arms). Defaults reproduce the
+# real-workload high-C mixed-step capture. The DECODE-ONLY SWEEP ARM (PRIMARY clean
+# testbed) is selected by ATTRIBUTE_PHASES=decode + ATTRIBUTE_REAL_WORKLOAD=0, which
+# drives the static decode sweep over DECODE_BATCH_SIZES (= concurrency ladder) at a
+# fixed DECODE_PAST_KV. See the "Decode-only sweep arm" usage note in the header.
+ATTRIBUTE_PHASES="${ATTRIBUTE_PHASES:-context,decode,mixed}"
+ATTRIBUTE_REAL_WORKLOAD="${ATTRIBUTE_REAL_WORKLOAD:-1}"
+# DECODE_BATCH_SIZES: static-sweep decode batch sizes; each value is BOTH the request
+# count and the concurrency for that decode point (collect_fpm_metrics.sh send_sweep
+# decode loop). For the v3 decode concurrency sweep set "1,4,16,64,128".
+DECODE_BATCH_SIZES="${DECODE_BATCH_SIZES:-1,4,16,64,128}"
 
 # Scheduler parity: forced via env so FPM shell + align agree (shell reads $MAX_NUM_SEQS).
 FPM_MAX_NUM_SEQS="${FPM_MAX_NUM_SEQS:-256}"
@@ -520,18 +559,39 @@ stage_attribute() {
       # nsys capture succeeded (Phase-0 smoke: DRIVER_EXIT=2 but fpm_worker.nsys-rep was produced). So
       # capture the rc without letting `set -e` abort the driver, and gate continuation on a .nsys-rep
       # existing rather than on rc==0; only a total collection failure (NO .nsys-rep) fails the unit.
+      # LOAD_FORMAT=dummy -> vLLM random weights (no checkpoint download). Valid for the
+      # timing/comm mechanism study: kernels are shape-driven (value-independent), Qwen3-32B
+      # is dense (no MoE routing), and IGNORE_EOS fixes decode length. Default empty = real weights.
+      local extra_vllm=()
+      [[ -n "${LOAD_FORMAT:-}" ]] && extra_vllm+=(--extra-vllm-arg="--load-format=${LOAD_FORMAT}")
+
+      # Workload selection (design.md v3 §5). Default = real-workload high-C mixed-step
+      # capture. ATTRIBUTE_REAL_WORKLOAD=0 selects the static decode sweep (decode-only
+      # arm): DECODE_BATCH_SIZES drives both request count and concurrency per decode
+      # point, at a fixed DECODE_PAST_KV; the real-workload-shape args are dropped.
+      local workload=()
+      if [[ "$ATTRIBUTE_REAL_WORKLOAD" == "1" ]]; then
+        workload=(
+          --real-workload --real-workload-requests "$req" --real-workload-concurrency "$conc"
+          --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE"
+          --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN"
+          --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN"
+        )
+      else
+        workload=(--no-real-workload --decode-batches "$DECODE_BATCH_SIZES")
+        [[ -n "${DECODE_OSL:-}" ]] && workload+=(--decode-osl "$DECODE_OSL")
+      fi
+
       local collect_rc=0
       run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
-          --phases context,decode,mixed --decode-past-kv "$DECODE_PAST_KV" \
-          --real-workload --real-workload-requests "$req" --real-workload-concurrency "$conc" \
-          --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE" \
-          --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN" \
-          --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN" \
+          --phases "$ATTRIBUTE_PHASES" --decode-past-kv "$DECODE_PAST_KV" \
+          "${workload[@]}" \
           --prompt-token-mode safe_ascii --warmup-requests "$FPM_WARMUP_REQUESTS" \
           --image "$DYNAMO_VLLM_IMAGE" --run-dir "$rdir" \
+          "${extra_vllm[@]}" \
           --nsys-profile-worker --nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW" || collect_rc=$?
 
       local nsysrep; nsysrep="$(ls -1 "$rdir"/nsys/*.nsys-rep 2>/dev/null | head -1 || true)"
@@ -567,12 +627,21 @@ stage_attribute() {
       # fpm_metrics_phase.csv (the clean-lane wall) -- NOT fpm_run_dir's parent, which
       # holds no CSV and sends _load_fpm down the nested tp{T}_ep{E}_past{K} fallback
       # that does not exist for the attribute run (FileNotFoundError -> decompose fails).
-      run_env "" "$LOG_DIR/${unit}_decompose.log" \
+      # --per-pid (ATTRIBUTE_PER_PID=1, default) ALSO emits accurate per-rank rows
+      # (pid column) alongside the aggregate -- the per-rank variance the v3
+      # arrival-skew decomposition needs. The aggregate rows are unchanged.
+      local perpid=()
+      [[ "$ATTRIBUTE_PER_PID" == "1" ]] && perpid=(--per-pid)
+      # Decompose imports the aiconfigurator SDK (AIC predictions). On a source-checkout
+      # box with no installed dist, put src/ on PYTHONPATH so the import resolves; the
+      # __init__ version-fallback makes it work without dist metadata.
+      run_env "PYTHONPATH=$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" "$LOG_DIR/${unit}_decompose.log" \
         python3 -m collector.layerwise.diagnostics.aic_fpm_attribute \
           --sqlite "$sqlite" \
           --fpm-run "$rdir" \
           --system "$SYSTEM" --model "$hf" --tp "$TP" \
           --discard-first-n "$ATTRIBUTE_DISCARD_N" \
+          "${perpid[@]}" \
           --out "$rdir/decomposition.csv" \
         || warn "decompose failed for $unit (rc=$?); .nsys-rep + .sqlite retained under $rdir/nsys for manual decompose"
 

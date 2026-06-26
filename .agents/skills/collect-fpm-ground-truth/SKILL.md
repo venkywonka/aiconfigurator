@@ -64,7 +64,7 @@ ATTRIBUTE_WINDOW=100-115 ATTRIBUTE_DISCARD_N=3 \
 
 `ATTRIBUTE_WINDOW` is `"lo-hi[,lo-hi...]"` step ordinals (the marker's `bench_step::N` step) passed to `--nsys-cuda-profiler-window`; `ATTRIBUTE_DISCARD_N` drops the first N sync-drained boundary steps before reducing. Note the driver default `NSYS_VERSION_DIR=2026.3.1` is for layerwise; the box ships 2025.3.2, so override it.
 
-**Box gotchas.** Disk is the binding constraint (130MB+ per 32B capture; `OUT_ROOT` must be local ext4 — nsys export dies "database is locked" on SMB/NFS). `docker rm -f` is permission-gated on the box — use `docker stop` to clear leftover `dynamo-fpm-*` containers.
+**Box gotchas.** Disk is the binding constraint (130MB+ per 32B capture; `OUT_ROOT` must be local ext4 — nsys export dies "database is locked" on SMB/NFS). `docker rm -f` is permission-gated on the box — use `docker stop` to clear leftover `dynamo-fpm-*` containers. The box disk is EPHEMERAL on `brev delete` (only `brev stop` preserves it) — back up raw `.nsys-rep`/`.sqlite` to scratch BEFORE stopping/deleting. `brev-pull.sh` alone is INSUFFICIENT: it mirrors only `/home/ubuntu/aic-runs/`, but the stage writes traces under the repo tree + `/tmp`. Use the by-filetype sweep in the `run-nsys-in-vllm-container` skill, packaged as `slop/birepo-brev-8xh100-layerwise/brev-backup-nsys.sh`.
 
 **4 stage-script robustness fixes (do NOT regress these in `stage_attribute`).**
 1. Empty-glob + `pipefail` abort is guarded with `|| true` on `ls ... | head` lookups (`nsysrep`, `existing_sqlite`, `sqlite`).
@@ -96,3 +96,5 @@ Summarize `*_phase.csv` before comparing:
 - `mixed`: keep rows as observed scheduler iterations; shapes are `(ctx_tokens, decode_requests, mean_decode_kv_tokens)`.
 
 If collection fails after some traffic, still inspect copied partial outputs. The script should preserve collector CSVs before exiting.
+
+**Back up raw traces before stopping the box.** Attributed-FPM `.nsys-rep`/`.sqlite` live only on the ephemeral box disk and are NOT returned by the normal CSV pull. Sweep them to scratch (`slop/birepo-brev-8xh100-layerwise/brev-backup-nsys.sh`, by file type across all roots) BEFORE `brev stop`/`brev delete`. See the backup section in `run-nsys-in-vllm-container`.

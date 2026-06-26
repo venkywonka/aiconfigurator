@@ -287,6 +287,8 @@ failure (e.g. AIC has no layerwise data for the model) warns + retains the `.nsy
 manual decompose instead of aborting. Knobs: `ATTRIBUTE_WINDOW` (default `100-115`, `lo-hi[,lo-hi...]`
 step ordinals) and `ATTRIBUTE_DISCARD_N` (default `3`).
 
+**Back up the raw capture off the ephemeral box.** The `.nsys-rep`/`.sqlite` live only on the brev box disk (ephemeral on `brev delete`; preserved across `brev stop`) and are NOT returned by the normal CSV pull. Sweep them to scratch BY FILE TYPE (`slop/birepo-brev-8xh100-layerwise/brev-backup-nsys.sh`) — NOT the path-scoped `brev-pull.sh`, which mirrors only `/home/ubuntu/aic-runs/` and misses traces written under the repo tree + `/tmp` — BEFORE `brev stop`/`brev delete`. See the backup section in `run-nsys-in-vllm-container`.
+
 **Manual export + decompose fallback** (the documented path used for the first real 32B result, when the
 stage aborted before part (b)):
 

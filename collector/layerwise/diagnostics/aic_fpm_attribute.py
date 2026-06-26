@@ -66,22 +66,36 @@ def aggregate_profiled_by_shape(
     *,
     discard_first_n: int = 3,
     aggregate: str = "median",
-) -> dict[tuple[int, int], dict[str, float]]:
-    """Aggregate analyze_sqlite per-step rows into per-(batch_size, past_kv)
-    composition, in milliseconds. Discards sync-drained boundary steps first."""
+    per_pid: bool = False,
+) -> dict[tuple[int, ...], dict[str, float]]:
+    """Aggregate analyze_sqlite per-step rows into per-shape composition, in ms.
+    Discards sync-drained boundary steps first.
+
+    per_pid=False (default): key on (batch_size, past_kv). Rows are the merged
+    cross-rank analyze_sqlite output (compute/comm are SUMS over all ranks, busy is
+    the cross-rank interval union); the median is over repeated STEPS of the shape.
+
+    per_pid=True: rows carry a 'pid' (rank id) -- key on (batch_size, past_kv, pid)
+    so each rank is its OWN bucket. The median is over repeated steps of the SAME
+    (rank, shape) and NEVER across ranks, preserving per-rank variance. Values are
+    already per-rank (analyze_sqlite per_pid=True does not sum across ranks), so the
+    caller must NOT divide compute/comm by ranks; busy is that rank's own union."""
     from collector.layerwise.vllm.nsys import _filter_boundary_discards
 
     rows = _filter_boundary_discards(rows, discard_first_n=discard_first_n)
-    buckets: dict[tuple[int, int], dict[str, list[float]]] = defaultdict(
+    buckets: dict[tuple[int, ...], dict[str, list[float]]] = defaultdict(
         lambda: {"compute": [], "comm": [], "busy": []}
     )
     for row in rows:
-        key = (int(row["batch_size"]), int(row["past_kv"]))
+        if per_pid:
+            key: tuple[int, ...] = (int(row["batch_size"]), int(row["past_kv"]), int(row["pid"]))
+        else:
+            key = (int(row["batch_size"]), int(row["past_kv"]))
         buckets[key]["compute"].append(float(row["compute_gpu_us"]) / 1000.0)
         buckets[key]["comm"].append(float(row["comm_gpu_us"]) / 1000.0)
         buckets[key]["busy"].append(float(row["total_union_us"]) / 1000.0)
     reduce = statistics.median if aggregate == "median" else statistics.fmean
-    out: dict[tuple[int, int], dict[str, float]] = {}
+    out: dict[tuple[int, ...], dict[str, float]] = {}
     for key, series in buckets.items():
         out[key] = {
             "gpu_compute_ms": float(reduce(series["compute"])),
@@ -89,6 +103,37 @@ def aggregate_profiled_by_shape(
             "gpu_busy_ms": float(reduce(series["busy"])),
         }
     return out
+
+
+def _sum_per_pid_rows_to_merged(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse per-PID analyze_sqlite rows back to the merged (per_pid=False) shape.
+
+    The aggregate (cross-rank) row must be computed from the SAME reduction the
+    per_pid=False path uses: compute/comm SUMMED across ranks per step, busy the
+    cross-rank interval union. We do not have the raw intervals here, so busy is the
+    MAX rank union per step (ranks run in lockstep, so the cross-rank union ≈ the
+    longest single-rank union -- the empirical gpu_busy ≈ wall identity). This keeps
+    the aggregate identical to today for the genuine merged-lane input (one row per
+    step, pid empty), where each step is its own group of size one and sum/max are
+    no-ops."""
+    by_step: dict[tuple[int, int, int, int], dict[str, float]] = {}
+    for row in rows:
+        gk = (int(row["step"]), int(row["batch_size"]), int(row["past_kv"]), int(row["measure_run"]))
+        acc = by_step.setdefault(
+            gk, {"compute_gpu_us": 0.0, "comm_gpu_us": 0.0, "total_union_us": 0.0}
+        )
+        acc["compute_gpu_us"] += float(row["compute_gpu_us"])
+        acc["comm_gpu_us"] += float(row["comm_gpu_us"])
+        acc["total_union_us"] = max(acc["total_union_us"], float(row["total_union_us"]))
+    merged: list[dict[str, Any]] = []
+    for (step, bs, past, run), acc in by_step.items():
+        merged.append({
+            "step": step, "batch_size": bs, "past_kv": past, "measure_run": run,
+            "compute_gpu_us": acc["compute_gpu_us"],
+            "comm_gpu_us": acc["comm_gpu_us"],
+            "total_union_us": acc["total_union_us"],
+        })
+    return merged
 
 
 def _bin_fpm_wall_to_profiled_key(
@@ -127,6 +172,7 @@ def run_decode_attribution(
     discard_first_n: int = 3,
     aggregate: str = "median",
     ranks: int = 1,
+    per_pid: bool = False,
 ) -> list[dict[str, Any]]:
     """Join profiled composition + clean FPM wall + AIC breakdown per decode shape.
 
@@ -145,26 +191,33 @@ def run_decode_attribution(
     if profiled_rows is None:
         from collector.layerwise.diagnostics.analyze_nsys_comm_overlap import analyze_sqlite
 
-        profiled_rows, _meta = analyze_sqlite(sqlite_path)
-    profiled = aggregate_profiled_by_shape(
-        profiled_rows, discard_first_n=discard_first_n, aggregate=aggregate
-    )
+        profiled_rows, _meta = analyze_sqlite(sqlite_path, per_pid=per_pid)
     # Bin the clean-lane float mean_kv onto the profiled integer past_kv key space so
     # the join below is over a single, consistent integer key space.
     fpm_wall_binned = _bin_fpm_wall_to_profiled_key(fpm_wall_by_shape)
     out: list[dict[str, Any]] = []
+
+    # --- aggregate (cross-rank) rows: ALWAYS computed from the per_pid=False reduction
+    # so they are IDENTICAL to today regardless of per_pid. When per_pid=True the input
+    # rows are per-rank, so first sum them back to the merged (cross-rank) shape; when
+    # per_pid=False the merged rows pass through _sum_per_pid_rows_to_merged as a no-op.
+    merged_rows = _sum_per_pid_rows_to_merged(profiled_rows) if per_pid else profiled_rows
+    profiled = aggregate_profiled_by_shape(
+        merged_rows, discard_first_n=discard_first_n, aggregate=aggregate
+    )
     for key in sorted(set(profiled) & set(fpm_wall_binned)):
         batch_size, past_kv = key
         aic_compute, aic_comm, aic_total = aic_predict(batch_size, past_kv)
         if aic_compute is None:
             continue
         comp = profiled[key]
-        # TP>1: analyze_sqlite sums kernel durations across ALL ranks captured in the
-        # single nsys report, but `wall` and the AIC layerwise prediction are single-rank.
-        # For a balanced dense TP run each rank does ~1/ranks of the compute and one
-        # allreduce per collective, so the per-rank value is the sum / ranks. gpu_busy
-        # (interval union) is left as-is: ranks run in wall-clock lockstep, so the union
-        # already collapses to ~one rank's wall (empirically gpu_busy ≈ wall at TP=8).
+        # TP>1: analyze_sqlite (merged) sums kernel durations across ALL ranks captured
+        # in the single nsys report, but `wall` and the AIC layerwise prediction are
+        # single-rank. For a balanced dense TP run each rank does ~1/ranks of the compute
+        # and one allreduce per collective, so the per-rank value is the sum / ranks.
+        # gpu_busy (interval union) is left as-is: ranks run in wall-clock lockstep, so
+        # the union already collapses to ~one rank's wall (empirically gpu_busy ≈ wall
+        # at TP=8).
         row = decompose_shape(
             wall_ms=fpm_wall_binned[key],
             aic_compute_ms=aic_compute,
@@ -177,7 +230,40 @@ def run_decode_attribution(
         row["phase"] = "decode"
         row["batch_size"] = batch_size
         row["past_kv"] = past_kv
+        row["pid"] = ""
         out.append(row)
+
+    # --- per-rank rows (per_pid=True only): keyed by (batch_size, past_kv, pid),
+    # median over repeated steps of the SAME (rank, shape) -- NEVER across ranks, so
+    # cross-rank variance is preserved. Values are ALREADY per-rank, so they are NOT
+    # divided by ranks; gpu_busy is that rank's own interval union. These rows are
+    # emitted ALONGSIDE the aggregate rows above and never feed the /ranks aggregate.
+    if per_pid:
+        per_rank = aggregate_profiled_by_shape(
+            profiled_rows, discard_first_n=discard_first_n, aggregate=aggregate, per_pid=True
+        )
+        for key in sorted(per_rank):
+            batch_size, past_kv, pid = key
+            if (batch_size, past_kv) not in fpm_wall_binned:
+                continue
+            aic_compute, aic_comm, aic_total = aic_predict(batch_size, past_kv)
+            if aic_compute is None:
+                continue
+            comp = per_rank[key]
+            row = decompose_shape(
+                wall_ms=fpm_wall_binned[(batch_size, past_kv)],
+                aic_compute_ms=aic_compute,
+                aic_comm_ms=aic_comm,
+                aic_other_ms=aic_total - aic_compute - aic_comm,
+                gpu_compute_ms=comp["gpu_compute_ms"],  # per-rank, NOT /ranks
+                gpu_comm_ms=comp["gpu_comm_ms"],        # per-rank, NOT /ranks
+                gpu_busy_ms=comp["gpu_busy_ms"],        # this rank's own union
+            )
+            row["phase"] = "decode"
+            row["batch_size"] = batch_size
+            row["past_kv"] = past_kv
+            row["pid"] = pid
+            out.append(row)
     return out
 
 
@@ -272,7 +358,7 @@ def write_decomposition_csv(rows: list[dict[str, Any]], out_path: str) -> None:
             "(empty join -- profiled/FPM/AIC lanes had no shape in common)."
         )
     cols = [
-        "phase", "batch_size", "past_kv", "wall_ms", "aic_total_ms",
+        "phase", "batch_size", "past_kv", "pid", "wall_ms", "aic_total_ms",
         "aic_compute_ms", "aic_comm_ms", "aic_other_ms",
         "gpu_compute_ms", "gpu_comm_ms", "gpu_busy_ms",
         "overlap_ms", "overhead_ms", "gap_ms",
@@ -311,6 +397,13 @@ def _main(argv=None):
     p.add_argument("--model", required=True)
     p.add_argument("--tp", type=int, default=8)
     p.add_argument("--discard-first-n", type=int, default=3)
+    p.add_argument(
+        "--per-pid",
+        action="store_true",
+        help="ALSO emit accurate per-rank rows (pid column) alongside the cross-rank "
+             "aggregate. Per-rank compute/comm are NOT divided by ranks and per-rank "
+             "variance is preserved; the aggregate rows are unchanged.",
+    )
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
 
@@ -371,13 +464,13 @@ def _main(argv=None):
     # Reduce the nsys lane once; both decode and context phases share the profiled rows
     # (decode keys on per-(batch,kv) rows, context aggregates the bs0 pure-prefill rows).
     from collector.layerwise.diagnostics.analyze_nsys_comm_overlap import analyze_sqlite
-    profiled_rows, _meta = analyze_sqlite(args.sqlite)
+    profiled_rows, _meta = analyze_sqlite(args.sqlite, per_pid=args.per_pid)
 
     rows = run_decode_attribution(
         sqlite_path=args.sqlite, profiled_rows=profiled_rows,
         fpm_wall_by_shape=fpm_wall, aic_predict=aic_predict,
         discard_first_n=args.discard_first_n,
-        ranks=args.tp,
+        ranks=args.tp, per_pid=args.per_pid,
     )
 
     # --- context phase (the high-C context puzzle) ---
@@ -403,13 +496,18 @@ def _main(argv=None):
                 raise ValueError(f"AIC context predict unavailable (status={status})")
             return (compute, comm, total)
 
+        # Context is a single CROSS-RANK aggregate (no per-rank rows). When --per-pid
+        # is set the profiled rows are per-rank, so sum them back to the merged shape
+        # first; aggregate_profiled_context then divides by ranks exactly as today.
+        ctx_profiled = _sum_per_pid_rows_to_merged(profiled_rows) if args.per_pid else profiled_rows
         ctx_row = run_context_attribution(
-            sqlite_path=args.sqlite, profiled_rows=profiled_rows,
+            sqlite_path=args.sqlite, profiled_rows=ctx_profiled,
             fpm_ctx_wall_ms=fpm_ctx_wall_ms, aic_ctx_predict=aic_ctx_predict,
             discard_first_n=args.discard_first_n, ranks=args.tp,
         )
         ctx_row["batch_size"] = ""
         ctx_row["past_kv"] = int(ctx_tokens)
+        ctx_row["pid"] = ""
         rows.append(ctx_row)
     except Exception as exc:  # noqa: BLE001 - never crash _main; decode rows still written
         print(f"[attribute] context phase skipped: {exc}", file=sys.stderr)

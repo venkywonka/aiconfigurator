@@ -95,6 +95,25 @@ python -m collector.layerwise.diagnostics.aic_fpm_attribute --sqlite OUT.sqlite 
 
 `aic_fpm_attribute.py` loads the sqlite via `collector/layerwise/diagnostics/analyze_nsys_comm_overlap.py`. If `stage_attribute` aborts after a valid capture, run these two steps manually rather than re-collecting.
 
+## Backup Raw Traces BEFORE Stopping The Box (ephemeral disk)
+
+`/home/ubuntu` on brev is ephemeral: `brev delete` wipes it. `brev stop` preserves the disk, so a stopped box can be restarted and its traces pulled -- but do NOT rely on that. The decompose runs ON the box and only the reduced CSVs come back, so raw `.nsys-rep`/`.sqlite` are NOT durable unless explicitly pulled. **Always back them up before `brev stop`/`brev delete`.**
+
+Gotcha that lost traces once: `brev-pull.sh` mirrors ONLY `/home/ubuntu/aic-runs/`, but `stage_attribute` writes traces under the repo tree and `/tmp`. So a path-scoped pull misses them. Back up by FILE TYPE across all roots, not by one output dir:
+
+```bash
+BREV=8xh100-layerwise
+DEST=/home/gvenkatarama/scratch/agent-slop/aiconfigurator/fpm-nsys-attribution/box-nsys-backup
+SSH="ssh -o BatchMode=yes -o RequestTTY=no"
+# discover by type across ALL roots (not just aic-runs/), excluding pkg/cache noise
+$SSH "$BREV" "find /home/ubuntu /tmp -xdev \( -name '*.nsys-rep' -o -name '*.qdrep' -o -name '*.sqlite' \) \
+  -not -path '*/.cache/*' -not -path '*/site-packages/*' -not -path '*/__pycache__/*' -print0 2>/dev/null" > /tmp/nsys.files0
+# --relative keeps each artifact's absolute remote path (provenance); -az never deletes
+rsync -az --relative --from0 --files-from=/tmp/nsys.files0 -e "$SSH" "$BREV:/" "$DEST/"
+```
+
+DEST MUST be SCRATCH-BACKED (mirrors to clab-sc-01 via CIFS), never the ephemeral box and never a non-scratch local path. Packaged as `slop/birepo-brev-8xh100-layerwise/brev-backup-nsys.sh` (sweeps, prints total size, writes a size/mtime `MANIFEST.tsv` for verification). This is a REQUIRED step at the end of any attributed-FPM collection -- the brev-pull companion alone is insufficient.
+
 ## Notes For This Repo
 
 - The vLLM collector launches `nsys profile` from inside the scheduler process, so `nsys` must be visible inside the container that runs `python -m collector.layerwise.vllm.collect`.
