@@ -122,14 +122,6 @@ NSYS_PROFILE_TRAFFIC_ONLY="${NSYS_PROFILE_TRAFFIC_ONLY:-1}"
 NSYS_SESSION_NAME="${NSYS_SESSION_NAME:-fpm_worker}"
 NSYS_CUDA_PROFILER_WINDOW="${NSYS_CUDA_PROFILER_WINDOW:-}"
 
-# Host-side telemetry (design.md v3 §6): dmon per-GPU clock/power (S-clock rule-out),
-# DCGM NVLink util (S-fabric rule-out), pidstat per worker (M-launch corroboration).
-# Detached collectors bracketing the nsys session; gated by --telemetry / TELEMETRY=1.
-# Each collector is guarded with command -v and skips gracefully if its tool is absent.
-TELEMETRY="${TELEMETRY:-0}"
-TELEMETRY_INTERVAL_SECONDS="${TELEMETRY_INTERVAL_SECONDS:-1}"
-TELEMETRY_PIDS=()
-
 RUN_ID="${RUN_ID:-dynamo-fpm-$(date +%Y%m%d-%H%M%S)-$$}"
 NAME_PREFIX="${NAME_PREFIX:-${RUN_ID}}"
 RUN_DIR="${RUN_DIR:-/tmp/${RUN_ID}}"
@@ -242,10 +234,6 @@ Options:
   --nsys-cuda-graph-trace MODE  nsys --cuda-graph-trace value when profiling worker (default: ${NSYS_CUDA_GRAPH_TRACE})
   --nsys-cuda-profiler-window SPEC  Windowed cudaProfilerStart/Stop gating; "lo-hi[,lo-hi...]" step ordinals -> LAYERWISE_CUDA_PROFILER_WINDOW
   --nsys-full-worker            Profile from worker start instead of only measured traffic
-  --telemetry                   Collect host-side telemetry bracketing the nsys session into RUN_DIR/telemetry/:
-                                nvidia-smi dmon -> dmon.csv, dcgmi dmon NVLink -> dcgm_nvlink.csv, pidstat -> pidstat.csv.
-                                Each collector is skipped gracefully if its tool is absent (command -v guarded).
-  --telemetry-interval-seconds N  Telemetry sampling interval in seconds (default: ${TELEMETRY_INTERVAL_SECONDS})
   --max-tokens N                Fixed-workload max_tokens (default: ${MAX_TOKENS})
   --prompt-token-seed N         Seed for reproducible random prompt token IDs (default: random)
   --prompt-token-mode MODE      random_vocab_excluding_special or safe_ascii (default: ${PROMPT_TOKEN_MODE})
@@ -479,15 +467,6 @@ cleanup() {
         kill "${DISCOVERY_TOUCH_PID}" >/dev/null 2>&1 || true
         wait "${DISCOVERY_TOUCH_PID}" >/dev/null 2>&1 || true
     fi
-    # Never leak detached telemetry collectors if we exit before stop_telemetry.
-    if [[ "${#TELEMETRY_PIDS[@]}" -gt 0 ]]; then
-        local _tpid
-        for _tpid in "${TELEMETRY_PIDS[@]}"; do
-            kill "${_tpid}" >/dev/null 2>&1 || true
-            wait "${_tpid}" >/dev/null 2>&1 || true
-        done
-        TELEMETRY_PIDS=()
-    fi
     if [[ "${CLEANUP_ENABLED}" != "1" ]]; then
         exit "${rc}"
     fi
@@ -595,8 +574,6 @@ while [[ $# -gt 0 ]]; do
         --nsys-cuda-graph-trace) NSYS_CUDA_GRAPH_TRACE="$2"; shift 2 ;;
         --nsys-cuda-profiler-window) NSYS_CUDA_PROFILER_WINDOW="$2"; shift 2 ;;
         --nsys-full-worker) NSYS_PROFILE_TRAFFIC_ONLY=0; shift ;;
-        --telemetry) TELEMETRY=1; shift ;;
-        --telemetry-interval-seconds) TELEMETRY_INTERVAL_SECONDS="$2"; shift 2 ;;
         --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
         --prompt-token-seed) PROMPT_TOKEN_SEED="$2"; shift 2 ;;
         --prompt-token-mode) PROMPT_TOKEN_MODE="$2"; shift 2 ;;
@@ -779,7 +756,6 @@ mkdir -p \
     "${METADATA_OUTPUT_DIR}" \
     "${EFFECTIVE_CONFIG_OUTPUT_DIR}" \
     "${RUN_DIR}/nsys" \
-    "${RUN_DIR}/telemetry" \
     "${HF_HOME_HOST}" \
     "${VLLM_CACHE_HOST}" \
     "${VLLM_CACHE_HOST}/tilelang/tmp"
@@ -1332,91 +1308,6 @@ stop_nsys_worker_collection() {
         log "WARNING: failed to stop Nsight session ${NSYS_SESSION_NAME}"
 }
 
-# --- Host-side telemetry (design.md v3 §6) ----------------------------------
-# start_telemetry/stop_telemetry mirror the nsys session start/stop bracket: they
-# are called immediately around start_nsys_worker_collection / stop_nsys_worker_collection
-# so the telemetry window aligns with the profiled traffic. Each collector is launched
-# detached, writes under RUN_DIR/telemetry/, and is skipped gracefully (command -v
-# guarded) if its tool is unavailable. Stopped by killing the recorded PIDs (also on
-# the cleanup EXIT trap, so a crash never leaks background collectors).
-
-# Resolve the host-namespace PIDs of the worker's `dynamo.vllm` processes, for pidstat.
-# docker top shows host PIDs of in-container processes; fall back to host pgrep.
-worker_dynamo_vllm_pids() {
-    local pids=""
-    if command -v docker >/dev/null 2>&1 && container_exists "${WORKER_NAME}"; then
-        # Columns vary by docker version; PID is the first numeric field, match on the cmd.
-        pids="$(docker top "${WORKER_NAME}" -eo pid,cmd 2>/dev/null \
-            | awk '/dynamo\.vllm/ {print $1}' | tr '\n' ',' | sed 's/,$//')"
-    fi
-    if [[ -z "${pids}" ]] && command -v pgrep >/dev/null 2>&1; then
-        pids="$(pgrep -d, -f 'dynamo\.vllm' 2>/dev/null || true)"
-    fi
-    echo "${pids}"
-}
-
-start_telemetry() {
-    if [[ "${TELEMETRY}" != "1" ]]; then
-        return
-    fi
-    if [[ "${DRY_RUN}" == "1" ]]; then
-        log "[telemetry] DRY_RUN: would start dmon/dcgm/pidstat under ${RUN_DIR}/telemetry/"
-        return
-    fi
-    local tdir="${RUN_DIR}/telemetry"
-    mkdir -p "${tdir}"
-    log "Starting host telemetry into ${tdir} (interval ${TELEMETRY_INTERVAL_SECONDS}s)"
-
-    # 1) nvidia-smi dmon: per-GPU power/util/clocks (S-clock rule-out) -> dmon.csv.
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        nvidia-smi dmon -s pucm -o DT -d "${TELEMETRY_INTERVAL_SECONDS}" >"${tdir}/dmon.csv" 2>"${tdir}/dmon.err" &
-        TELEMETRY_PIDS+=("$!")
-    else
-        log "[telemetry] nvidia-smi absent; skipping dmon.csv"
-    fi
-
-    # 2) dcgmi dmon NVLink TX/RX bandwidth fields 1011/1012 (S-fabric rule-out) -> dcgm_nvlink.csv.
-    # Requires the nv-hostengine; skip gracefully if either dcgmi or nv-hostengine is absent.
-    if command -v dcgmi >/dev/null 2>&1 && command -v nv-hostengine >/dev/null 2>&1; then
-        local dcgm_interval_ms=$(( TELEMETRY_INTERVAL_SECONDS * 1000 ))
-        dcgmi dmon -e 1011,1012 -d "${dcgm_interval_ms}" >"${tdir}/dcgm_nvlink.csv" 2>"${tdir}/dcgm_nvlink.err" &
-        TELEMETRY_PIDS+=("$!")
-    else
-        log "[telemetry] dcgmi/nv-hostengine absent; skipping dcgm_nvlink.csv"
-    fi
-
-    # 3) pidstat on the worker's dynamo.vllm host PIDs (M-launch corroboration) -> pidstat.csv.
-    if command -v pidstat >/dev/null 2>&1; then
-        local wpids; wpids="$(worker_dynamo_vllm_pids)"
-        if [[ -n "${wpids}" ]]; then
-            # -h flat output, -u CPU, -r mem, -p <pids>, sampled forever at the interval.
-            pidstat -h -u -r -p "${wpids}" "${TELEMETRY_INTERVAL_SECONDS}" \
-                >"${tdir}/pidstat.csv" 2>"${tdir}/pidstat.err" &
-            TELEMETRY_PIDS+=("$!")
-        else
-            log "[telemetry] no dynamo.vllm worker PIDs resolved (docker top/pgrep); skipping pidstat.csv"
-        fi
-    else
-        log "[telemetry] pidstat absent (install sysstat); skipping pidstat.csv"
-    fi
-}
-
-stop_telemetry() {
-    if [[ "${TELEMETRY}" != "1" || "${DRY_RUN}" == "1" ]]; then
-        return
-    fi
-    if [[ "${#TELEMETRY_PIDS[@]}" -eq 0 ]]; then
-        return
-    fi
-    log "Stopping host telemetry (${#TELEMETRY_PIDS[@]} collector(s))"
-    local pid
-    for pid in "${TELEMETRY_PIDS[@]}"; do
-        kill "${pid}" >/dev/null 2>&1 || true
-        wait "${pid}" >/dev/null 2>&1 || true
-    done
-    TELEMETRY_PIDS=()
-}
-
 log "Run directory: ${RUN_DIR}"
 log "CSV output: ${OUTPUT_CSV}"
 log "FPM detail CSV: ${DETAIL_OUTPUT_CSV}"
@@ -1558,7 +1449,6 @@ if [[ "${DRY_RUN}" != "1" ]]; then
 fi
 
 start_nsys_worker_collection
-start_telemetry
 
 send_sweep_workloads() {
     local context_count context_requests
@@ -1671,7 +1561,6 @@ else
         "legacy" || REQUEST_SEND_RC=$?
 fi
 
-stop_telemetry
 stop_nsys_worker_collection
 
 if [[ "${REQUEST_SEND_RC}" != "0" ]]; then

@@ -75,7 +75,6 @@ class WorkUnit:
     target_layers: list[int]
     datapoints: list[DataPoint]
     model_layer_count: int | None = None
-    patched_num_hidden_layers: int | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     cache_block_size: int | None = None

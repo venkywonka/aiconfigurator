@@ -242,7 +242,6 @@ def make_work_unit_args(
         target_layers=public_args.target_layers,
         target_layer_config_depth=public_args.target_layer_config_depth,
         phases=phases,
-        mixed_specs=getattr(public_args, "mixed_specs", None),
         ctx_new_tokens=public_args.ctx_new_tokens or preset_values["ctx_new_tokens"],
         ctx_past_kv=public_args.ctx_past_kv or preset_values["ctx_past_kv"],
         ctx_batch_sizes=public_args.ctx_batch_sizes or preset_values["ctx_batch_sizes"],
@@ -587,38 +586,6 @@ def _patch_for_layerwise_depth(
     )
 
 
-def _parse_mixed_specs(raw: Any) -> list[tuple[int, int, int]]:
-    """Normalize the ``mixed_specs`` argument into ``(P, B, K)`` int triples.
-
-    Accepts either an already-parsed iterable of triples or a string of
-    semicolon/comma-delimited ``P:B:K`` cells (e.g. ``"2048:64:4096;512:8:1024"``).
-    """
-
-    if raw in (None, ""):
-        return []
-    specs: list[tuple[int, int, int]] = []
-    if isinstance(raw, str):
-        for cell in raw.replace(";", ",").split(","):
-            cell = cell.strip()
-            if not cell:
-                continue
-            parts = cell.split(":")
-            if len(parts) != 3:
-                raise ValueError(f"mixed spec {cell!r} must use P:B:K syntax")
-            specs.append((int(parts[0]), int(parts[1]), int(parts[2])))
-    else:
-        for item in raw:
-            prefill_tokens, decode_requests, decode_past_kv = item
-            specs.append((int(prefill_tokens), int(decode_requests), int(decode_past_kv)))
-    for prefill_tokens, decode_requests, decode_past_kv in specs:
-        if prefill_tokens < 1 or decode_requests < 1 or decode_past_kv < 1:
-            raise ValueError(
-                f"mixed spec values must be >= 1, got "
-                f"P={prefill_tokens} B={decode_requests} K={decode_past_kv}"
-            )
-    return specs
-
-
 def _build_datapoints(
     *,
     phases: str,
@@ -627,7 +594,6 @@ def _build_datapoints(
     ctx_batch_sizes: list[int],
     gen_batch_sizes: list[int],
     gen_past_kv: list[int],
-    mixed_specs: list[tuple[int, int, int]] | None = None,
 ) -> list[DataPoint]:
     datapoints: list[DataPoint] = []
     if phases in ("ctx", "both"):
@@ -639,26 +605,6 @@ def _build_datapoints(
         for batch_size in gen_batch_sizes:
             for past_kv in gen_past_kv:
                 datapoints.append(DataPoint("gen", batch_size, 1, past_kv))
-    if phases == "mixed":
-        for prefill_tokens, decode_requests, decode_past_kv in mixed_specs or []:
-            # The mixed datapoint is the overlapping (fused) measurement; the
-            # three reference datapoints on the SAME work unit isolate the
-            # prefill-only, decode-at-K, and decode-at-1 components so the
-            # analyzer can attribute the overlap savings.
-            datapoints.append(
-                DataPoint(
-                    "mixed",
-                    0,
-                    0,
-                    0,
-                    prefill_tokens=prefill_tokens,
-                    decode_requests=decode_requests,
-                    decode_past_kv=decode_past_kv,
-                )
-            )
-            datapoints.append(DataPoint("ctx", 1, prefill_tokens, 0))
-            datapoints.append(DataPoint("gen", decode_requests, 1, decode_past_kv))
-            datapoints.append(DataPoint("gen", decode_requests, 1, 1))
     return datapoints
 
 
@@ -759,12 +705,6 @@ def _filter_datapoints_for_model_max_len(
             # measured context suffix, so max_model_len must fit the prompt plus that
             # generated token.
             required_len = dp.past_kv + dp.new_tokens + 1
-        elif dp.phase == "mixed":
-            # The fused step co-schedules one prefill of P tokens with B decodes
-            # each holding K past tokens. Use the conservative P + K + slack bound
-            # so max_model_len comfortably admits both the prefill prompt and the
-            # primed decode sequences.
-            required_len = dp.prefill_tokens + dp.decode_past_kv + 2
         else:
             required_len = dp.past_kv + 2
         if required_len > max_model_len:
@@ -845,7 +785,6 @@ def build_work_units(args: argparse.Namespace) -> list[WorkUnit]:
 
     system = args.system or _get_system_name()
     version = args.framework_version or _get_vllm_version()
-    mixed_specs = _parse_mixed_specs(getattr(args, "mixed_specs", None))
     base_datapoints = _build_datapoints(
         phases=args.phases,
         ctx_new_tokens=ctx_new_tokens,
@@ -853,7 +792,6 @@ def build_work_units(args: argparse.Namespace) -> list[WorkUnit]:
         ctx_batch_sizes=ctx_batch_sizes,
         gen_batch_sizes=gen_batch_sizes,
         gen_past_kv=gen_past_kv,
-        mixed_specs=mixed_specs,
     )
     base_datapoints, resolved_max_num_seqs = _resolve_decode_max_num_seqs(base_datapoints, max_num_seqs)
     gen_driver = str(getattr(args, "gen_driver", "") or os.environ.get("LAYERWISE_GEN_DRIVER") or "prefix_cache")
@@ -1031,14 +969,6 @@ def build_work_units(args: argparse.Namespace) -> list[WorkUnit]:
             "attn_quant": args.attn_quant,
             "kv_quant": args.kv_quant,
         }
-        is_mixed_phase = args.phases == "mixed"
-        # For mixed units the engine is patched down to ``num_hidden_layers``
-        # resident layers, but the reported ``model_layer_count`` is the FULL
-        # model depth so ``target_layers`` stays a strict subset of
-        # ``range(model_layer_count)`` (=> ``needs_layer_patch`` is True and the
-        # scheduler enables layer patching). ``patched_num_hidden_layers`` carries
-        # the actual resident depth used to patch the config.
-        unit_model_layer_count = orig_layer_count if is_mixed_phase else num_hidden_layers
         for representative in layer_schedule:
             target_layers = representative.kept_layers()
             includes_moe = not moe_noop and "moe" in representative.layer_type.lower()
@@ -1066,8 +996,7 @@ def build_work_units(args: argparse.Namespace) -> list[WorkUnit]:
                         representative=representative,
                         target_layers=target_layers,
                         datapoints=partitioned_datapoints,
-                        model_layer_count=unit_model_layer_count,
-                        patched_num_hidden_layers=num_hidden_layers,
+                        model_layer_count=num_hidden_layers,
                         max_num_seqs=resolved_max_num_seqs,
                         max_num_batched_tokens=resolved_max_num_batched_tokens,
                         cache_block_size=resolved_cache_block_size,
