@@ -584,13 +584,14 @@ def _load_fpm(
     if filter_pathological_context and _normalized_workload_segment(workload_segment) is not None:
         support_rows = _read_fpm_rows(path, workload_segment=None)
         context_pathology_reasons.update(_context_workload_transition_reasons(rows, support_rows))
+    # Bin every context-phase row wherever it sits in the CSV. Real FPM walls interleave context
+    # steps among decode steps (a prefill runs in whatever scheduler iteration picks it up), so the
+    # context rows are NOT a contiguous block at the top. An earlier shortcut stopped at the first
+    # decode row and dropped every later context shape -> only the first distinct-ISL prefill scored.
+    # The per-row phase guard below already skips non-context rows; pathological/interference rows are
+    # handled by filter_pathological_context, not by CSV position. (With prefix caching + chunked
+    # prefill disabled in the layerwise deploy, each context row is a clean full prefill, kv==0.)
     context_rows = rows
-    if rows and str(rows[0].get("phase", "")).lower() == "context":
-        context_rows = []
-        for row in rows:
-            if str(row.get("phase", "")).lower() != "context":
-                break
-            context_rows.append(row)
     for index, row in enumerate(context_rows):
         if str(row.get("phase", "")).lower() != "context":
             continue

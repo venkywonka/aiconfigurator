@@ -1789,7 +1789,12 @@ def test_context_workload_transition_filter_requires_singleton_fresh_context() -
     assert _context_workload_transition_reasons(rows, support_rows) == {}
 
 
-def test_load_fpm_preserves_leading_context_iteration_rows(tmp_path) -> None:
+def test_load_fpm_raw_bins_all_context_rows_regardless_of_position(tmp_path) -> None:
+    # Raw mode (filter_pathological_context=False) bins EVERY context-phase row, wherever it
+    # sits in the CSV — including context rows that appear AFTER decode rows. (Previously a
+    # contiguous-prefix shortcut stopped at the first decode row and silently dropped every
+    # later context shape, which lost most distinct-ISL prefills in real interleaved walls.)
+    # Anomaly screening is the job of filter_pathological_context, not of CSV row position.
     fpm = tmp_path / "fpm.csv"
     _write(
         fpm,
@@ -1807,10 +1812,41 @@ context,6,w,0,2048,1,2048,0,0,0,0.000,0,0,0,0,999.0
     context, decode, _ = _load_fpm(fpm, filter_pathological_context=False)
 
     assert context[(1, 128, 0)] == [17.0]
-    assert context[(1, 2048, 0)] == [100.0]
-    assert context[(1, 2048, 2048)] == [110.0]
+    # post-decode same-shape context rows are now binned (raw mode keeps all samples)
+    assert context[(1, 2048, 0)] == [100.0, 999.0]
+    assert context[(1, 2048, 2048)] == [110.0, 999.0]
     assert (1, 4096, 0) not in context
     assert decode[(1, 4096.0)] == [8.0]
+
+
+def test_load_fpm_bins_context_rows_interleaved_among_decode(tmp_path) -> None:
+    # Real FPM walls interleave context steps among thousands of decode steps: a long prefill
+    # lands in whatever scheduler iteration runs it, so distinct-ISL context rows are scattered
+    # through the CSV, NOT a contiguous block at the top. With prefix caching + chunked prefill
+    # disabled (the layerwise deploy default), each is a clean full prefill at ctx_kv_tokens=0.
+    # _load_fpm must bin EVERY context-phase row, wherever it sits, so all distinct prefill
+    # shapes are scored (not just the first contiguous block).
+    fpm = tmp_path / "fpm.csv"
+    _write(
+        fpm,
+        """
+phase,counter_id,worker_id,dp_rank,ctx_tokens,ctx_requests,ctx_kv_tokens,decode_tokens,decode_requests,decode_kv_tokens,mean_decode_kv_tokens,queued_ctx_tokens,queued_ctx_requests,queued_decode_requests,queued_decode_kv_tokens,latency_ms
+context,1,w,0,512,1,0,0,0,0,0.000,0,0,0,0,10.0
+decode,2,w,0,0,0,0,1,1,4096,4096.000,0,0,0,0,4.0
+decode,3,w,0,0,0,0,1,1,4097,4097.000,0,0,0,0,4.0
+context,4,w,0,3363,1,0,0,0,0,0.000,0,0,0,0,40.0
+decode,5,w,0,0,0,0,1,1,4098,4098.000,0,0,0,0,4.0
+context,6,w,0,16384,1,0,0,0,0,0.000,0,0,0,0,180.0
+""",
+    )
+
+    context, _, _ = _load_fpm(fpm, workload_segment=None)
+
+    # all three distinct-ISL prefills are binned, despite decode rows between them
+    assert context[(1, 512, 0)] == [10.0]
+    assert context[(1, 3363, 0)] == [40.0]
+    assert context[(1, 16384, 0)] == [180.0]
+    assert len([k for k in context if k[0] == 1]) == 3
 
 
 def test_decode_comparison_uses_exact_kv_bin(tmp_path) -> None:
