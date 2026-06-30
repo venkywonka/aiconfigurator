@@ -123,6 +123,14 @@ def _apply_common_runtime_defaults(args: list[str]) -> None:
     # doesn't impact latency, only generation output settings.
     _append_default_pair(args, "--generation-config", "vllm")
 
+    # Disable prefix caching and chunked prefill by default so FPM/layerwise measurements are not
+    # confounded by re-prefills: with either ON, context-phase steps can carry ctx_kv_tokens>0
+    # (prefix-cache reuse / continuation) or appear as partial chunk fragments instead of clean
+    # single-turn full prefills. An explicit --enable-prefix-caching / --enable-chunked-prefill in
+    # extra_args is respected (the positive flag is the alias guard, so the default is not added).
+    _append_default_flag(args, "--no-enable-prefix-caching", "--enable-prefix-caching")
+    _append_default_flag(args, "--no-enable-chunked-prefill", "--enable-chunked-prefill")
+
 
 def _apply_deepseek_v4_runtime_defaults(args: list[str]) -> None:
     """Add vLLM's published DeepSeek-V4 recipe defaults when not overridden."""

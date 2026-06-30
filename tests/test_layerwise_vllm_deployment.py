@@ -196,3 +196,40 @@ def test_gpt_oss_runtime_defaults_preserve_explicit_overrides() -> None:
     assert defaults.disable_prefix_caching is False
     assert "--stream-interval" not in defaults.extra_args
     assert "--stream-interval=7" in defaults.extra_args
+
+
+def test_runtime_defaults_disable_prefix_caching_and_chunked_prefill_for_fpm_model() -> None:
+    # FPM/layerwise measurements must not be confounded by re-prefills. With prefix caching
+    # or chunked prefill ON, context steps can carry ctx_kv_tokens>0 (cache reuse) or appear as
+    # 2048-token chunk fragments instead of clean full prefills. A clean single-turn prefill
+    # baseline requires BOTH disabled by default for the FPM deploy (a non-GPT-OSS model).
+    defaults = gpt_oss_runtime_defaults(model="Qwen/Qwen3-32B", system="h100_sxm")
+
+    assert "--no-enable-prefix-caching" in defaults.extra_args
+    assert "--no-enable-chunked-prefill" in defaults.extra_args
+    assert "--enable-prefix-caching" not in defaults.extra_args
+    assert "--enable-chunked-prefill" not in defaults.extra_args
+
+
+def test_runtime_defaults_respect_explicit_enable_prefix_caching() -> None:
+    # An explicit --enable-prefix-caching override must NOT be clobbered by the default-disable.
+    defaults = gpt_oss_runtime_defaults(
+        model="Qwen/Qwen3-32B",
+        system="h100_sxm",
+        extra_args=("--enable-prefix-caching",),
+    )
+
+    assert "--enable-prefix-caching" in defaults.extra_args
+    assert "--no-enable-prefix-caching" not in defaults.extra_args
+
+
+def test_runtime_defaults_respect_explicit_enable_chunked_prefill() -> None:
+    # An explicit --enable-chunked-prefill override must NOT be clobbered by the default-disable.
+    defaults = gpt_oss_runtime_defaults(
+        model="Qwen/Qwen3-32B",
+        system="h100_sxm",
+        extra_args=("--enable-chunked-prefill",),
+    )
+
+    assert "--enable-chunked-prefill" in defaults.extra_args
+    assert "--no-enable-chunked-prefill" not in defaults.extra_args
