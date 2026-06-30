@@ -6,7 +6,6 @@ per scheduler-step shape, for any (system, backend, version, model). All tracks 
 ONE per-step entry point (flipping ``vllm_backend._USE_LAYERWISE`` + swapping the ``database``):
 
     layerwise        layerwise CSV (compute-version) + comm tables (comm-version), cal-off headline
-    layerwise_cal0066 same + the old 0.0066 decode batch-cal (counterfactual sensitivity)
     opwise_silicon   measured op-wise PerfDatabase (SILICON)
     empirical        analytic SOL/scale_factor (version-skew-immune)
     hybrid           SILICON-with-empirical-fallback
@@ -65,19 +64,15 @@ def make_tracks(compute_version: str, comm_version: str):
     Layerwise tracks use the COMPUTE version (the layerwise CSV, version-matched to FPM); op-wise
     tracks use the COMM/op-DB version. decode_cal_override forces vllm_backend._DECODE_COMPUTE_BATCH_CAL
     (None = live default, 0.0 = disable). The headline 'layerwise' forces 0.0 (the linear decode
-    batch-cal is mis-tuned); 'layerwise_cal0066' forces the old 0.0066 as a counterfactual sensitivity track.
+    batch-cal is mis-tuned).
     """
     return [
         ("layerwise", True, None, compute_version, True, 0.0),
-        ("layerwise_cal0066", True, None, compute_version, True, 0.0066),
         ("opwise_silicon", False, "SILICON", comm_version, True, None),
         ("empirical", False, "EMPIRICAL", comm_version, False, None),
         ("hybrid", False, "HYBRID", comm_version, True, None),
         ("sol", False, "SOL", comm_version, False, None),
     ]
-
-# Tracks excluded from the headline ranking/decomposition (best-effort or sensitivity).
-NON_HEADLINE_TRACKS = {"layerwise_cal0066"}
 
 INSUFFICIENT_COVERAGE_FRACTION = 0.60  # spec §7 honest escape hatch
 
@@ -507,8 +502,8 @@ def run(repo_root: Path, fpm_run: Path, out_dir: Path, *, system: str, backend_n
         try:
             for (track_name, use_lw, mode, version, is_measured, cal_override) in tracks:
                 api["vllm_backend"]._USE_LAYERWISE = use_lw
-                # Force the decode batch-calibration for sensitivity tracks
-                # (layerwise_nocal sets it to 0.0); else keep the live default.
+                # decode_cal_override forces the decode batch-calibration per track
+                # (the headline 'layerwise' sets it to 0.0); None keeps the live default.
                 eff_cal = old_cal if cal_override is None else cal_override
                 api["vllm_backend"]._DECODE_COMPUTE_BATCH_CAL = eff_cal
                 # Per-track RuntimeConfig: the layerwise GEN data has no

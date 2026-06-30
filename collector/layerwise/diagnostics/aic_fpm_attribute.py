@@ -404,6 +404,13 @@ def _main(argv=None):
              "aggregate. Per-rank compute/comm are NOT divided by ranks and per-rank "
              "variance is preserved; the aggregate rows are unchanged.",
     )
+    p.add_argument(
+        "--layerwise-csv",
+        default=None,
+        help="explicit layerwise CSV for AIC's layerwise prediction (default: the shipped "
+             "systems-data layerwise_perf.csv). Pass the run's freshly-collected layerwise.csv "
+             "to decompose the gap against AIC's own measured layerwise instead of shipped data.",
+    )
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
 
@@ -412,12 +419,18 @@ def _main(argv=None):
     backend = api["VLLMBackend"]()
     api["vllm_backend"]._USE_LAYERWISE = True
     api["vllm_backend"]._DECODE_COMPUTE_BATCH_CAL = 0.0
+    # Resolve the layerwise CSV: explicit --layerwise-csv (e.g. this run's fresh layerwise.csv)
+    # wins; otherwise fall back to the shipped systems-data file (matches the headline gap track's
+    # default in aic_fpm_gap.run()).
+    layerwise_csv = args.layerwise_csv or str(
+        Path(G.DEFAULT_REPO_ROOT)
+        / f"src/aiconfigurator/systems/data/{args.system}/vllm/0.20.1/layerwise_perf.csv"
+    )
     model, db, err = G.build_model_and_db(
         "layerwise", True, None, "0.20.1", args.tp,
         system=args.system, backend="vllm", comm_version="0.19.0",
         systems_root=str(Path(G.DEFAULT_REPO_ROOT) / "src/aiconfigurator/systems"),
-        layerwise_csv=str(Path(G.DEFAULT_REPO_ROOT)
-                          / f"src/aiconfigurator/systems/data/{args.system}/vllm/0.20.1/layerwise_perf.csv"),
+        layerwise_csv=layerwise_csv,
         api=api,
     )
     if err:

@@ -632,6 +632,12 @@ stage_attribute() {
       # arrival-skew decomposition needs. The aggregate rows are unchanged.
       local perpid=()
       [[ "$ATTRIBUTE_PER_PID" == "1" ]] && perpid=(--per-pid)
+      # Grade AIC's layerwise prediction against THIS run's freshly-collected layerwise.csv
+      # (collected by the layerwise stage at $OUT_ROOT/layerwise/<slug>/layerwise.csv) rather
+      # than the shipped systems-data file. If the layerwise stage was not run (no fresh CSV),
+      # omit the flag so aic_fpm_attribute falls back to the shipped default.
+      local lwarg=(); local lwcsv; lwcsv="$(lw_csv "$slug")"
+      [[ -f "$lwcsv" ]] && lwarg=(--layerwise-csv "$lwcsv")
       # Decompose imports the aiconfigurator SDK (AIC predictions). On a source-checkout
       # box with no installed dist, put src/ on PYTHONPATH so the import resolves; the
       # __init__ version-fallback makes it work without dist metadata.
@@ -642,6 +648,7 @@ stage_attribute() {
           --system "$SYSTEM" --model "$hf" --tp "$TP" \
           --discard-first-n "$ATTRIBUTE_DISCARD_N" \
           "${perpid[@]}" \
+          "${lwarg[@]}" \
           --out "$rdir/decomposition.csv" \
         || warn "decompose failed for $unit (rc=$?); .nsys-rep + .sqlite retained under $rdir/nsys for manual decompose"
 

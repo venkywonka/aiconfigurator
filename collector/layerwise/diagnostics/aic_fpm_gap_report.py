@@ -21,19 +21,18 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-TRACK_ORDER = ["layerwise", "layerwise_cal0066", "opwise_silicon", "hybrid", "empirical", "sol"]
-# Diagnostic/sensitivity tracks excluded from the headline ranking.
-SENSITIVITY_TRACKS = {"layerwise_cal0066"}
+TRACK_ORDER = ["layerwise", "opwise_silicon", "hybrid", "empirical", "sol"]
+# Diagnostic/sensitivity tracks excluded from the headline ranking (none currently).
+SENSITIVITY_TRACKS: set[str] = set()
 TRACK_COLOR = {
     "layerwise": "#1f77b4",
-    "layerwise_cal0066": "#17becf",
     "opwise_silicon": "#d62728",
     "hybrid": "#9467bd",
     "empirical": "#ff7f0e",
     "sol": "#7f7f7f",
 }
 TRACK_VERSION = {
-    "layerwise": "0.20.1", "layerwise_cal0066": "0.20.1", "opwise_silicon": "0.19.0",
+    "layerwise": "0.20.1", "opwise_silicon": "0.19.0",
     "hybrid": "0.19.0", "empirical": "0.19.0", "sol": "0.19.0",
 }
 PHASES = ["ctx", "gen"]
@@ -294,8 +293,7 @@ CONFOUNDERS = [
     ("MITIGATED", "Layerwise decode batch-calibration (now DISABLED)",
      "vllm_backend._DECODE_COMPUTE_BATCH_CAL has been set to 0.0, disabling the (1 + 0.0066·batch) multiplier that "
      "previously scaled layerwise dense decode (+21% at batch=32) and was the dominant cause of the concurrency "
-     "over-prediction. The headline 'layerwise' track is now uncalibrated; the layerwise_cal0066 SENSITIVITY track "
-     "re-applies the old 0.0066 to show what was removed (decode_batch_cal column records the factor). NOTE: the "
+     "over-prediction. The headline 'layerwise' track is now uncalibrated. NOTE: the "
      "fix was the FORM — disabling a multiplier on the floor-dominated decode sum; a per-(model,system,TP) additive "
      "slope, validated against FPM, would be the principled replacement (default 0.0 where no FPM exists)."),
     ("REMAINS", "Engine/SKU/version non-parity + synthesized TP comm",
@@ -318,8 +316,7 @@ CONFOUNDERS = [
 
 CONCURRENCY_EXPLANATION = [
     "RESOLVED in the headline: _DECODE_COMPUTE_BATCH_CAL is now 0.0, so the live 'layerwise' track no longer "
-    "carries the concurrency degradation. The layerwise_cal0066 SENSITIVITY track re-applies the old 0.0066 and "
-    "still shows it, for the record.",
+    "carries the concurrency degradation that the old 0.0066 decode batch-cal introduced.",
     "What it was: with cal=0.0066 the layerwise decode over-predicted increasingly with batch — clean TP1/kv~4096 "
     "fit pred = 13.383 + 0.2524·batch vs fpm = 13.376 + 0.1911·batch (intercepts match to +0.007 ms, but the "
     "per-request slope ran 1.32× too steep), so signed bias climbed −0.0% @B1 → +5.8% @B8 → +15.8% @B32.",
@@ -331,7 +328,7 @@ CONCURRENCY_EXPLANATION = [
     "The PREMISE was right (author comment at :1424 — the single-GPU microbenchmark grows too gently: FPM's true "
     "per-request slope ≈0.150 vs the microbenchmark's ≈0.074 ms/req, ~2×), but the magnitude/form over-corrected. "
     "With cal=0 the headline layerwise now tracks FPM within ±5% at every batch (gen MAPE ~3–4% at TP1) vs the "
-    "old cal's 11–16% — confirmed by the cal0066 sensitivity track. A principled replacement is a per-"
+    "old cal's 11–16%. A principled replacement is a per-"
     "(model,system,TP) ADDITIVE slope validated against FPM (the slope varies ~4× across TP, so it is NOT a single "
     "global constant); default 0.0 where no FPM exists.",
     "Adversarial checks (layerwise-specific, not an FPM artifact): (a) op-wise over the SAME FPM truth shows the "
@@ -361,7 +358,7 @@ def write_report(out_dir: Path, result, *, fpm_run, aggregation, workload_segmen
     sku_label = system.replace("_", " ").upper()
     model_short = model.split("/")[-1]
     TRACK_VERSION.update({
-        "layerwise": compute_version, "layerwise_cal0066": compute_version,
+        "layerwise": compute_version,
         "opwise_silicon": comm_version, "hybrid": comm_version,
         "empirical": comm_version, "sol": comm_version,
     })
@@ -497,7 +494,7 @@ def write_report(out_dir: Path, result, *, fpm_run, aggregation, workload_segmen
 <section><h2>Signed bias vs TP (compute vs comm)</h2>{_img(charts['bias'], 'bias vs tp')}</section>
 <section><h2>MAPE vs TP</h2>{_img(charts['mape'], 'mape vs tp')}</section>
 <section><h2>MAPE vs concurrency (× TP × phase)</h2>
-  <div class="note">Concurrency = decode batch size (decode_requests). Faceted by TP (columns) and phase (rows: gen, mixed); ctx is single-request (concurrency=1) and omitted. <code>layerwise_nocal</code> is the layerwise track with the decode batch-calibration disabled (sensitivity). Data: <code>gap_summary_by_concurrency.csv</code>.</div>
+  <div class="note">Concurrency = decode batch size (decode_requests). Faceted by TP (columns) and phase (rows: gen, mixed); ctx is single-request (concurrency=1) and omitted. The <code>layerwise</code> track runs with the decode batch-calibration disabled (_DECODE_COMPUTE_BATCH_CAL = 0.0). Data: <code>gap_summary_by_concurrency.csv</code>.</div>
   {_img(charts['mape_conc'], 'mape vs concurrency')}</section>
 <section><h2>Why layerwise accuracy degrades with concurrency</h2>
   {_concurrency_html()}</section>
