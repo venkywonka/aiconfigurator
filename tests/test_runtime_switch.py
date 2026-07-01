@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # DRY_RUN transcript tests for the RUNTIME indirection in collect_fpm_metrics.sh.
-import subprocess
 import os
 import pathlib
+import subprocess
 
 SCRIPT = "collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh"
 
@@ -77,3 +77,29 @@ def test_docker_mode_nsys_exec_in_transcript():
     assert "nsys" in t, (
         "NSYS_PROFILE_WORKER=1 must include 'nsys' in the exec command"
     )
+
+
+def test_docker_mode_dumps_frontend_and_worker_logs_when_model_registration_fails():
+    """If the frontend is alive but /v1/models never contains the target model,
+    the failure branch must dump frontend/worker logs so CI postmortems can see
+    whether the worker crashed, is downloading config/tokenizer, or registered a
+    different model name. This is a source-level guard because dry-run does not
+    execute the model-registration wait/failure branch.
+    """
+    source = pathlib.Path(SCRIPT).read_text()
+
+    assert "model registration timed out" in source
+    assert 'docker logs "${FRONTEND_NAME}"' in source
+    assert 'docker logs "${WORKER_NAME}"' in source
+
+
+def test_docker_mode_worker_command_uses_clean_weightless_defaults():
+    """FPM timing uses scheduler shapes and must not materialize full model weights.
+    The final worker command (not just helper unit defaults) must include dummy
+    loading and the clean-prefill flags.
+    """
+    t = _dry_run({"RUNTIME": "docker"})
+
+    assert "--load-format dummy" in t or "--load-format=dummy" in t
+    assert "--no-enable-prefix-caching" in t
+    assert "--no-enable-chunked-prefill" in t

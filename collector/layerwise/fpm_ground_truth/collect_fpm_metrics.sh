@@ -426,6 +426,9 @@ apply_vllm_runtime_defaults() {
     if is_gpt_oss_model && [[ "${PREFIX_CACHING_EXPLICIT}" != "1" ]] && ! worker_extra_has_flag "--enable-prefix-caching"; then
         disable_prefix_requested=1
     fi
+    if ! worker_extra_has_flag "--load-format"; then
+        WORKER_EXTRA_ARGS+=(--load-format=dummy)
+    fi
 
     local helper_args=(
         runtime-defaults
@@ -1403,11 +1406,16 @@ if [[ "${DRY_RUN}" != "1" ]]; then
             --timeout "${START_TIMEOUT_SECONDS}" >/dev/null
 
     log "Waiting for model registration (${MODEL_REQUEST_NAME})"
-    docker run --rm --network host -v "${RUN_DIR}:/work" "${IMAGE}" \
+    if ! docker run --rm --network host -v "${RUN_DIR}:/work" "${IMAGE}" \
         python3 /work/wait_http.py \
             --url "http://127.0.0.1:${HTTP_PORT}/v1/models" \
             --contains "${MODEL_REQUEST_NAME}" \
-            --timeout "${START_TIMEOUT_SECONDS}" >/dev/null
+            --timeout "${START_TIMEOUT_SECONDS}" >/dev/null; then
+        log "ERROR: model registration timed out; dumping frontend/worker logs"
+        docker logs "${FRONTEND_NAME}" 2>&1 || true
+        docker logs "${WORKER_NAME}" 2>&1 || true
+        return 1
+    fi
 fi
 
 if [[ "${SKIP_REQUESTS}" != "1" && "${WARMUP_REQUESTS}" != "0" ]]; then
