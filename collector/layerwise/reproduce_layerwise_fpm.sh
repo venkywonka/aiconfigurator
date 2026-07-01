@@ -623,10 +623,14 @@ stage_attribute() {
       # Guard the decompose so a failure (e.g. AIC has no layerwise data for this model)
       # warns + retains the .nsys-rep/.sqlite for manual decompose instead of aborting the
       # driver under `set -e` -- the expensive capture must never be lost to a downstream step.
-      # --fpm-run is THIS attribute run's dir ($rdir), where the collector wrote
-      # fpm_metrics_phase.csv (the clean-lane wall) -- NOT fpm_run_dir's parent, which
-      # holds no CSV and sends _load_fpm down the nested tp{T}_ep{E}_past{K} fallback
-      # that does not exist for the attribute run (FileNotFoundError -> decompose fails).
+      # --fpm-run is the CLEAN non-profiled FPM run for this pareto point: its wall timing is
+      # authoritative and is not perturbed by nsys. --profiled-fpm-run is this attribute run
+      # ($rdir), used for runtime-config/provenance only; the sqlite supplies the profiled
+      # composition lane.
+      local clean_fpm_run; clean_fpm_run="$(fpm_run_dir "$slug" "$pname")"
+      if [[ "$DRY_RUN" != "1" && ! -f "$clean_fpm_run/fpm_metrics_phase.csv" ]]; then
+        die "clean FPM phase CSV missing for attribute: $clean_fpm_run/fpm_metrics_phase.csv (run fpm stage first)"
+      fi
       # --per-pid (ATTRIBUTE_PER_PID=1, default) ALSO emits accurate per-rank rows
       # (pid column) alongside the aggregate -- the per-rank variance the v3
       # arrival-skew decomposition needs. The aggregate rows are unchanged.
@@ -644,7 +648,8 @@ stage_attribute() {
       run_env "PYTHONPATH=$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" "$LOG_DIR/${unit}_decompose.log" \
         python3 -m collector.layerwise.diagnostics.aic_fpm_attribute \
           --sqlite "$sqlite" \
-          --fpm-run "$rdir" \
+          --fpm-run "$clean_fpm_run" \
+          --profiled-fpm-run "$rdir" \
           --system "$SYSTEM" --model "$hf" --tp "$TP" \
           --discard-first-n "$ATTRIBUTE_DISCARD_N" \
           "${perpid[@]}" \

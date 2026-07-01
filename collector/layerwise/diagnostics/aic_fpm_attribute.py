@@ -393,6 +393,11 @@ def _main(argv=None):
     p = argparse.ArgumentParser(description="Attributed-FPM gap decomposition")
     p.add_argument("--sqlite", required=True)
     p.add_argument("--fpm-run", required=True, help="clean golden FPM run dir (authoritative wall)")
+    p.add_argument(
+        "--profiled-fpm-run",
+        default=None,
+        help="profiled attribute run dir (for runtime config / provenance); defaults to --fpm-run",
+    )
     p.add_argument("--system", default="h100_sxm")
     p.add_argument("--model", required=True)
     p.add_argument("--tp", type=int, default=8)
@@ -438,7 +443,7 @@ def _main(argv=None):
     # Build the predictor's RuntimeConfig from the run's effective config rather
     # than a hardcoded literal (F3). vllm_max_num_seqs stays None: GEN rows carry
     # an empty max_num_seqs, so None selects the primary index on the layerwise track.
-    run_rc = G._read_runtime_config(Path(args.fpm_run))
+    run_rc = G._read_runtime_config(Path(args.profiled_fpm_run or args.fpm_run))
     rc = api["RuntimeConfig"](
         vllm_max_num_batched_tokens=run_rc["vllm_max_num_batched_tokens"],
         vllm_max_num_seqs=None,

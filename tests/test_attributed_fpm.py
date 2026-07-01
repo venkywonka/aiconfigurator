@@ -1,6 +1,7 @@
 # tests/test_attributed_fpm.py
 import os
 import sys
+import pathlib
 from unittest import mock
 
 import pytest
@@ -511,3 +512,11 @@ def test_run_context_attribution_identity_holds():
     terms = (row["term_compute_err"] + row["term_comm_err"] + row["term_aic_other"]
              + row["term_overlap"] + row["term_neg_overhead"])
     assert abs(terms - row["gap_ms"]) < 1e-9
+
+
+def test_stage_attribute_decomposes_against_clean_fpm_run_not_profiled_attribute_run():
+    script = pathlib.Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+
+    assert 'local clean_fpm_run; clean_fpm_run="$(fpm_run_dir "$slug" "$pname")"' in script
+    assert '--fpm-run "$clean_fpm_run"' in script
+    assert '--profiled-fpm-run "$rdir"' in script
