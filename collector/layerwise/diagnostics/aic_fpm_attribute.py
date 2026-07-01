@@ -21,6 +21,7 @@ Decomposition identity (exact):
 
 from __future__ import annotations
 
+import os
 import statistics
 from collections import defaultdict
 from typing import Any
@@ -476,9 +477,23 @@ def _main(argv=None):
         # KV before predicting -- the layerwise GEN grid is exact-lookup, so an off-grid
         # KV would raise/miss and drop the shape. This mirrors the headline 'layerwise'
         # track in aic_fpm_gap.run() (which snaps via _nearest_available_generation_kv).
+        #
+        # BOUND the snap distance: with max_distance=inf a decode KV of 20478 would silently
+        # snap to a measured grid point 12k tokens away and be attributed as if on-grid,
+        # producing a decomposition that is mostly EXTRAPOLATION masquerading as measurement
+        # (the "98% extrapolated" failure). ATTRIBUTE_MAX_DECODE_KV_DIST caps how far a shape
+        # may snap; shapes beyond it are dropped as off-grid (honest under-coverage) instead of
+        # extrapolated. Default caps at half the KV so it scales with sequence length; set to a
+        # large number to restore the old unbounded behaviour.
+        _kv = int(past_kv)
+        _max_dist_env = os.environ.get("ATTRIBUTE_MAX_DECODE_KV_DIST", "")
+        if _max_dist_env.strip():
+            _max_dist = float(_max_dist_env)
+        else:
+            _max_dist = max(1024.0, _kv / 2.0)
         snapped = api["_nearest_available_generation_kv"](
             db.layerwise, model=G.MODEL_NAME, tp_size=args.tp,
-            requested_kv=int(past_kv), max_distance=float("inf"),
+            requested_kv=_kv, max_distance=_max_dist,
         )
         if snapped is None:
             return (None, None, None)
