@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -59,7 +60,35 @@ def _engine_tokens(
             gpu_memory_utilization=gpu_memory_utilization,
         )
     )
-    tokens.extend(extra_vllm_args)
+    # The layerwise default disables prefix caching (clean single-turn ctx prefills) by baking
+    # --no-enable-prefix-caching into extra_vllm_args. But the prefix_cache GEN driver REPLAYS decode
+    # steps against a cached KV and REQUIRES prefix caching (worker.py raises "prefix-cache ctx/gen
+    # driver requires vLLM prefix caching" otherwise). ctx and gen run as SEPARATE work-unit
+    # processes/engines, so re-enable prefix caching for the gen engine ONLY, without touching the
+    # clean-ctx default. The live-step driver needs no prefix cache, so it is exempt.
+    def _use_live_step(dp: DataPoint) -> bool:
+        if os.environ.get("LAYERWISE_USE_LIVE_STEP_DRIVER", "0") != "1":
+            return False
+        if dp.phase == "gen":
+            min_kv = int(os.environ.get("LAYERWISE_LIVE_STEP_GEN_MIN_PAST_KV", "8192"))
+            if int(dp.past_kv) >= min_kv:
+                return True
+            min_bs = int(os.environ.get("LAYERWISE_LIVE_STEP_GEN_MIN_BATCH_SIZE", "256"))
+            return min_bs > 0 and int(dp.batch_size) >= min_bs
+        return False
+
+    gen_needs_prefix_cache = (
+        gen_driver == "prefix_cache"
+        and any(dp.phase == "gen" and not _use_live_step(dp) for dp in datapoints)
+    )
+    extra = list(extra_vllm_args)
+    if gen_needs_prefix_cache:
+        # Drop the baked-in disable (and its store_false alias) so it can't win by ordering, then
+        # force-enable. Done on a copy so only the gen engine sees it. Chunked prefill stays as-is.
+        extra = [a for a in extra if a not in ("--no-enable-prefix-caching", "--disable-prefix-caching")]
+        if not has_cli_flag(extra, "--enable-prefix-caching"):
+            extra.append("--enable-prefix-caching")
+    tokens.extend(extra)
     return tokens
 
 def _create_llm(engine_tokens: list[str], *, enable_layerwise_nvtx_tracing: bool = True):
