@@ -217,5 +217,52 @@ class WriteDecompositionCsvFailClosedTests(unittest.TestCase):
                 write_decomposition_csv([], out_path)
 
 
+class AllowEmptyAttributionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_allow_empty_decomposition_still_requires_kernels_and_bench_steps(self):
+        from collector.layerwise.diagnostics.assert_attribution_valid import assert_attribution_valid
+
+        sqlite_path = self.tmp / "trace.sqlite"
+        csv_path = self.tmp / "decomposition.csv"
+        _write_sqlite(sqlite_path, with_kernel=True, with_bench_step=True)
+        _write_decomposition_csv(csv_path, with_row=False)
+
+        assert assert_attribution_valid(
+            str(sqlite_path), str(csv_path), allow_empty_decomposition=True
+        ) == 0
+
+        sqlite_no_kernel = self.tmp / "no_kernel.sqlite"
+        _write_sqlite(sqlite_no_kernel, with_kernel=False, with_bench_step=True)
+        with self.assertRaises(Exception):
+            assert_attribution_valid(
+                str(sqlite_no_kernel), str(csv_path), allow_empty_decomposition=True
+            )
+
+        sqlite_no_step = self.tmp / "no_step.sqlite"
+        _write_sqlite(sqlite_no_step, with_kernel=True, with_bench_step=False)
+        with self.assertRaises(Exception):
+            assert_attribution_valid(
+                str(sqlite_no_step), str(csv_path), allow_empty_decomposition=True
+            )
+
+
+class WriteDecompositionCsvAllowEmptyTests(unittest.TestCase):
+    def test_write_decomposition_csv_allow_empty_writes_header_only(self):
+        from collector.layerwise.diagnostics.aic_fpm_attribute import write_decomposition_csv
+
+        with TemporaryDirectory() as d:
+            out_path = Path(d) / "decomposition.csv"
+            write_decomposition_csv([], str(out_path), allow_empty=True)
+
+            rows = list(csv.reader(out_path.open()))
+            self.assertEqual(len(rows), 1)
+            self.assertIn("phase", rows[0])
+            self.assertIn("term_compute_err", rows[0])
+
+
 if __name__ == "__main__":
     unittest.main()

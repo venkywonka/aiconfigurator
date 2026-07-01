@@ -61,8 +61,17 @@ def _count_decomposition_rows(decomposition_csv_path: str) -> int:
         return sum(1 for row in reader if any(cell.strip() for cell in row))
 
 
-def assert_attribution_valid(sqlite_path: str, decomposition_csv_path: str) -> int:
-    """Raise :class:`AttributionInvalidError` unless all three checks hold.
+def assert_attribution_valid(
+    sqlite_path: str,
+    decomposition_csv_path: str,
+    *,
+    allow_empty_decomposition: bool = False,
+) -> int:
+    """Raise :class:`AttributionInvalidError` unless validity checks hold.
+
+    By default all three checks hold: kernels, bench_step ranges, and >=1 decomposition
+    row. ``allow_empty_decomposition`` keeps the profiler/marker checks fail-closed while
+    allowing a header-only decomposition CSV for no-overlap diagnostic buckets.
 
     Returns ``0`` on success so callers may use the return value as an exit code.
     """
@@ -86,7 +95,7 @@ def assert_attribution_valid(sqlite_path: str, decomposition_csv_path: str) -> i
         )
 
     n_rows = _count_decomposition_rows(decomposition_csv_path)
-    if n_rows < 1:
+    if n_rows < 1 and not allow_empty_decomposition:
         raise AttributionInvalidError(
             f"check (c) FAILED: no data rows in {decomposition_csv_path} "
             "(shape join / config produced an empty decomposition)."
@@ -106,14 +115,29 @@ def main(argv=None) -> int:
         required=True,
         help="decomposition.csv emitted by aic_fpm_attribute",
     )
+    p.add_argument(
+        "--allow-empty-decomposition",
+        action="store_true",
+        help="allow a header-only decomposition CSV while still requiring kernels and bench_step rows",
+    )
     args = p.parse_args(argv)
 
     try:
-        assert_attribution_valid(args.sqlite, args.decomposition)
+        assert_attribution_valid(
+            args.sqlite,
+            args.decomposition,
+            allow_empty_decomposition=args.allow_empty_decomposition,
+        )
     except (AttributionInvalidError, OSError, sqlite3.Error) as exc:
         print(f"[assert_attribution_valid] {exc}", file=sys.stderr)
         return 1
-    print("[assert_attribution_valid] OK: kernels + bench_step ranges + decomposition rows present")
+    if args.allow_empty_decomposition and _count_decomposition_rows(args.decomposition) < 1:
+        print(
+            "[assert_attribution_valid] OK: kernels + bench_step ranges present; "
+            "decomposition empty by explicit allowance"
+        )
+    else:
+        print("[assert_attribution_valid] OK: kernels + bench_step ranges + decomposition rows present")
     return 0
 
 

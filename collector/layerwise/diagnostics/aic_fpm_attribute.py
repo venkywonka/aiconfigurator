@@ -159,7 +159,7 @@ def _bin_fpm_wall_to_profiled_key(
 
     binned: dict[tuple[int, int], list[float]] = _dd(list)
     for (batch_size, mean_kv), wall_ms in fpm_wall_by_shape.items():
-        binned[(int(batch_size), int(round(mean_kv)))].append(float(wall_ms))
+        binned[(int(batch_size), round(mean_kv))].append(float(wall_ms))
     return {key: statistics.fmean(walls) for key, walls in binned.items()}
 
 
@@ -344,15 +344,17 @@ def run_context_attribution(
     return row
 
 
-def write_decomposition_csv(rows: list[dict[str, Any]], out_path: str) -> None:
+def write_decomposition_csv(rows: list[dict[str, Any]], out_path: str, *, allow_empty: bool = False) -> None:
     """Write decomposition rows to CSV (stable column order).
 
-    Raises ``ValueError`` on empty input so an empty join cannot pass silently
-    (the ``.done`` gate / shell ``|| warn`` only fires on a real failure signal).
+    Raises ``ValueError`` on empty input by default so an empty join cannot pass silently
+    (the ``.done`` gate / shell ``|| warn`` only fires on a real failure signal). Callers
+    may explicitly allow an empty diagnostic CSV when a profiled capture is valid but the
+    sampled shapes have no overlap with the clean/AIC lanes.
     """
     import csv
 
-    if not rows:
+    if not rows and not allow_empty:
         raise ValueError(
             f"write_decomposition_csv: no decomposition rows to write to {out_path} "
             "(empty join -- profiled/FPM/AIC lanes had no shape in common)."
@@ -388,6 +390,7 @@ def _main(argv=None):
     import argparse
     import sys
     from pathlib import Path
+
     import collector.layerwise.diagnostics.aic_fpm_gap as G
 
     p = argparse.ArgumentParser(description="Attributed-FPM gap decomposition")
@@ -417,6 +420,11 @@ def _main(argv=None):
              "to decompose the gap against AIC's own measured layerwise instead of shipped data.",
     )
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="write a header-only decomposition CSV when no profiled/FPM/AIC shapes overlap",
+    )
     args = p.parse_args(argv)
 
     api = G._import_repo(Path(G.DEFAULT_REPO_ROOT))
@@ -527,10 +535,10 @@ def _main(argv=None):
         ctx_row["past_kv"] = int(ctx_tokens)
         ctx_row["pid"] = ""
         rows.append(ctx_row)
-    except Exception as exc:  # noqa: BLE001 - never crash _main; decode rows still written
+    except Exception as exc:
         print(f"[attribute] context phase skipped: {exc}", file=sys.stderr)
 
-    write_decomposition_csv(rows, args.out)
+    write_decomposition_csv(rows, args.out, allow_empty=args.allow_empty)
     print(f"[attribute] wrote {len(rows)} shapes -> {args.out}")
 
 

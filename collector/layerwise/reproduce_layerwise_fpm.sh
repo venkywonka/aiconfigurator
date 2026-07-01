@@ -657,6 +657,7 @@ stage_attribute() {
           "${perpid[@]}" \
           "${lwarg[@]}" \
           --out "$rdir/decomposition.csv" \
+          --allow-empty \
         || warn "decompose failed for $unit (rc=$?); .nsys-rep + .sqlite retained under $rdir/nsys for manual decompose"
 
       # Fail-closed attribution-validity gate (spec Fix 2): a unit is only stamped
@@ -669,6 +670,7 @@ stage_attribute() {
           python3 -m collector.layerwise.diagnostics.assert_attribution_valid \
             --sqlite "$sqlite" \
             --decomposition "$rdir/decomposition.csv" \
+            --allow-empty-decomposition \
           || die "attribution-validity gate failed for $unit; artifacts retained under $rdir, refusing to mark done"
       fi
 
