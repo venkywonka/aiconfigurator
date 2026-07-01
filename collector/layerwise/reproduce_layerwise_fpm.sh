@@ -415,6 +415,7 @@ stage_fpm() {
     IFS='|' read -r slug hf kind moe <<<"$m"
     for i in "${!PARETO_NAMES[@]}"; do
       local pname="${PARETO_NAMES[$i]}" conc="${PARETO_CONCURRENCY[$i]}"
+      local seed_env=(PROMPT_TOKEN_SEED="$i")
       # P2: per-point request count = clamp(FPM_REQ_MULT*conc, FPM_REQ_MIN, FPM_REQ_MAX).
       local req=$(( FPM_REQ_MULT * conc ))
       (( req < FPM_REQ_MIN )) && req="$FPM_REQ_MIN"
@@ -429,7 +430,7 @@ stage_fpm() {
 
       # Scheduler parity forced via env (FPM shell reads $MAX_NUM_SEQS / $MAX_NUM_BATCHED_TOKENS;
       # the python wrapper inherits os.environ into the subprocess).
-      run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value)" \
+      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value)" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" \
@@ -543,6 +544,7 @@ stage_attribute() {
     IFS='|' read -r slug hf kind moe <<<"$m"
     for i in "${!PARETO_NAMES[@]}"; do
       local pname="${PARETO_NAMES[$i]}" conc="${PARETO_CONCURRENCY[$i]}"
+      local seed_env=(PROMPT_TOKEN_SEED="$i")
       local req=$(( FPM_REQ_MULT * conc ))
       (( req < FPM_REQ_MIN )) && req="$FPM_REQ_MIN"
       (( req > FPM_REQ_MAX )) && req="$FPM_REQ_MAX"
@@ -583,7 +585,7 @@ stage_attribute() {
       fi
 
       local collect_rc=0
-      run_env "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
+      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \

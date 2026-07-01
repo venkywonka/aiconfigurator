@@ -520,3 +520,10 @@ def test_stage_attribute_decomposes_against_clean_fpm_run_not_profiled_attribute
     assert 'local clean_fpm_run; clean_fpm_run="$(fpm_run_dir "$slug" "$pname")"' in script
     assert '--fpm-run "$clean_fpm_run"' in script
     assert '--profiled-fpm-run "$rdir"' in script
+
+
+def test_stage_attribute_reuses_clean_fpm_prompt_seed_for_matching_shapes():
+    script = pathlib.Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+
+    assert 'local seed_env=(PROMPT_TOKEN_SEED="$i")' in script
+    assert 'run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS' in script
