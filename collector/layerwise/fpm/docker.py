@@ -100,7 +100,10 @@ def build_collect_command(args, case: FpmCase, run_dir: Path) -> FpmShellCommand
         argv.append("--nsys-profile-worker")
     if getattr(args, "nsys_cuda_profiler_window", None):
         argv.extend(["--nsys-cuda-profiler-window", args.nsys_cuda_profiler_window])
-    if args.extra_vllm_arg:
+    extra_vllm_args = list(args.extra_vllm_arg or [])
+    if not any(arg == "--load-format" or arg.startswith("--load-format=") for arg in extra_vllm_args):
+        extra_vllm_args.append("--load-format=dummy")
+    if extra_vllm_args:
         argv.append("--")
-        argv.extend(args.extra_vllm_arg)
+        argv.extend(extra_vllm_args)
     return FpmShellCommand(argv=argv)

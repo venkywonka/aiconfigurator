@@ -6,7 +6,7 @@ import pytest
 
 from collector.layerwise.common.paths import default_run_dir, slugify
 from collector.layerwise.fpm import collect as fpm_collect
-from collector.layerwise.fpm.datapoint_generator import default_shapes, generate_fpm_cases
+from collector.layerwise.fpm.datapoint_generator import FpmCase, default_shapes, generate_fpm_cases
 from collector.layerwise.fpm.docker import build_collect_command
 from collector.layerwise.vllm import collect as vllm_collect
 from collector.layerwise.vllm import datapoint_generator as vllm_datapoints
@@ -306,7 +306,9 @@ def test_fpm_case_generation_and_shell_command(tmp_path):
         cmd.argv.index("--prompt-token-mode"): cmd.argv.index("--prompt-token-mode") + 2
     ] == ["--prompt-token-mode", "safe_ascii"]
     assert "--dry-run" in cmd.argv
-    assert cmd.argv[-3:] == ["--", "--foo", "bar"]
+    passthrough = cmd.argv[cmd.argv.index("--") + 1 :]
+    assert passthrough[:2] == ["--foo", "bar"]
+    assert "--load-format=dummy" in passthrough
 
 
 def test_fpm_case_generation_keeps_vllm_representable_ep_sizes():
@@ -319,3 +321,89 @@ def test_fpm_case_generation_keeps_vllm_representable_ep_sizes():
         (8, 1, 1024),
         (8, 8, 1024),
     ]
+
+
+def test_fpm_collect_command_defaults_to_dummy_load_format_for_weightless_measurement(tmp_path):
+    args = argparse.Namespace(
+        model="Qwen/Qwen3-32B",
+        phases="context,decode,mixed",
+        contexts="128",
+        context_repeats="6",
+        decode_batches="1",
+        decode_osl="8",
+        decode_repeats=6,
+        include_sweep=False,
+        real_workload=True,
+        real_workload_requests=6,
+        real_workload_concurrency=1,
+        real_workload_dataset="OpenAssistant/oasst1",
+        real_workload_shape_source="scaled_dataset",
+        real_workload_isl_min=512,
+        real_workload_isl_max=16384,
+        real_workload_isl_mean=8192,
+        real_workload_osl_min=100,
+        real_workload_osl_max=4096,
+        real_workload_osl_mean=256,
+        request_allow_failures=0,
+        prompt_token_mode="safe_ascii",
+        image="image",
+        warmup_requests=4,
+        gpus=None,
+        keep_running=False,
+        dry_run=True,
+        continue_on_case_failure=False,
+        extra_vllm_arg=[],
+        expected_vllm_version=None,
+        allow_version_mismatch=False,
+        nsys_profile_worker=False,
+        nsys_cuda_profiler_window=None,
+    )
+
+    cmd = build_collect_command(args, FpmCase(tp_size=8, ep_size=1, decode_past_kv=4096), tmp_path)
+
+    assert "--" in cmd.argv
+    passthrough = cmd.argv[cmd.argv.index("--") + 1 :]
+    assert "--load-format=dummy" in passthrough
+
+
+def test_fpm_collect_command_respects_explicit_load_format_override(tmp_path):
+    args = argparse.Namespace(
+        model="Qwen/Qwen3-32B",
+        phases="context,decode",
+        contexts="128",
+        context_repeats="6",
+        decode_batches="1",
+        decode_osl="8",
+        decode_repeats=6,
+        include_sweep=False,
+        real_workload=False,
+        real_workload_requests=6,
+        real_workload_concurrency=1,
+        real_workload_dataset="OpenAssistant/oasst1",
+        real_workload_shape_source="scaled_dataset",
+        real_workload_isl_min=512,
+        real_workload_isl_max=16384,
+        real_workload_isl_mean=8192,
+        real_workload_osl_min=100,
+        real_workload_osl_max=4096,
+        real_workload_osl_mean=256,
+        request_allow_failures=0,
+        prompt_token_mode="safe_ascii",
+        image="image",
+        warmup_requests=None,
+        gpus=None,
+        keep_running=False,
+        dry_run=True,
+        continue_on_case_failure=False,
+        extra_vllm_arg=["--load-format=auto"],
+        expected_vllm_version=None,
+        allow_version_mismatch=False,
+        nsys_profile_worker=False,
+        nsys_cuda_profiler_window=None,
+    )
+
+    cmd = build_collect_command(args, FpmCase(tp_size=8, ep_size=1, decode_past_kv=4096), tmp_path)
+
+    passthrough = cmd.argv[cmd.argv.index("--") + 1 :]
+    assert "--load-format=auto" in passthrough
+    assert "--load-format=dummy" not in passthrough
