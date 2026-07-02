@@ -527,3 +527,125 @@ def test_stage_attribute_reuses_clean_fpm_prompt_seed_for_matching_shapes():
 
     assert 'local seed_env=(PROMPT_TOKEN_SEED="$i")' in script
     assert 'run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS' in script
+
+
+def test_select_dominant_context_key_filters_by_resolved_chunk_size():
+    # AIC-1205: the context filter must select by the RUN's chunk size C
+    # (vllm_max_num_batched_tokens), not a hardcoded 2048. With C=4096 the dominant
+    # key must come from the 4096 subset even though a 2048 shape has more samples.
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _select_dominant_context_key
+
+    context = {
+        (1, 2048, 0): [1.0, 2.0, 3.0],  # more samples but WRONG chunk size
+        (1, 4096, 0): [10.0, 11.0],     # fewer samples but == C
+        (1, 512, 0): [9.0],
+    }
+    assert _select_dominant_context_key(context, chunk_c=4096) == (1, 4096, 0)
+
+
+def test_select_dominant_context_key_defaults_to_2048_via_fallback_config():
+    # When the effective config is unreadable, _read_runtime_config falls back to 2048,
+    # so the filter reproduces today's behavior exactly (selects the 2048 subset).
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _select_dominant_context_key
+
+    context = {
+        (1, 2048, 0): [1.0, 2.0],
+        (1, 8000, 0): [5.0],
+    }
+    assert _select_dominant_context_key(context, chunk_c=2048) == (1, 2048, 0)
+
+
+def test_select_dominant_context_key_falls_back_to_full_pool_when_no_match():
+    # If NO step matches C (chunked prefill off, or ISL<C), fall back to the full pool
+    # (most-sampled shape) rather than returning None / raising off-grid.
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _select_dominant_context_key
+
+    context = {
+        (1, 12000, 0): [1.0, 2.0, 3.0],  # dominant by count, but != C
+        (1, 3000, 0): [4.0],
+    }
+    assert _select_dominant_context_key(context, chunk_c=2048) == (1, 12000, 0)
+
+
+def test_select_dominant_context_key_empty_context_returns_none():
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _select_dominant_context_key
+
+    assert _select_dominant_context_key({}, chunk_c=2048) is None
+
+
+def test_collect_context_kv_grid_from_plain_layout():
+    # AIC-1205: the context prefix snap collects seq_len_kv_cache keys from the plain
+    # layerwise[model]["CTX"][tp][seq_len][kv] layout. detail leaves are opaque dicts.
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _collect_context_kv_grid
+
+    layerwise = {
+        "qwen": {
+            "CTX": {
+                1: {
+                    2048: {0: {"gemm": 1.0}, 2048: {"gemm": 2.0}},
+                    4096: {0: {"gemm": 3.0}, 4096: {"gemm": 4.0}},
+                }
+            }
+        }
+    }
+    assert _collect_context_kv_grid(layerwise, model="Qwen", tp_size=1) == {0, 2048, 4096}
+
+
+def test_collect_context_kv_grid_from_max_batched_index():
+    # The max_num_batched_tokens index nests one extra level under max_key; the snap must
+    # still find the kv axis there so a chunked-prefill run (which sets the index) snaps.
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _collect_context_kv_grid
+
+    layerwise = {
+        "__max_num_batched_tokens_index__": {
+            "qwen": {
+                "CTX": {
+                    1: {
+                        2048: {  # max_key bucket
+                            2048: {0: {"gemm": 1.0}, 2048: {"gemm": 2.0}},
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert _collect_context_kv_grid(layerwise, model="qwen", tp_size=1) == {0, 2048}
+
+
+def test_collect_context_kv_grid_missing_ctx_returns_empty():
+    # No CTX table (e.g. GEN-only db) -> empty set, so the caller leaves the prefix raw
+    # rather than dropping the shape (no regression vs. the pre-snap path).
+    from collector.layerwise.diagnostics.aic_fpm_attribute import _collect_context_kv_grid
+
+    layerwise = {"qwen": {"GEN": {1: {1: {4096: {"gemm": 1.0}}}}}}
+    assert _collect_context_kv_grid(layerwise, model="qwen", tp_size=1) == set()
+
+
+def test_driver_threads_chunked_prefill_optin_to_both_fpm_stages():
+    # AIC-1205: the opt-in must reach BOTH the clean FPM run and the nsys attribute
+    # capture via the ENABLE_CHUNKED_PREFILL env (mirrors MAX_NUM_BATCHED_TOKENS), and
+    # the layerwise ctx grid must gain an exact new_tokens=C point when opted in.
+    script = pathlib.Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+
+    assert 'FPM_ENABLE_CHUNKED_PREFILL="${FPM_ENABLE_CHUNKED_PREFILL:-0}"' in script
+    assert script.count("ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL") >= 2
+    assert '${LW_CTX_NEW_TOKENS},${FPM_MAX_NUM_BATCHED_TOKENS}' in script
+    # The chunked-prefill opt-in must also seed a non-singleton ctx past_kv axis containing
+    # C (and 0), and pass it to the collector -- otherwise smoke's singleton [0] kv axis makes
+    # the continuation-chunk (C, C) lookup raise off-grid.
+    assert 'LW_CTX_PAST_KV="0,${FPM_MAX_NUM_BATCHED_TOKENS}"' in script
+    assert "${LW_CTX_PAST_KV:+--ctx-past-kv ${LW_CTX_PAST_KV}}" in script
+
+
+def test_fpm_shell_routes_chunked_prefill_through_worker_extra_args():
+    # The positive flag must be seeded into WORKER_EXTRA_ARGS BEFORE
+    # apply_vllm_runtime_defaults so the alias guard cancels the negative default
+    # (exactly one of the two flags survives -- avoids the double-flag hazard).
+    script = pathlib.Path(
+        "collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh"
+    ).read_text()
+
+    assert 'ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-0}"' in script
+    seed_idx = script.index("WORKER_EXTRA_ARGS+=(--enable-chunked-prefill)")
+    apply_idx = script.index("\napply_vllm_runtime_defaults\n")
+    assert seed_idx < apply_idx

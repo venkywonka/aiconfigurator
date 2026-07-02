@@ -18,9 +18,16 @@
 #               -> <OUT_ROOT>/fpm/<slug>/<pareto>/.../fpm_metrics_phase.csv
 #   align     : tools/plot_fpm_vs_aic.py, one chart set per pareto point
 #               -> <OUT_ROOT>/charts/<slug>/<pareto>/fpm_vs_aic_*.png
+#               ALSO runs the profile figures below (so they arrive with align).
+#   profile   : collector/layerwise/diagnostics/plot_fpm_distributions.py, one
+#               data-profile figure set per pareto point (batch-composition +
+#               param distributions + latency scatters). Pure CSV postprocessing
+#               (no GPU/AIC); fail-safe. -> <OUT_ROOT>/charts/<slug>/<pareto>/
+#               fpm_profile/fpm_distribution_*.png
 #
 # Default order is "layerwise fpm align" (fast stage first so a setup bug fails
-# in minutes, not after the ~hours-long FPM sweep). Reorder via STAGES=.
+# in minutes, not after the ~hours-long FPM sweep); align triggers profile too.
+# Reorder via STAGES=; select "profile" alone to (re)plot only the distributions.
 #
 # DESIGN: fail-fast (set -euo pipefail). Idempotent: each unit drops a marker in
 # <OUT_ROOT>/.done/ and is skipped on re-run unless FORCE=1 -> fix the failure,
@@ -181,10 +188,21 @@ DECODE_BATCH_SIZES="${DECODE_BATCH_SIZES:-1,4,16,64,128}"
 # Scheduler parity: forced via env so FPM shell + align agree (shell reads $MAX_NUM_SEQS).
 FPM_MAX_NUM_SEQS="${FPM_MAX_NUM_SEQS:-256}"
 FPM_MAX_NUM_BATCHED_TOKENS="${FPM_MAX_NUM_BATCHED_TOKENS:-2048}"
+# Opt-in: enable chunked prefill on the FPM/context worker (both the clean FPM run and the
+# nsys attribute capture) so context steps become uniform C-token chunks (C =
+# FPM_MAX_NUM_BATCHED_TOKENS). Off by default -> the decode lane is unchanged. When on, the
+# layerwise ctx grid also gains an exact new_tokens=C anchor (appended below) so the C-chunk
+# query lands on a grid point instead of interpolating (the AIC CTX lookup interpolates
+# within-grid but is exact at grid points, and raises when C is outside the grid range).
+FPM_ENABLE_CHUNKED_PREFILL="${FPM_ENABLE_CHUNKED_PREFILL:-0}"
 
 # Layerwise shapes (single-GPU TP-mock).
 LW_PHASES="${LW_PHASES:-both}"
 LW_CTX_NEW_TOKENS="${LW_CTX_NEW_TOKENS:-1,16,128,1024,4096}"
+# Empty by default -> the collector uses the run-preset ctx_past_kv (full: 0,16,...,32768;
+# smoke: singleton [0]). The chunked-prefill block below seeds {0,C} when unset so a
+# continuation chunk (past_kv=C) is bracketed instead of hitting a singleton kv axis.
+LW_CTX_PAST_KV="${LW_CTX_PAST_KV:-}"
 LW_GEN_BATCH_SIZES="${LW_GEN_BATCH_SIZES:-1,2,4,8,16,32,64}"
 LW_GEN_PAST_KV="${LW_GEN_PAST_KV:-1,4096,8192,16384,32768}"
 LW_MAX_DECODE_BATCH_SIZE="${LW_MAX_DECODE_BATCH_SIZE:-256}"
@@ -229,6 +247,36 @@ if [[ -n "${MODEL:-}" ]]; then
   MODELS=("${_model_slug}|${MODEL}|${MODEL_KIND:-dense}|${MOE_PERF_FILE:-}")
 fi
 LW_RUN_PRESET="${LW_RUN_PRESET:-full}"
+
+# When chunked prefill is opted in, the FPM/context worker emits uniform C-token chunks
+# (C = FPM_MAX_NUM_BATCHED_TOKENS) and the attribution filter selects context steps at
+# ctx_tokens==C. The AIC CTX layerwise lookup keys on BOTH new_tokens AND past_kv: it is
+# exact at grid points and 2-D linearly interpolates within the collected hull, raising
+# only when a coordinate falls OUTSIDE the axis min/max range (or when the kv axis is a
+# singleton, e.g. smoke's [0]). Appending new_tokens=C gives an exact anchor at the
+# dominant chunk shape (avoiding interpolation error there) and guarantees coverage when
+# C exceeds the current grid max. A continuation chunk also lands at past_kv=C, so the ctx
+# past_kv grid must contain C (and 0 for the first chunk); when LW_CTX_PAST_KV is unset the
+# smoke preset collapses to a singleton [0] kv axis, which would make the (C, C) query raise.
+# We therefore also seed {0,C} on the past_kv axis when it is unset. All appends preserve
+# existing shapes (append, not replace). Runs after the SMOKE/MODEL/preset blocks so their
+# overrides win.
+if [[ "$FPM_ENABLE_CHUNKED_PREFILL" == "1" ]]; then
+  case ",${LW_CTX_NEW_TOKENS}," in
+    *",${FPM_MAX_NUM_BATCHED_TOKENS},"*) : ;;
+    *) LW_CTX_NEW_TOKENS="${LW_CTX_NEW_TOKENS},${FPM_MAX_NUM_BATCHED_TOKENS}" ;;
+  esac
+  if [[ -z "${LW_CTX_PAST_KV}" ]]; then
+    # Unset -> collector would use the preset default. Seed {0,C} so the past_kv axis is
+    # non-singleton and brackets the continuation-chunk prefix=C exactly (fixes smoke's [0]).
+    LW_CTX_PAST_KV="0,${FPM_MAX_NUM_BATCHED_TOKENS}"
+  else
+    case ",${LW_CTX_PAST_KV}," in
+      *",${FPM_MAX_NUM_BATCHED_TOKENS},"*) : ;;
+      *) LW_CTX_PAST_KV="${LW_CTX_PAST_KV},${FPM_MAX_NUM_BATCHED_TOKENS}" ;;
+    esac
+  fi
+fi
 
 # P1: normalize pareto point names to the concurrency ladder length (auto-derive c<conc>) so
 # PARETO_CONCURRENCY can define any number of points. Previously PARETO_NAMES=(low mid high) was a
@@ -373,7 +421,7 @@ python3 -m collector.layerwise.vllm.collect \
   --model "${hf}" --model-kind "${kind}" \
   --tp-sizes ${LW_TP_LIST} --ep-sizes ${EP} \
   --phases ${LW_PHASES} --run-preset ${LW_RUN_PRESET} \
-  --ctx-new-tokens ${LW_CTX_NEW_TOKENS} --ctx-batch-sizes auto \
+  --ctx-new-tokens ${LW_CTX_NEW_TOKENS} ${LW_CTX_PAST_KV:+--ctx-past-kv ${LW_CTX_PAST_KV}} --ctx-batch-sizes auto \
   --gen-batch-sizes ${LW_GEN_BATCH_SIZES} --gen-past-kv ${LW_GEN_PAST_KV} \
   --max-decode-batch-size ${LW_MAX_DECODE_BATCH_SIZE} \
   --gemm-quant ${GEMM_QUANT} --attn-quant ${ATTN_QUANT} --kv-quant ${KV_QUANT} --moe-quant ${MOE_QUANT} \
@@ -430,7 +478,7 @@ stage_fpm() {
 
       # Scheduler parity forced via env (FPM shell reads $MAX_NUM_SEQS / $MAX_NUM_BATCHED_TOKENS;
       # the python wrapper inherits os.environ into the subprocess).
-      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value)" \
+      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL HF_TOKEN=$(hf_token_value)" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" \
@@ -514,6 +562,63 @@ stage_align() {
 
       mark_done "$unit"
     done
+
+    # Per-concurrency FPM data-profile figures (batch composition + param
+    # distributions + latency scatters). Runs alongside align so the diagnostic
+    # charts arrive with the AIC-vs-FPM charts. Fail-safe: a plotting failure
+    # (missing matplotlib/pandas/CSV) warns and does not abort the pipeline.
+    profile_fpm_run "$slug" "$hf"
+  done
+}
+
+# ============================================================================
+# Stage: profile (per-concurrency FPM data-distribution figures)
+# ============================================================================
+# For each pareto point, render fpm_distribution_{composition,params,scatter}.png
+# from that point's fpm_metrics_phase.csv into
+# <OUT_ROOT>/charts/<slug>/<pareto>/fpm_profile/. This is pure CSV postprocessing:
+# no GPU, no AIC lookup. It is OPT-fail-safe -- if the phase CSV is absent or the
+# plotter errors (e.g. matplotlib/pandas missing), it warns and continues so a
+# diagnostics gap never fails the collection pipeline. Selectable via STAGES and
+# also invoked automatically at the tail of stage_align.
+profile_fpm_run() {
+  local slug="$1" hf="$2" pname
+  for pname in $PLOT_PARETO; do
+    local unit="profile_${slug}_${pname}"
+    if is_done "$unit"; then log "skip $unit (done; FORCE=1 to redo)"; continue; fi
+    local fdir; fdir="$(fpm_run_dir "$slug" "$pname")"
+    local pcsv="$fdir/fpm_metrics_phase.csv"
+    if [[ "$DRY_RUN" != "1" && ! -f "$pcsv" ]]; then
+      # Single-TP runs may nest under tp{T}_ep{E}_past{K}/; fall back to a search.
+      pcsv="$(find "$fdir" -name fpm_metrics_phase.csv 2>/dev/null | head -1 || true)"
+    fi
+    if [[ "$DRY_RUN" != "1" && ( -z "$pcsv" || ! -f "$pcsv" ) ]]; then
+      warn "profile: no fpm_metrics_phase.csv under $fdir; skipping $unit"
+      continue
+    fi
+    local pdir="$OUT_ROOT/charts/$slug/$pname/fpm_profile"; mkdir -p "$pdir"
+    local conc="$pname"
+    local idx; for idx in "${!PARETO_NAMES[@]}"; do
+      [[ "${PARETO_NAMES[$idx]}" == "$pname" ]] && conc="${PARETO_CONCURRENCY[$idx]}" && break
+    done
+    log "Profile: $hf pareto=$pname conc=$conc  csv=${pcsv:-<dry-run>}  -> $pdir"
+    if run "$LOG_DIR/${unit}.log" \
+        python3 -m collector.layerwise.diagnostics.plot_fpm_distributions \
+          --fpm-csv "${pcsv:-$pcsv}" \
+          --out-dir "$pdir" \
+          --title "$hf  |  concurrency=$conc"; then
+      mark_done "$unit"
+    else
+      warn "profile: plotter failed for $unit (see $LOG_DIR/${unit}.log); continuing"
+    fi
+  done
+}
+
+stage_profile() {
+  local slug hf kind moe m
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r slug hf kind moe <<<"$m"
+    profile_fpm_run "$slug" "$hf"
   done
 }
 
@@ -585,7 +690,7 @@ stage_attribute() {
       fi
 
       local collect_rc=0
-      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
+      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
@@ -692,7 +797,8 @@ main() {
       fpm)       log "== STAGE fpm =="; stage_fpm;;
       attribute) log "== STAGE attribute =="; stage_attribute;;
       align)     log "== STAGE align =="; stage_align;;
-      *) die "unknown stage: $stage (valid: layerwise fpm attribute align)";;
+      profile)   log "== STAGE profile =="; stage_profile;;
+      *) die "unknown stage: $stage (valid: layerwise fpm attribute align profile)";;
     esac
   done
   report

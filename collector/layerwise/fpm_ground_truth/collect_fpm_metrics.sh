@@ -38,6 +38,10 @@ FPM_PORT="${DYN_FORWARDPASS_METRIC_PORT:-20380}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
+# Opt-in: enable chunked prefill on the FPM/context worker so context steps become
+# uniform C-token (C = MAX_NUM_BATCHED_TOKENS) chunks instead of full-ISL prefills.
+# Off by default so the decode lane keeps its --no-enable-chunked-prefill behavior.
+ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-0}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 GPUS="${GPUS:-}"
 TP_SIZE="${TP_SIZE:-}"
@@ -516,6 +520,7 @@ while [[ $# -gt 0 ]]; do
         --kv-cache-dtype) KV_CACHE_DTYPE="$2"; shift 2 ;;
         --disable-prefix-caching) DISABLE_PREFIX_CACHING=1; PREFIX_CACHING_EXPLICIT=1; shift ;;
         --enable-prefix-caching) DISABLE_PREFIX_CACHING=0; PREFIX_CACHING_EXPLICIT=1; shift ;;
+        --enable-chunked-prefill) ENABLE_CHUNKED_PREFILL=1; shift ;;
         --file-discovery-touch-seconds) FILE_DISCOVERY_TOUCH_SECONDS="$2"; shift 2 ;;
         --workload-plan) WORKLOAD_PLAN="$2"; shift 2 ;;
         --phases) MEASURED_PHASES="$2"; shift 2 ;;
@@ -830,6 +835,14 @@ fi
 if [[ -z "${GPUS}" ]]; then
     gpu_count="$(( ${TP_SIZE:-1} * DATA_PARALLEL_SIZE ))"
     GPUS="$(infer_docker_gpus "${gpu_count}")"
+fi
+# Opt-in chunked prefill (context lane). Seed the POSITIVE flag into WORKER_EXTRA_ARGS
+# BEFORE apply_vllm_runtime_defaults so it flows in as --extra-arg=--enable-chunked-prefill:
+# _apply_common_runtime_defaults then sees the positive alias and suppresses its
+# --no-enable-chunked-prefill default (exactly one of the two survives). --max-num-batched-tokens
+# is already appended when MAX_NUM_BATCHED_TOKENS is set, pinning every chunk to exactly C.
+if [[ "${ENABLE_CHUNKED_PREFILL}" == "1" ]] && ! worker_extra_has_flag "--enable-chunked-prefill"; then
+    WORKER_EXTRA_ARGS+=(--enable-chunked-prefill)
 fi
 apply_vllm_runtime_defaults
 if [[ "${ENABLE_EXPERT_PARALLEL}" == "1" ]]; then

@@ -50,6 +50,7 @@ class VllmDeploymentConfig:
     kv_cache_dtype: str | None = None
     enforce_eager: bool = False
     disable_prefix_caching: bool = False
+    enable_chunked_prefill: bool = False
     no_async_scheduling: bool = False
     extra_args: tuple[str, ...] = ()
 
@@ -233,6 +234,12 @@ def build_engine_args(config: VllmDeploymentConfig) -> list[str]:
         args.append("--enforce-eager")
     if config.disable_prefix_caching:
         args.append("--no-enable-prefix-caching")
+    if config.enable_chunked_prefill:
+        # Positive opt-in for the FPM/context lane. This is also the alias guard for
+        # _apply_common_runtime_defaults' `--no-enable-chunked-prefill` default (line ~132):
+        # has_cli_flag treats `--enable-chunked-prefill` as the alias, so the negative
+        # default is suppressed when this is set. The decode-lane default is left untouched.
+        args.append("--enable-chunked-prefill")
     if config.no_async_scheduling:
         args.append("--no-async-scheduling")
     args.extend(config.extra_args)
@@ -416,6 +423,7 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kv-cache-dtype")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--disable-prefix-caching", action="store_true")
+    parser.add_argument("--enable-chunked-prefill", action="store_true")
     parser.add_argument("--no-async-scheduling", action="store_true")
     parser.add_argument("--extra-arg", action="append", default=[])
 
@@ -434,6 +442,7 @@ def _config_from_args(args: argparse.Namespace) -> VllmDeploymentConfig:
         kv_cache_dtype=args.kv_cache_dtype,
         enforce_eager=args.enforce_eager,
         disable_prefix_caching=args.disable_prefix_caching,
+        enable_chunked_prefill=args.enable_chunked_prefill,
         no_async_scheduling=args.no_async_scheduling,
         extra_args=tuple(args.extra_arg or ()),
     )

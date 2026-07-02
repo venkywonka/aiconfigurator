@@ -233,3 +233,29 @@ def test_runtime_defaults_respect_explicit_enable_chunked_prefill() -> None:
 
     assert "--enable-chunked-prefill" in defaults.extra_args
     assert "--no-enable-chunked-prefill" not in defaults.extra_args
+
+
+def test_build_engine_args_chunked_prefill_off_by_default() -> None:
+    # Backward compat: the FPM/context chunked-prefill opt-in is off unless requested,
+    # so the emitted args must not carry the positive flag by default.
+    args = build_engine_args(
+        VllmDeploymentConfig(model="Qwen/Qwen3-32B", max_num_batched_tokens=2048)
+    )
+
+    assert "--enable-chunked-prefill" not in args
+
+
+def test_build_engine_args_emits_enable_chunked_prefill_when_opted_in() -> None:
+    # Opt-in on the FPM/context lane forwards the positive flag; --max-num-batched-tokens
+    # pins the chunk size C so context steps are uniform C-token chunks.
+    args = build_engine_args(
+        VllmDeploymentConfig(
+            model="Qwen/Qwen3-32B",
+            max_num_batched_tokens=4096,
+            enable_chunked_prefill=True,
+        )
+    )
+
+    assert "--enable-chunked-prefill" in args
+    assert "--no-enable-chunked-prefill" not in args
+    assert args[args.index("--max-num-batched-tokens") + 1] == "4096"

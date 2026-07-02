@@ -375,6 +375,108 @@ def write_decomposition_csv(rows: list[dict[str, Any]], out_path: str, *, allow_
             writer.writerow({col: row.get(col, "") for col in cols})
 
 
+def _select_dominant_context_key(
+    context: dict[tuple[Any, ...], list[Any]], chunk_c: int
+) -> tuple[Any, ...] | None:
+    """Pick the dominant FPM context key for the run's chunk size ``chunk_c``.
+
+    Context keys are ``(ctx_requests, ctx_tokens, ctx_prefix)``. When chunked prefill
+    is enabled the context steps are UNIFORM ``chunk_c``-token single-request prefills, so
+    filter to ``ctx_tokens == chunk_c`` (``chunk_c`` = ``vllm_max_num_batched_tokens``, not a
+    hardcoded literal) and return the most-sampled key -- the dominant-by-count pick prefers
+    the uniform chunk over any ragged (<C) tail chunk.
+
+    If NO step matches ``chunk_c`` (chunked prefill off, or ISL<C so the only chunk is
+    partial), fall back to the full context pool so attribution still proceeds on the
+    most-sampled shape instead of returning no context shape. Returns ``None`` when there
+    are no context shapes at all (caller warns and keeps decode rows).
+
+    Args:
+        context: FPM context-phase samples keyed by ``(ctx_requests, ctx_tokens, ctx_prefix)``.
+        chunk_c: Resolved chunk size ``C`` from the profiled run's effective vLLM config.
+
+    Returns:
+        The dominant context key, or ``None`` if ``context`` is empty.
+    """
+    if not context:
+        return None
+    ctx_c = {k: v for k, v in context.items() if int(k[1]) == chunk_c}
+    ctx_pool = ctx_c or context
+    return max(ctx_pool.items(), key=lambda kv: len(kv[1]))[0]
+
+
+def _collect_context_kv_grid(
+    layerwise_data: dict[str, Any], *, model: str, tp_size: int
+) -> set[int]:
+    """Collect every collected CTX ``seq_len_kv_cache`` (prefix/past-kv) value.
+
+    Walks the model's ``"CTX"`` sub-table across the plain layout and any
+    ``max_num_batched_tokens`` index buckets, gathering the second-axis keys
+    (``model_data[seq_len][seq_len_kv_cache]``). Mirrors how
+    ``_nearest_available_generation_kv`` sweeps the GEN table, but for the
+    context KV axis.
+
+    Args:
+        layerwise_data: ``db.layerwise`` mapping.
+        model: model name (case-insensitive).
+        tp_size: tensor-parallel size the CTX table is keyed by.
+
+    Returns:
+        The set of collected context KV values (empty if the CTX table is absent).
+    """
+    model_key = model.lower()
+    kv_grid: set[int] = set()
+
+    def _is_detail(node: Any) -> bool:
+        # A CTX detail leaf is a dict of metric-name -> scalar (no dict values).
+        return isinstance(node, dict) and bool(node) and not any(
+            isinstance(v, dict) for v in node.values()
+        )
+
+    def _harvest(seq_len_map: Any) -> None:
+        # seq_len_map is {seq_len: {seq_len_kv_cache: detail}}. Collect the inner keys
+        # (the kv axis) of every seq_len whose child is a {kv: detail} map.
+        if not isinstance(seq_len_map, dict):
+            return
+        for child in seq_len_map.values():
+            if not isinstance(child, dict) or not child:
+                continue
+            if all(_is_detail(v) for v in child.values()):
+                for kv in child:
+                    try:
+                        kv_grid.add(round(float(kv)))
+                    except (TypeError, ValueError):
+                        continue
+
+    def _walk_ctx(ctx: Any) -> None:
+        # ctx is layerwise[...]["CTX"]. The tp entry is either the plain
+        # {seq_len: {kv: detail}} map, or a bucketed {max_key/mode: {seq_len: {kv: detail}}}
+        # under the max_num_batched_tokens / mode index. Handle both.
+        if not isinstance(ctx, dict):
+            return
+        tp_data = ctx.get(tp_size)
+        if not isinstance(tp_data, dict):
+            return
+        _harvest(tp_data)  # plain layout
+        for bucket in tp_data.values():  # bucketed layout (max_key/mode -> seq_len map)
+            _harvest(bucket)
+
+    # Plain layout: layerwise[model]["CTX"][tp][seq_len][kv].
+    try:
+        _walk_ctx(layerwise_data[model_key]["CTX"])
+    except (KeyError, TypeError):
+        pass
+    # max-batched / mode index buckets carry the same model["CTX"] shape.
+    for index_key, node in layerwise_data.items():
+        if not (isinstance(index_key, str) and index_key.startswith("__")):
+            continue
+        try:
+            _walk_ctx(node[model_key]["CTX"])
+        except (KeyError, TypeError):
+            continue
+    return kv_grid
+
+
 def _main(argv=None):
     """CLI entry for the `attribute` driver stage: build AIC's layerwise predictor,
     load the clean-lane FPM wall, reduce the profiled nsys lane, join + decompose,
@@ -515,18 +617,62 @@ def _main(argv=None):
     )
 
     # --- context phase (the high-C context puzzle) ---
-    # Context chunks are UNIFORM 2048-token single-request prefill steps. Pick the
-    # DOMINANT FPM context key (most-sampled) so the AIC ctx_prefix matches the real
-    # chunk, median its latency for the clean wall, and decompose the single aggregate
-    # context shape. Skip gracefully (warn, keep decode rows) if either side is missing.
+    # Context chunks are UNIFORM C-token (C = vllm_max_num_batched_tokens) single-request
+    # prefill steps when chunked prefill is enabled. Filter to the run's real chunk size C
+    # (read from the profiled run's effective config via run_rc, not a stale literal), then
+    # pick the DOMINANT FPM context key (most-sampled) so the AIC ctx_prefix matches the real
+    # chunk, median its latency for the clean wall, and decompose the single aggregate context
+    # shape. The dominant-by-count pick handles a ragged (<C) tail chunk by preferring the
+    # most-sampled uniform C shape. If NO step matches C (chunked prefill off, or ISL<C so the
+    # only chunk is partial), fall back to the full context pool so attribution still proceeds
+    # (the old, less-uniform behavior) instead of returning no context shape. Skip gracefully
+    # (warn, keep decode rows) if either side is missing.
     try:
-        ctx_2048 = {k: v for k, v in context.items() if int(k[1]) == 2048}
-        ctx_pool = ctx_2048 or context
-        if not ctx_pool:
+        chunk_c = int(run_rc["vllm_max_num_batched_tokens"])
+        if any(int(k[1]) == chunk_c for k in context):
+            pass
+        elif context:
+            print(
+                f"[attribute] no context step matches chunk size C={chunk_c}; "
+                "falling back to full context pool (non-uniform-chunk mode)",
+                file=sys.stderr,
+            )
+        dom_key = _select_dominant_context_key(context, chunk_c)
+        if dom_key is None:
             raise ValueError("no FPM context-phase shapes found")
-        dom_key = max(ctx_pool.items(), key=lambda kv: len(kv[1]))[0]
         ctx_requests, ctx_tokens, ctx_prefix = dom_key
-        fpm_ctx_wall_ms = api["_aggregate"](ctx_pool[dom_key], "median")
+        fpm_ctx_wall_ms = api["_aggregate"](context[dom_key], "median")
+
+        # Snap the (integer) context prefix to the nearest COLLECTED CTX past-kv before
+        # predicting -- symmetric to the decode KV snap above. With chunked prefill on and
+        # prefix caching off, continuation-chunk prefixes are C-multiples {0, C, 2C, ...};
+        # a prefix off the collected CTX grid would either silently 2-D interpolate (quality
+        # loss) or raise off-hull (>max collected kv). Snapping keeps the query on/near a
+        # measured point and, when the nearest is farther than the cap, drops the shape as
+        # off-grid (honest under-coverage) instead of extrapolating -- reusing the decode
+        # lane's ATTRIBUTE_MAX_DECODE_KV_DIST bound. prefix=0 (the common single-chunk case)
+        # snaps to itself when 0 is on the grid, so the default path is unchanged.
+        _ctx_prefix = int(ctx_prefix)
+        _ctx_kv_grid = _collect_context_kv_grid(
+            db.layerwise, model=G.MODEL_NAME, tp_size=args.tp
+        )
+        if _ctx_kv_grid:
+            # Grid is discoverable: snap within the bound, or drop the shape if the nearest
+            # collected prefix is too far (honest under-coverage, same policy as decode).
+            _ctx_max_dist_env = os.environ.get("ATTRIBUTE_MAX_DECODE_KV_DIST", "")
+            if _ctx_max_dist_env.strip():
+                _ctx_max_dist = float(_ctx_max_dist_env)
+            else:
+                _ctx_max_dist = max(1024.0, _ctx_prefix / 2.0)
+            _nearest = min(_ctx_kv_grid, key=lambda kv: (abs(kv - _ctx_prefix), kv))
+            if abs(_nearest - _ctx_prefix) > _ctx_max_dist:
+                raise ValueError(
+                    f"context prefix {_ctx_prefix} beyond collected CTX kv grid "
+                    f"(nearest {_nearest}, cap {_ctx_max_dist:g}); dropping context shape"
+                )
+            ctx_prefix = _nearest
+        # else: CTX grid not introspectable from db.layerwise -> leave prefix raw and let
+        # the AIC lookup interpolate/raise as before (no regression vs. the pre-snap path).
 
         def aic_ctx_predict():
             compute, comm, total, _src, status = G.predict_context_breakdown(
