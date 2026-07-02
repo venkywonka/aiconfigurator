@@ -102,6 +102,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "profile and write reports under RUN_DIR/nsys (used by the attributed-FPM 'attribute' stage).",
     )
     advanced.add_argument(
+        "--nsys-full-worker",
+        action="store_true",
+        help="Forward to the FPM shell as --nsys-full-worker: profile the whole vLLM worker "
+        "lifetime (NSYS_PROFILE_TRAFFIC_ONLY=0) so CUPTI records real GPU kernels "
+        "(gpu_compute_ms/gpu_comm_ms) instead of a windowed cudaProfilerApi capture that "
+        "can yield 0 CUPTI rows. Mutually exclusive in effect with --nsys-cuda-profiler-window.",
+    )
+    advanced.add_argument(
         "--nsys-cuda-profiler-window",
         default=None,
         help="Forward to the FPM shell as --nsys-cuda-profiler-window: windowed "
