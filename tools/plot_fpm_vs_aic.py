@@ -52,8 +52,10 @@ if str(_REPO_ROOT) not in sys.path:
 from collector.layerwise.diagnostics.compare_aic_layerwise_fpm import (  # noqa: E402
     _LayerwiseDatabase,
     _effective_moe_parallelism,
+    _load_fpm_max_num_seqs,
     _model_defaults,
     _prepare_moe_overlay_systems_root,
+    _resolve_auto_max_num_batched_tokens,
 )
 from collector.layerwise.diagnostics.compare_aic_layerwise_fpm_summary import _all_cases  # noqa: E402
 from aiconfigurator.sdk.backends import vllm_backend  # noqa: E402
@@ -102,6 +104,49 @@ def _filter_outliers_by_sigma(records, get_fy, sigma: float):
 # ----------------------------------------------------------------------------
 # AIC evaluation helpers (full per-step latency = sum of all op latencies).
 # ----------------------------------------------------------------------------
+def _resolve_plot_config(
+    raw,
+    *,
+    kind: str,
+    layerwise_csv,
+    fpm_csv,
+    model_name: str,
+    tp: int,
+    moe_tp: int,
+    ep: int,
+    workload_segment: str | None = "sweep",
+):
+    """Resolve the AIC-prediction scheduler config for THIS run, mirroring the summary tool.
+
+    Config parity is load-bearing: the AIC ctx/gen prediction depends on
+    ``vllm_max_num_batched_tokens`` (ctx chunking) and ``vllm_max_num_seqs`` (decode-row
+    lookup key). Hardcoding 2048/256 while the run collected at another config biases the
+    error (verified: ctx points with new_tokens>mnbt are chunked off-parity). So default to
+    ``auto`` and read the values back from the run's OWN FPM metadata + layerwise cap, the
+    same way ``compare_aic_layerwise_fpm_summary`` already does.
+
+    ``raw`` accepts an int-string (explicit override), ``"auto"`` (resolve from the run),
+    or ``""``/``"none"``/``"None"`` (opt out -> None, only meaningful for max_num_seqs).
+    """
+    if raw == "auto":
+        if kind == "max_num_batched_tokens":
+            return _resolve_auto_max_num_batched_tokens(
+                layerwise_csv=layerwise_csv,
+                fpm_csv=fpm_csv,
+                model_name=model_name,
+                tp=tp,
+                moe_tp=moe_tp,
+                ep=ep,
+                workload_segment=workload_segment,
+            )
+        if kind == "max_num_seqs":
+            return _load_fpm_max_num_seqs(fpm_csv)
+        raise ValueError(kind)
+    if raw in ("", "none", "None", None):
+        return None
+    return int(raw)
+
+
 def _aic_ctx(backend, model, database, rc, new_tokens: int, past_kv: int):
     try:
         latency, _, _ = backend._get_context_step_latency(
@@ -243,8 +288,16 @@ def plot_phase_grid(
     rc,
     fpm_root: Path,
     out_path: Path,
+    config_note: str | None = None,
+    rc_for_row=None,
 ):
     """Build the ctx or gen image (subplot per parallelism x past_kv).
+
+    ``rc_for_row``, if given, is a callable ``(tp, moe_tp, ep, fpm_path) -> RuntimeConfig``
+    used to resolve a config-parity ``rc`` PER parallelism row (each tp's AIC prediction is
+    then computed at THAT tp's own collected mnbt/mns, matching the summary tool's per-case
+    resolution). Falls back to the shared ``rc`` when not provided (single-tp runs / callers
+    that don't need per-row parity).
 
     For gen, two lines are drawn from ``database``: the uncalibrated decode lookup
     (plum) and the batch-calibrated decode (orange), so the calibration's effect
@@ -275,6 +328,9 @@ def plot_phase_grid(
 
     for r, (tp, moe_tp, ep, fpm_path) in enumerate(par_keys):
         model = _make_model(model_name, tp, moe_tp, ep)
+        # Config parity: resolve THIS row's rc from its own tp/fpm (so a multi-tp layerwise
+        # doesn't predict every tp at the lowest tp's mnbt/mns). Falls back to the shared rc.
+        row_rc = rc_for_row(tp, moe_tp, ep, fpm_path) if rc_for_row is not None else rc
 
         # FPM points for this parallelism, binned to nearest AIC past_kv.
         fpm_by_pk = {pk: {} for pk in pk_grid}  # pk -> {x: [latencies]}
@@ -324,7 +380,7 @@ def plot_phase_grid(
                 if not is_ctx:
                     cx, cy = [], []
                     for x in _dense_x(x_lo, x_hi):
-                        y = _aic_gen(backend, model, database, rc, x, pk, comm=False)
+                        y = _aic_gen(backend, model, database, row_rc, x, pk, comm=False)
                         if y is not None and y > 0:
                             cx.append(x)
                             cy.append(y)
@@ -333,8 +389,8 @@ def plot_phase_grid(
                                 label="AIC no comm")
                 solid_x, solid_y, extra_x, extra_y = [], [], [], []
                 for x in _dense_x(x_lo, x_hi):
-                    y = _aic_ctx(backend, model, database, rc, x, pk) if is_ctx else _aic_gen(
-                        backend, model, database, rc, x, pk, comm=True
+                    y = _aic_ctx(backend, model, database, row_rc, x, pk) if is_ctx else _aic_gen(
+                        backend, model, database, row_rc, x, pk, comm=True
                     )
                     if y is None or y <= 0:
                         continue
@@ -376,6 +432,9 @@ def plot_phase_grid(
                 seen.setdefault(label, handle)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.suptitle(f"{model_name}  |  {phase.upper()}  |  FPM vs AIC layerwise", fontsize=12, y=0.995)
+    # Stamp the AIC-prediction config on the chart so parity is verifiable, not assumed.
+    if config_note:
+        fig.text(0.5, 0.925, config_note, ha="center", va="top", fontsize=7.5, color="0.35")
     if seen:
         fig.legend(
             list(seen.values()), list(seen.keys()),
@@ -663,8 +722,11 @@ def main() -> int:
     parser.add_argument("--systems-root", default="src/aiconfigurator/systems")
     parser.add_argument("--moe-perf-file", type=Path, default=None, help="MoE overlay (only for MoE models).")
     parser.add_argument("--out-dir", type=Path, default=Path("fpm_vs_aic_charts"))
-    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=2048)
-    parser.add_argument("--vllm-max-num-seqs", type=int, default=256)
+    # Config parity (load-bearing): default to `auto` so the AIC ctx/gen prediction is
+    # computed at the RUN's own collected config, resolved from FPM metadata + layerwise cap
+    # (same as compare_aic_layerwise_fpm_summary). An int-string still forces an explicit value.
+    parser.add_argument("--vllm-max-num-batched-tokens", default="auto")
+    parser.add_argument("--vllm-max-num-seqs", default="none")
     parser.add_argument("--phases", default="ctx,gen,mixed,allreduce", help="Comma list of phases to plot.")
     parser.add_argument(
         "--mixed-outlier-sigma",
@@ -746,10 +808,70 @@ def main() -> int:
         repair_decode_anchor_kvs=(2048, 4096),
     )
     backend = VLLMBackend()
-    rc = RuntimeConfig(
-        vllm_max_num_batched_tokens=args.vllm_max_num_batched_tokens,
-        vllm_max_num_seqs=args.vllm_max_num_seqs,
+    # Config parity: resolve mnbt/mns for THIS run (default `auto`) rather than hardcoding
+    # 2048/256. Use the case whose TP matches the collected layerwise data (the only case
+    # that draws an AIC line); its FPM run dir carries the run's own scheduler metadata.
+    collected_tps = {int(v) for v in layerwise_df["attn_tp"].dropna().unique()}
+    parity_case = next((c for c in cases if c.tp in collected_tps), None)
+    if parity_case is None:
+        # No golden Case matches the collected TP. The chart would draw no AIC line anyway
+        # (raw points are filtered by attn_tp==case.tp), so config resolution is moot — but
+        # warn LOUDLY rather than silently resolving at an unrelated case's TP.
+        parity_case = cases[0]
+        print(
+            f"[config-parity][WARN] no golden case tp in collected attn_tp {sorted(collected_tps)}; "
+            f"resolving config at fallback tp{parity_case.tp} (charts for this TP will be empty — "
+            "the AIC line is only drawn where layerwise attn_tp == case.tp)."
+        )
+    parity_fpm = args.fpm_root / parity_case.fpm
+    resolved_mnbt = _resolve_plot_config(
+        args.vllm_max_num_batched_tokens, kind="max_num_batched_tokens",
+        layerwise_csv=args.layerwise, fpm_csv=parity_fpm, model_name=args.model,
+        tp=parity_case.tp, moe_tp=parity_case.moe_tp, ep=parity_case.ep,
     )
+    resolved_mns = _resolve_plot_config(
+        args.vllm_max_num_seqs, kind="max_num_seqs",
+        layerwise_csv=args.layerwise, fpm_csv=parity_fpm, model_name=args.model,
+        tp=parity_case.tp, moe_tp=parity_case.moe_tp, ep=parity_case.ep,
+    )
+    print(
+        f"[config-parity] AIC prediction config for tp{parity_case.tp}: "
+        f"max_num_batched_tokens={resolved_mnbt} max_num_seqs={resolved_mns} "
+        f"(from {'auto/FPM-metadata' if args.vllm_max_num_batched_tokens == 'auto' else 'explicit'}; "
+        f"fpm={parity_fpm})"
+    )
+    rc = RuntimeConfig(
+        vllm_max_num_batched_tokens=resolved_mnbt,
+        vllm_max_num_seqs=resolved_mns,
+    )
+    config_note = (
+        f"AIC prediction config: tp={parity_case.tp} "
+        f"max_num_batched_tokens={resolved_mnbt} max_num_seqs={resolved_mns} "
+        f"(source={'auto/FPM-metadata' if args.vllm_max_num_batched_tokens == 'auto' else 'explicit-cli'})"
+    )
+
+    # Per-ROW config resolution (fixes the multi-tp case: each tp's AIC line uses THAT tp's own
+    # collected mnbt/mns, mirroring the summary tool's per-case resolution — not one shared rc).
+    _rc_cache: dict[tuple, RuntimeConfig] = {}
+
+    def rc_for_row(tp, moe_tp, ep, fpm_path):
+        key = (tp, moe_tp, ep, str(fpm_path))
+        if key not in _rc_cache:
+            row_mnbt = _resolve_plot_config(
+                args.vllm_max_num_batched_tokens, kind="max_num_batched_tokens",
+                layerwise_csv=args.layerwise, fpm_csv=fpm_path, model_name=args.model,
+                tp=tp, moe_tp=moe_tp, ep=ep,
+            )
+            row_mns = _resolve_plot_config(
+                args.vllm_max_num_seqs, kind="max_num_seqs",
+                layerwise_csv=args.layerwise, fpm_csv=fpm_path, model_name=args.model,
+                tp=tp, moe_tp=moe_tp, ep=ep,
+            )
+            _rc_cache[key] = RuntimeConfig(
+                vllm_max_num_batched_tokens=row_mnbt, vllm_max_num_seqs=row_mns
+            )
+        return _rc_cache[key]
+
     vllm_backend._USE_LAYERWISE = True
 
     phases = [p.strip() for p in args.phases.split(",") if p.strip()]
@@ -765,6 +887,8 @@ def main() -> int:
             rc=rc,
             fpm_root=args.fpm_root,
             out_path=args.out_dir / "fpm_vs_aic_ctx.png",
+            config_note=config_note,
+            rc_for_row=rc_for_row,
         )
     if "gen" in phases:
         plot_phase_grid(
@@ -778,6 +902,8 @@ def main() -> int:
             rc=rc,
             fpm_root=args.fpm_root,
             out_path=args.out_dir / "fpm_vs_aic_gen.png",
+            config_note=config_note,
+            rc_for_row=rc_for_row,
         )
     if "mixed" in phases:
         plot_mixed(

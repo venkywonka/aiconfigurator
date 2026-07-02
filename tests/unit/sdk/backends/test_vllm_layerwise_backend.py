@@ -52,6 +52,37 @@ def _detail(latency: float, *, layers: int = 4, includes_moe: bool = False, mode
     }
 
 
+def _gen_singlegpu_full_step_detail(
+    *, layers: int = 4, includes_moe: bool = False, mode: str = "dense", physical_gpus: float = 1.0
+) -> dict:
+    """A full-step GEN scheduler envelope collected on ``physical_gpus`` GPUs.
+
+    Defaults to a single-GPU shape sweep (physical_gpus < tp_size) so the explicit
+    generation tp-allreduce term fires (see _layerwise_generation_tp_allreduce_ms).
+    """
+    return {
+        "latency": 1.0,
+        "energy": 0.0,
+        "measured_layer_count": float(layers),
+        "layer_multiplier": float(layers),
+        "includes_moe": includes_moe,
+        "moe_weight_mode": mode,
+        "latency_source": "schedule_to_update",
+        "physical_gpus": physical_gpus,
+    }
+
+
+class _FusedAllreduceDB:
+    """Serves one fused all-reduce+RMS timing per collective for the GEN tp-allreduce term."""
+
+    def __init__(self, per_allreduce_ms: float = 0.5) -> None:
+        self.per_allreduce_ms = per_allreduce_ms
+
+    def query_allreduce_rms(self, quant_mode, tp_size, size, hidden_size):
+        del quant_mode, tp_size, size, hidden_size
+        return self.per_allreduce_ms
+
+
 def test_layerwise_loader_merges_duplicate_representative_shapes(tmp_path) -> None:
     path = tmp_path / "layerwise_perf.csv"
     path.write_text(
@@ -475,10 +506,17 @@ def test_decode_step_uses_full_scheduler_row_without_structural_tp_allreduce(mon
             detail = _detail(8.0)
             detail["measured_layer_count"] = 4.0
             detail["latency_source"] = "schedule_to_update"
+            # A full-step envelope measured on real multi-GPU hardware
+            # (physical_gpus >= tp_size) already contains the tensor-parallel
+            # all-reduce, so no explicit term is added.
+            detail["physical_gpus"] = 2.0
             return detail
 
         def query_custom_allreduce(self, quant_mode, tp_size, size, database_mode=None, execution_mode=None):
             raise AssertionError("full-step GEN layerwise rows must not add generic TP allreduce")
+
+        def query_allreduce_rms(self, quant_mode, tp_size, size, hidden_size):
+            raise AssertionError("full-step multi-GPU GEN rows must not add generic TP allreduce")
 
     monkeypatch.setattr(vllm_backend, "_USE_LAYERWISE", True)
 
@@ -493,6 +531,152 @@ def test_decode_step_uses_full_scheduler_row_without_structural_tp_allreduce(mon
     assert latency == {"generation_layerwise": pytest.approx(8.0)}
     assert energy["generation_layerwise"] == 0.0
     assert sources["generation_layerwise"] == "silicon"
+
+
+def _gen_ar_ms(backend, model, database, *, layer_detail, layer_includes_moe, moe_tp_size, moe_ep_size, tp_size=2):
+    represented_moe_layers = backend._layerwise_detail_represented_moe_layers(layer_detail, 4)
+    return backend._layerwise_generation_tp_allreduce_ms(
+        model,
+        database,
+        tp_size,
+        8,
+        4,
+        layer_detail=layer_detail,
+        layer_includes_moe=layer_includes_moe,
+        represented_moe_layers=represented_moe_layers,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+
+
+def test_decode_generation_tp_allreduce_dense_counts_two_per_layer() -> None:
+    # A dense TP transformer does 2 tp-group all-reduces per decode layer
+    # (attention o_proj + MLP down_proj), matching llama.py generation_ar_1/_2
+    # and qwen35 dense attention_ar + ffn_ar. per_AR=0.5, 4 layers -> 0.5*2*4.
+    ms = _gen_ar_ms(
+        VLLMBackend(),
+        _Model(),
+        _FusedAllreduceDB(0.5),
+        layer_detail=_gen_singlegpu_full_step_detail(mode="dense"),
+        layer_includes_moe=False,
+        moe_tp_size=1,
+        moe_ep_size=1,
+    )
+    assert ms == pytest.approx(4.0)
+
+
+def test_decode_generation_tp_allreduce_noop_moe_counts_attention_only() -> None:
+    # A no-op MoE decode row (includes_moe=False, moe_weight_mode="noop") synthesizes
+    # the post-expert tp-group reduce SEPARATELY via the noop add-back
+    # (generation_moe_tp_allreduce). This backbone term must therefore count the
+    # attention all-reduce ONLY (1/layer) or the post-expert reduce is double-counted.
+    ms = _gen_ar_ms(
+        VLLMBackend(),
+        _Model(),
+        _FusedAllreduceDB(0.5),
+        layer_detail=_gen_singlegpu_full_step_detail(mode="noop"),
+        layer_includes_moe=False,
+        moe_tp_size=2,  # moe_tp == tp; would tempt a blanket *2 into double-counting
+        moe_ep_size=1,
+    )
+    assert ms == pytest.approx(2.0)  # 0.5 * 1 * 4, NOT 0.5 * 2 * 4
+
+
+def test_decode_generation_tp_allreduce_full_moe_tp_sharded_counts_two_per_layer() -> None:
+    # A full-MoE measured row (includes_moe=True) with TP-sharded experts
+    # (moe_tp==tp, moe_ep==1, e.g. vLLM DeepSeek) does a full tp-group reduce after
+    # the MoE too. On a single-GPU sweep the measured step has no real collective and
+    # no MoE add-back fires (gated `not layer_includes_moe`), so this term must carry
+    # BOTH attention + post-MoE reduce = 2/layer, matching deepseek.py 2*num_layers.
+    ms = _gen_ar_ms(
+        VLLMBackend(),
+        _Model(),
+        _FusedAllreduceDB(0.5),
+        layer_detail=_gen_singlegpu_full_step_detail(includes_moe=True, mode="dummy"),
+        layer_includes_moe=True,
+        moe_tp_size=2,  # moe_tp == tp
+        moe_ep_size=1,
+    )
+    assert ms == pytest.approx(4.0)
+
+
+def test_decode_generation_tp_allreduce_full_moe_expert_parallel_counts_attention_only() -> None:
+    # A full-MoE row with expert parallelism (moe_ep>1): the expert collective is an
+    # EP-group all-to-all counted elsewhere, so the tp-group term is attention-only.
+    ms = _gen_ar_ms(
+        VLLMBackend(),
+        _Model(),
+        _FusedAllreduceDB(0.5),
+        layer_detail=_gen_singlegpu_full_step_detail(includes_moe=True, mode="dummy"),
+        layer_includes_moe=True,
+        moe_tp_size=1,
+        moe_ep_size=4,  # expert-parallel -> separate EP collective
+    )
+    assert ms == pytest.approx(2.0)  # 0.5 * 1 * 4
+
+
+def test_decode_noop_moe_does_not_double_count_post_expert_reduce(monkeypatch) -> None:
+    # Integration guard: for a no-op MoE decode row with moe_tp==tp, the backbone
+    # generation_tp_allreduce (attention, ar=1) and the noop add-back
+    # generation_moe_tp_allreduce (post-expert reduce) must be DISTINCT and each
+    # counted once. A blanket *2 in the backbone term would inflate
+    # generation_tp_allreduce and double-count the post-MoE reduce.
+    from aiconfigurator.sdk.backends import vllm_backend
+
+    class _ConfigTp2MoeTp2(_Config):
+        tp_size = 2
+        moe_tp_size = 2
+
+    class _MoeModel(_Model):
+        config = _ConfigTp2MoeTp2()
+        _topk = 2
+
+    class _Database:
+        def query_layerwise_detail(self, *args, **kwargs):
+            del args, kwargs
+            detail = _detail(6.0, layers=1, mode="noop")
+            detail["measured_layer_count"] = 1.0
+            detail["latency_source"] = "schedule_to_update"
+            detail["physical_gpus"] = 1.0  # single-GPU sweep -> backbone term fires
+            return detail
+
+        def query_allreduce_rms(self, quant_mode, tp_size, size, hidden_size):
+            del quant_mode, tp_size, size, hidden_size
+            return 0.5  # fused per-collective attention all-reduce
+
+        def query_custom_allreduce(self, quant_mode, tp_size, size, database_mode=None, execution_mode=None):
+            del quant_mode, tp_size, size, database_mode, execution_mode
+            return PerformanceResult(0.3)  # standalone per-collective post-expert reduce
+
+    backend = VLLMBackend()
+
+    def _noop_addback(model, database, *, token_count, num_layers, is_context, workload_distribution_override=None):
+        del model, database, token_count, is_context, workload_distribution_override
+        return (
+            (1.0, 0.0, "silicon"),  # moe_step_ms > 0 so the MoE-TP add-back fires
+            (0.0, 0.0, "silicon"),
+            (0.0, 0.0, "silicon"),
+            (0.0, 0.0, "silicon"),
+            False,
+        )
+
+    monkeypatch.setattr(vllm_backend, "_USE_LAYERWISE", True)
+    monkeypatch.setattr(backend, "_layerwise_noop_moe_addback", _noop_addback)
+
+    latency, _energy, _sources = backend._get_decode_step_latency(
+        _MoeModel(),
+        _Database(),
+        RuntimeConfig(),
+        batch_size=1,
+        past_kv=4096,
+    )
+
+    # Backbone attention all-reduce: 1 per layer (ar=1) * 4 layers * 0.5 = 2.0.
+    # A blanket *2 (double-count) would inflate this to 4.0.
+    assert latency["generation_tp_allreduce"] == pytest.approx(2.0)
+    # Post-expert reduce lives in its OWN key (add-back), counted once and distinct
+    # from the backbone term: query_custom_allreduce(0.3) * 1 represented noop layer.
+    assert latency["generation_moe_tp_allreduce"] == pytest.approx(0.3)
 
 
 def test_decode_noop_moe_shared_expert_overlap_adjusts_total(monkeypatch) -> None:

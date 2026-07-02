@@ -477,6 +477,23 @@ def _collect_context_kv_grid(
     return kv_grid
 
 
+def _resolve_config_lane(gap_mod, run_dir, tp, out_dir):
+    """Resolve the effective-config subdir + peers for one FPM lane (AIC-1205 / #31).
+
+    If the effective config lives directly under ``run_dir`` (flat per-pareto-point run), use
+    ``run_dir`` itself. Otherwise fall back to ``gap_mod._resolve_fpm_source`` to resolve the H100
+    concurrency layout (``fpm/<model>/c*/``, config under each c-dir) or the B300 TP-sweep layout
+    (``tp{tp}_ep1_past4096/``). This keeps a concurrency root from being a false-positive hard-fail
+    when its config lives under a c-dir rather than the passed root. Returns (subdir, peer_subdirs).
+    """
+    from pathlib import Path
+    run_dir = Path(run_dir)
+    if (run_dir / "effective_vllm_config.json").exists() or (run_dir / "vllm_metadata.json").exists():
+        return run_dir, [run_dir]
+    _csv, subdir, peers = gap_mod._resolve_fpm_source(run_dir, tp, out_dir)
+    return subdir, peers
+
+
 def _main(argv=None):
     """CLI entry for the `attribute` driver stage: build AIC's layerwise predictor,
     load the clean-lane FPM wall, reduce the profiled nsys lane, join + decompose,
@@ -528,6 +545,15 @@ def _main(argv=None):
         action="store_true",
         help="write a header-only decomposition CSV when no profiled/FPM/AIC shapes overlap",
     )
+    p.add_argument(
+        "--allow-config-mismatch",
+        action="store_true",
+        default=None,
+        help="Config-parity escape hatch (AIC-1205 / #31): DOWNGRADE a mismatch between --tp and "
+             "the FPM-run effective config's tensor_parallel_size (or mnbt/mns) from a hard fail to "
+             "a loud warning + provenance stamp. For rare known-legacy runs only. Missing/null/"
+             "incomplete configs still fail loud. Env: FPM_ALLOW_CONFIG_MISMATCH=1.",
+    )
     args = p.parse_args(argv)
 
     api = G._import_repo(Path(G.DEFAULT_REPO_ROOT))
@@ -542,6 +568,36 @@ def _main(argv=None):
         Path(G.DEFAULT_REPO_ROOT)
         / f"src/aiconfigurator/systems/data/{args.system}/vllm/0.20.1/layerwise_perf.csv"
     )
+    # CONFIG-PARITY GUARD (AIC-1205 / #31): resolve the RuntimeConfig from the run's EFFECTIVE
+    # vLLM config and CROSS-CHECK --tp against the config's tensor_parallel_size BEFORE building
+    # the AIC model at that TP. A missing/null/incomplete config, or a --tp that disagrees with the
+    # effective config, FAILS LOUD — the decomposition would otherwise be attributed at the WRONG
+    # config (the silent 5x-swing landmine; e.g. the DLC c128 run whose effective_config was null
+    # and whose only TP was a WRONG requested=8 while the golden run was TP=4). This runs first so a
+    # mismatched --tp fails before the model build. --allow-config-mismatch / FPM_ALLOW_CONFIG_MISMATCH=1
+    # downgrades a pure equality mismatch (over a complete config) to a loud warning + stamp.
+    #
+    # The profiled lane is LAYOUT-RESOLVED like the clean lane: if the config lives directly under
+    # the run dir use it; otherwise fall back to _resolve_fpm_source (concurrency/TP-sweep layout),
+    # so a concurrency root (config under fpm/<model>/c1/) is not a false-positive hard-fail.
+    prof_subdir, prof_peers = _resolve_config_lane(
+        G, Path(args.profiled_fpm_run or args.fpm_run), args.tp, Path(args.out).resolve().parent
+    )
+    run_rc = G.resolve_and_verify_runtime_config(
+        prof_subdir,
+        requested_tp=args.tp,
+        allow_mismatch=args.allow_config_mismatch,
+        peer_subdirs=prof_peers,
+    )
+    print(
+        f"[config-parity] tp={run_rc['tp']} "
+        f"max_num_batched_tokens={run_rc['vllm_max_num_batched_tokens']} "
+        f"max_num_seqs={run_rc['vllm_max_num_seqs']} "
+        f"(source={run_rc['config_source']}, mismatch={run_rc['config_mismatch']}, "
+        f"path={run_rc['config_path']})",
+        file=sys.stderr,
+    )
+
     model, db, err = G.build_model_and_db(
         "layerwise", True, None, "0.20.1", args.tp,
         system=args.system, backend="vllm", comm_version="0.19.0",
@@ -554,7 +610,6 @@ def _main(argv=None):
     # Build the predictor's RuntimeConfig from the run's effective config rather
     # than a hardcoded literal (F3). vllm_max_num_seqs stays None: GEN rows carry
     # an empty max_num_seqs, so None selects the primary index on the layerwise track.
-    run_rc = G._read_runtime_config(Path(args.profiled_fpm_run or args.fpm_run))
     rc = api["RuntimeConfig"](
         vllm_max_num_batched_tokens=run_rc["vllm_max_num_batched_tokens"],
         vllm_max_num_seqs=None,
@@ -565,8 +620,35 @@ def _main(argv=None):
     # H100 concurrency layout (fpm/qwen32/c*/) via _resolve_fpm_source if absent.
     fpm_run = Path(args.fpm_run)
     fpm_csv = fpm_run / "fpm_metrics_phase.csv"
+    clean_subdir = fpm_run          # flat-run: config lives in the run dir itself
+    clean_peers = [fpm_run]
     if not fpm_csv.exists():
-        fpm_csv, _subdir = G._resolve_fpm_source(fpm_run, args.tp, Path(args.out).resolve().parent)
+        # _resolve_fpm_source now returns (fpm_csv, subdir, peer_subdirs) — unpack all three.
+        fpm_csv, clean_subdir, clean_peers = G._resolve_fpm_source(
+            fpm_run, args.tp, Path(args.out).resolve().parent
+        )
+    # CONFIG-PARITY (two-lane, AIC-1205 / #31): the RuntimeConfig driving AIC is resolved from the
+    # PROFILED lane above (run_rc), but the decomposition wall below is computed from this CLEAN
+    # --fpm-run lane. If the two lanes were collected at DIFFERENT configs, the gap would again be
+    # meaningless. Resolve+verify the CLEAN lane and require its {tp,mnbt,mns} triple to MATCH the
+    # profiled lane's (cross-checking requested_tp=--tp and the profiled mnbt/mns). A mismatch
+    # FAILS LOUD unless --allow-config-mismatch / FPM_ALLOW_CONFIG_MISMATCH=1 downgrades it.
+    clean_rc = G.resolve_and_verify_runtime_config(
+        clean_subdir,
+        requested_tp=args.tp,
+        requested_mnbt=run_rc["vllm_max_num_batched_tokens"],
+        requested_mns=run_rc["vllm_max_num_seqs"],
+        allow_mismatch=args.allow_config_mismatch,
+        peer_subdirs=clean_peers,
+    )
+    print(
+        f"[config-parity] clean-lane tp={clean_rc['tp']} "
+        f"max_num_batched_tokens={clean_rc['vllm_max_num_batched_tokens']} "
+        f"max_num_seqs={clean_rc['vllm_max_num_seqs']} "
+        f"(source={clean_rc['config_source']}, mismatch={clean_rc['config_mismatch']}, "
+        f"path={clean_rc['config_path']})",
+        file=sys.stderr,
+    )
     # _load_fpm returns (context, decode, filtered_rows). decode keys are
     # (batch_size, mean_kv) with a RAW FLOAT mean_kv; run_decode_attribution bins them to
     # the profiled integer past_kv (NVTX round(mean)) before joining. context keys are
@@ -701,6 +783,22 @@ def _main(argv=None):
 
     write_decomposition_csv(rows, args.out, allow_empty=args.allow_empty)
     print(f"[attribute] wrote {len(rows)} shapes -> {args.out}")
+
+    # CONFIG PROVENANCE (AIC-1205 / #31): stamp the verified config for BOTH the profiled lane
+    # (which drove AIC's RuntimeConfig) and the clean lane (which supplied the FPM wall) next to
+    # the decomposition, so every attribution number is traceable to the config it was computed at
+    # and no downstream chart can silently be at a mismatched config.
+    import json as _json
+    prov_path = Path(args.out).resolve().parent / "config_provenance.json"
+    prov_path.write_text(_json.dumps({
+        "tool": "aic_fpm_attribute",
+        "requested_tp": args.tp,
+        "profiled_lane": run_rc,
+        "clean_lane": clean_rc,
+        "profiled_fpm_run": str(args.profiled_fpm_run or args.fpm_run),
+        "fpm_run": str(args.fpm_run),
+    }, indent=2))
+    print(f"[attribute] wrote config provenance -> {prov_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

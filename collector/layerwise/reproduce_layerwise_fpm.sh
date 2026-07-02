@@ -166,6 +166,11 @@ FPM_WARMUP_REQUESTS="${FPM_WARMUP_REQUESTS:-4}"
 # label step) passed through to --nsys-cuda-profiler-window; ATTRIBUTE_DISCARD_N drops
 # the first N sync-drained boundary steps of each cohort before reducing.
 ATTRIBUTE_WINDOW="${ATTRIBUTE_WINDOW:-100-115}"
+# BLOCKER-2 FIX (task #41 aws-dfw): full-worker nsys capture so CUPTI records real
+# GPU kernels -> real decomposition gpu_*_ms. Windowed cudaProfilerApi capture yielded
+# 0 CUPTI kernel rows (assert_attribution_valid failed). Default ON; set 0 to restore
+# the legacy windowed capture. Post-hoc step-window slicing is done in analysis.
+ATTRIBUTE_FULL_WORKER="${ATTRIBUTE_FULL_WORKER:-1}"
 ATTRIBUTE_DISCARD_N="${ATTRIBUTE_DISCARD_N:-3}"
 # ATTRIBUTE_PER_PID=1 passes --per-pid to aic_fpm_attribute so the decomposition CSV
 # carries accurate per-rank rows (pid column) ALONGSIDE the cross-rank aggregate
@@ -519,7 +524,10 @@ normalize_fpm_layout() {
   done
 }
 
-# Read the FPM-resolved scheduler config for true plot parity, else fall back.
+# DEPRECATED (2026-07-02): superseded by plot_fpm_vs_aic.py `--vllm-max-num-seqs auto`, which
+# resolves mns from the run's own FPM metadata (via _load_fpm_max_num_seqs) AND applies the same
+# to max_num_batched_tokens. stage_align no longer calls this; kept only for reference/back-compat.
+# shellcheck disable=SC2329  # retained intentionally; not invoked after the auto-parity fix
 plot_max_num_seqs() {
   local rdir="$1" cfg; cfg="$(ls "$rdir"/effective_vllm_config.json "$rdir"/*/effective_vllm_config.json 2>/dev/null | head -1 || true)"
   if [[ -n "$cfg" && -f "$cfg" && "$DRY_RUN" != "1" ]]; then
@@ -541,12 +549,18 @@ stage_align() {
       local fdir; fdir="$(fpm_run_dir "$slug" "$pname")"
       normalize_fpm_layout "$fdir"
       local cdir="$OUT_ROOT/charts/$slug/$pname"; mkdir -p "$cdir"
-      local mns; mns="$(plot_max_num_seqs "$fdir")"
       log "Align: $hf pareto=$pname  layerwise=$lwcsv  fpm-root=$(dirname "$fdir")  -> $cdir"
 
       local moearg=()
       [[ -n "$moe" ]] && moearg=(--moe-perf-file "$AIC_REPO/$moe")
 
+      # Config parity (load-bearing): pass `auto` so plot_fpm_vs_aic.py resolves
+      # max_num_batched_tokens / max_num_seqs from THIS run's own FPM metadata (matching the
+      # summary tool) instead of hardcoding 2048/256. A wrong mnbt off-parity-chunks any ctx
+      # point with new_tokens>mnbt; a wrong mns mis-selects the decode row. Overridable via
+      # PLOT_MAX_NUM_BATCHED_TOKENS / PLOT_MAX_NUM_SEQS for explicit control.
+      local plot_mnbt="${PLOT_MAX_NUM_BATCHED_TOKENS:-auto}"
+      local plot_mns="${PLOT_MAX_NUM_SEQS:-auto}"
       run "$LOG_DIR/${unit}.log" \
         python3 tools/plot_fpm_vs_aic.py \
           --layerwise "$lwcsv" \
@@ -555,7 +569,7 @@ stage_align() {
           --systems-root "$AIC_REPO/src/aiconfigurator/systems" \
           --fpm-root "$(dirname "$fdir")" \
           --fpm-run-name "$(basename "$fdir")" \
-          --vllm-max-num-seqs "$mns" --vllm-max-num-batched-tokens "$FPM_MAX_NUM_BATCHED_TOKENS" \
+          --vllm-max-num-seqs "$plot_mns" --vllm-max-num-batched-tokens "$plot_mnbt" \
           --phases "$PLOT_PHASES" \
           --out-dir "$cdir" \
           "${moearg[@]}"
@@ -689,6 +703,14 @@ stage_attribute() {
         [[ -n "${DECODE_OSL:-}" ]] && workload+=(--decode-osl "$DECODE_OSL")
       fi
 
+      # BLOCKER-2: full-worker vs windowed nsys capture. Full-worker profiles the whole
+      # worker lifetime so CUPTI records GPU kernels (real gpu_compute_ms/gpu_comm_ms).
+      local ATTRIBUTE_NSYS_FLAGS=(--nsys-profile-worker)
+      if [[ "${ATTRIBUTE_FULL_WORKER}" == "1" ]]; then
+        ATTRIBUTE_NSYS_FLAGS+=(--nsys-full-worker)
+      else
+        ATTRIBUTE_NSYS_FLAGS+=(--nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW")
+      fi
       local collect_rc=0
       run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
@@ -699,7 +721,7 @@ stage_attribute() {
           --prompt-token-mode safe_ascii --warmup-requests "$FPM_WARMUP_REQUESTS" \
           --image "$DYNAMO_VLLM_IMAGE" --run-dir "$rdir" \
           "${extra_vllm[@]}" \
-          --nsys-profile-worker --nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW" || collect_rc=$?
+          "${ATTRIBUTE_NSYS_FLAGS[@]}" || collect_rc=$?
 
       local nsysrep; nsysrep="$(ls -1 "$rdir"/nsys/*.nsys-rep 2>/dev/null | head -1 || true)"
       if [[ "$DRY_RUN" != "1" && -z "$nsysrep" ]]; then
@@ -752,7 +774,7 @@ stage_attribute() {
       # Decompose imports the aiconfigurator SDK (AIC predictions). On a source-checkout
       # box with no installed dist, put src/ on PYTHONPATH so the import resolves; the
       # __init__ version-fallback makes it work without dist metadata.
-      run_env "PYTHONPATH=$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" "$LOG_DIR/${unit}_decompose.log" \
+      run_env "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" "$LOG_DIR/${unit}_decompose.log" \
         python3 -m collector.layerwise.diagnostics.aic_fpm_attribute \
           --sqlite "$sqlite" \
           --fpm-run "$clean_fpm_run" \
@@ -771,7 +793,7 @@ stage_attribute() {
       # pinpoints the broken stage); the .nsys-rep/.sqlite/csv stay on disk for manual
       # decompose, and the unit re-runs on the next pass (no FORCE=1 needed).
       if [[ "$DRY_RUN" != "1" ]]; then
-        run_env "" "$LOG_DIR/${unit}_assert.log" \
+        run_env "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" "$LOG_DIR/${unit}_assert.log" \
           python3 -m collector.layerwise.diagnostics.assert_attribution_valid \
             --sqlite "$sqlite" \
             --decomposition "$rdir/decomposition.csv" \
