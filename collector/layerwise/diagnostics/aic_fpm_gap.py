@@ -419,10 +419,12 @@ def _merge_fpm_phase_csvs(paths: list[Path], out_path: Path) -> Path:
 
 
 def _resolve_fpm_source(fpm_run: Path, tp: int, out_dir: Path):
-    """Return (fpm_csv_path, runtime_config_subdir) for one TP, handling both FPM layouts.
+    """Return (fpm_csv_path, runtime_config_subdir, peer_subdirs) for one TP.
 
-    H100: merge fpm/<model>/c*/fpm_metrics_phase.csv -> one csv (config from the first c-dir).
-    B300: tp{tp}_ep1_past4096/fpm_metrics_phase.csv directly.
+    Handles both FPM layouts:
+      H100: merge fpm/<model>/c*/fpm_metrics_phase.csv -> one csv (config from the first c-dir;
+            `peer_subdirs` = ALL merged c-dirs so the parity guard can verify they share one config).
+      B300: tp{tp}_ep1_past4096/fpm_metrics_phase.csv directly (peer_subdirs = [subdir]).
 
     The concurrency-layout model dir is discovered, not hardcoded: it is whatever single dir
     under fpm/ holds c*/fpm_metrics_phase.csv (e.g. 'qwen32' for the golden runs, or an
@@ -446,9 +448,10 @@ def _resolve_fpm_source(fpm_run: Path, tp: int, out_dir: Path):
                                        out_dir / "merged_fpm_metrics_phase.csv")
         print(f"[fpm] concurrency layout ({conc_base.name}): merged {[d.name for d in cdirs]} (tp={tp})",
               file=sys.stderr)
-        return merged, cdirs[0]
+        # peer_subdirs = every merged c-dir; the parity guard requires they share (tp,mnbt,mns).
+        return merged, cdirs[0], list(cdirs)
     subdir = fpm_run / f"tp{tp}_ep1_past4096"
-    return subdir / "fpm_metrics_phase.csv", subdir
+    return subdir / "fpm_metrics_phase.csv", subdir, [subdir]
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +459,8 @@ def _resolve_fpm_source(fpm_run: Path, tp: int, out_dir: Path):
 # ---------------------------------------------------------------------------
 def run(repo_root: Path, fpm_run: Path, out_dir: Path, *, system: str, backend_name: str,
         compute_version: str, comm_version: str, tracks: list, layerwise_csv: Path | None = None,
-        aggregation: str, workload_segment: str, include_mixed: bool = True):
+        aggregation: str, workload_segment: str, include_mixed: bool = True,
+        allow_config_mismatch: bool | None = None):
     # NOTE: `backend_name` is the backend STRING ("vllm"); the local `backend` below is the
     # VLLMBackend INSTANCE used for prediction — keep them distinct (do not rename to `backend`).
     api = _import_repo(repo_root)
@@ -469,16 +473,34 @@ def run(repo_root: Path, fpm_run: Path, out_dir: Path, *, system: str, backend_n
     rows: list[dict[str, Any]] = []        # per (track, tp, phase, shape)
     noise_rows: list[dict[str, Any]] = []  # per (tp, phase)
     noise_by_tp_phase: dict[tuple[int, str], dict] = {}
+    config_provenance: list[dict[str, Any]] = []  # per tp: the config every gap number was computed at
 
     for tp in TP_VALUES:
         # FPM-FIXED: resolve the FPM source for this TP, handling H100 concurrency layout
         # (fpm/qwen32/c{conc}, merged) vs B300 TP layout (tp{tp}_ep1_past4096). decode bins are
         # keyed by (batch, mean_kv) and build_summary_by_concurrency groups by batch=concurrency.
-        fpm_csv, subdir = _resolve_fpm_source(fpm_run, tp, out_dir)
+        fpm_csv, subdir, peer_subdirs = _resolve_fpm_source(fpm_run, tp, out_dir)
         if not Path(fpm_csv).exists():
             print(f"[warn] missing FPM csv: {fpm_csv}", file=sys.stderr)
             continue
-        rc_kwargs = _read_runtime_config(subdir)
+        # CONFIG-PARITY GUARD (AIC-1205 / #31): read {tp, mnbt, mns} from the run's effective
+        # vLLM config and cross-check the loop's TP against it. A missing/null/incomplete config,
+        # or an effective TP that disagrees with this loop's `tp`, FAILS LOUD — the gap would
+        # otherwise be computed at the WRONG config (the silent 5x-swing landmine). All merged
+        # c-dirs must share one config (peer_subdirs). --allow-config-mismatch downgrades a pure
+        # equality mismatch (over a complete config) to a loud warning + provenance stamp.
+        rc_kwargs = resolve_and_verify_runtime_config(
+            subdir, requested_tp=tp, allow_mismatch=allow_config_mismatch, peer_subdirs=peer_subdirs,
+        )
+        print(
+            f"[config-parity] tp={rc_kwargs['tp']} "
+            f"max_num_batched_tokens={rc_kwargs['vllm_max_num_batched_tokens']} "
+            f"max_num_seqs={rc_kwargs['vllm_max_num_seqs']} "
+            f"(source={rc_kwargs['config_source']}, mismatch={rc_kwargs['config_mismatch']}, "
+            f"path={rc_kwargs['config_path']})",
+            file=sys.stderr,
+        )
+        config_provenance.append({"loop_tp": tp, **rc_kwargs})
 
         context, decode, _filtered = api["_load_fpm"](fpm_csv, workload_segment=workload_segment)
         # Restrict context to single-request prefill steps (the entry point's
@@ -613,47 +635,253 @@ def run(repo_root: Path, fpm_run: Path, out_dir: Path, *, system: str, backend_n
     _write_csv(out_dir / "gap_summary.csv", summary)
     _write_csv(out_dir / "gap_summary_by_concurrency.csv", by_concurrency)
     _write_csv(out_dir / "compute_comm_decomposition.csv", decomposition)
+    # Config provenance: the (tp, mnbt, mns, source, path) every gap number above was computed
+    # at — so no downstream chart can silently be at a mismatched config (AIC-1205 / #31).
+    if config_provenance:
+        _write_csv(out_dir / "config_provenance.csv", config_provenance)
     return {
         "rows": rows, "noise_rows": noise_rows, "coverage": coverage,
         "summary": summary, "by_concurrency": by_concurrency, "decomposition": decomposition,
         "noise_by_tp_phase": noise_by_tp_phase,
+        "config_provenance": config_provenance,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Config-parity guard (AIC-1205 / task #31).
+#
+# AIC-vs-FPM gap/attribution numbers are MEANINGLESS if the AIC prediction is computed at a
+# config that differs from the config the FPM ground truth was collected under. A proven
+# ~5%->~24% error swing (5x) came purely from a config mismatch: the predictor ran at
+# TP=8/mnbt=2048/mns=128 (hard-coded fallback + a defaulted --tp) while the run's real config
+# was TP=4/mnbt=40960/mns=256. The guard below closes the SILENT paths that let that happen:
+#   1. NO silent 2048/128 fallback — a missing/unreadable config FAILS LOUD.
+#   2. TP is READ from the effective config and CROSS-CHECKED against the caller's TP.
+#   3. A present-but-null/empty effective_config (a real DLC vllm_metadata.json shape) FAILS LOUD.
+# An explicit escape hatch (--allow-config-mismatch / FPM_ALLOW_CONFIG_MISMATCH=1) DOWNGRADES a
+# TP/mnbt/mns *equality mismatch* (over a complete, readable config) to a loud warning + stamp;
+# it never resurrects the fallback for a missing/null/incomplete config.
+#
+# SCOPE: "config parity" here is deliberately the THREE knobs #31 proved cause the ~5x error swing:
+# tensor_parallel_size, max_num_batched_tokens, max_num_seqs. The guard does NOT (yet) verify the
+# rest of the effective config (dtype, cache_dtype, compilation/cudagraph mode, ...). Two lanes with
+# identical {tp,mnbt,mns} but a different dtype/compile mode would pass — that broader "full
+# effective-config parity" is a documented FOLLOW-UP, not this fix's mandate. The full config dict
+# IS read and its path is stamped into provenance, so a later widening is a small delta.
+# ---------------------------------------------------------------------------
+
+# Flattened dotted keys used by the real effective config, with legacy fallbacks (top-level and
+# nested-object) for alternate layouts. Order matters: the flattened dotted key wins.
+_CFG_TP_KEYS = ("parallel_config.tensor_parallel_size", "tensor_parallel_size")
+_CFG_MNBT_KEYS = ("scheduler_config.max_num_batched_tokens", "max_num_batched_tokens")
+_CFG_MNS_KEYS = ("scheduler_config.max_num_seqs", "max_num_seqs")
+
+
+class ParityError(RuntimeError):
+    """Raised when the AIC prediction config cannot be proven equal to the FPM-run config.
+
+    A ParityError means a gap/attribution number would be computed at a config that does not
+    match the ground-truth run — i.e. it would be meaningless. Fail loud rather than emit it.
+    """
+
+
+def _allow_mismatch_enabled(explicit: bool | None) -> bool:
+    """Resolve the escape-hatch flag: explicit arg wins, else FPM_ALLOW_CONFIG_MISMATCH=1."""
+    if explicit is not None:
+        return bool(explicit)
+    import os
+    return os.environ.get("FPM_ALLOW_CONFIG_MISMATCH", "").strip() in ("1", "true", "True", "yes")
+
+
+def _extract_knob(cfg: dict, keys: tuple[str, ...]):
+    """Return the first present, non-None value across `keys`, or None if absent.
+
+    Uses explicit membership (not truthiness) so a legitimate 0 is not treated as absent —
+    though these knobs are never expected to be 0, this avoids the old `... or fallback` bug
+    that silently swallowed valid values.
+    """
+    nested = cfg.get("scheduler_config") if isinstance(cfg.get("scheduler_config"), dict) else {}
+    nested_p = cfg.get("parallel_config") if isinstance(cfg.get("parallel_config"), dict) else {}
+    for k in keys:
+        if k in cfg and cfg[k] is not None:
+            return cfg[k]
+        # nested-object fallback: the bare leaf name (e.g. "max_num_seqs") inside the sub-config
+        leaf = k.split(".", 1)[-1]
+        if leaf in nested and nested[leaf] is not None:
+            return nested[leaf]
+        if leaf in nested_p and nested_p[leaf] is not None:
+            return nested_p[leaf]
+    return None
+
+
+def _load_effective_config(subdir: Path) -> tuple[dict, str, Path]:
+    """Load the effective vLLM config for one FPM-run subdir. FAIL LOUD on the 3 holes.
+
+    Returns (effective_config_dict, source_label, config_path). `source_label` is
+    "effective" (from effective_vllm_config.json) or "metadata" (from
+    vllm_metadata.json.effective_config). Prefers the flat file; only reads the metadata
+    sibling when the flat file is ABSENT (avoids trusting a stale prior-run sibling when the
+    authoritative flat file exists). Never reads the `requested` block — the DLC null case had
+    a WRONG requested TP that would re-introduce the exact 5x error.
+    """
+    import json
+    flat = subdir / "effective_vllm_config.json"
+    meta = subdir / "vllm_metadata.json"
+
+    if flat.exists():
+        try:
+            cfg = json.loads(flat.read_text())
+        except Exception as e:  # noqa: BLE001
+            raise ParityError(f"config-parity: {flat} is present but unreadable ({e!r})") from e
+        if not isinstance(cfg, dict) or not cfg:
+            raise ParityError(f"config-parity: {flat} has an empty/invalid effective config")
+        return cfg, "effective", flat
+
+    if meta.exists():
+        try:
+            md = json.loads(meta.read_text())
+        except Exception as e:  # noqa: BLE001
+            raise ParityError(f"config-parity: {meta} is present but unreadable ({e!r})") from e
+        eff = md.get("effective_config") if isinstance(md, dict) else None
+        if not isinstance(eff, dict) or not eff:
+            # This is the DLC #31 shape: effective_config: null. FAIL LOUD — do NOT fall back to
+            # the `requested` block (its TP was wrong) or to constants.
+            raise ParityError(
+                f"config-parity: {meta} has null/empty effective_config "
+                f"(the run's effective vLLM config was not captured); refusing to guess"
+            )
+        return eff, "metadata", meta
+
+    raise ParityError(
+        f"config-parity: no effective vLLM config under {subdir} "
+        f"(looked for effective_vllm_config.json and vllm_metadata.json)"
+    )
+
+
+def resolve_and_verify_runtime_config(
+    subdir: Path,
+    requested_tp: int | None = None,
+    *,
+    requested_mnbt: int | None = None,
+    requested_mns: int | None = None,
+    allow_mismatch: bool | None = None,
+    peer_subdirs: list[Path] | None = None,
+) -> dict:
+    """Read {tp, mnbt, mns} from the FPM-run effective config and VERIFY config parity.
+
+    FAILS LOUD (ParityError) when:
+      * no effective config is found (missing file),
+      * the effective_config is null/empty,
+      * any of tensor_parallel_size / max_num_batched_tokens / max_num_seqs is absent,
+      * the effective TP != requested_tp (or requested_mnbt/mns mismatch, when passed),
+      * peer_subdirs disagree on the config triple (concurrency-merge cross-dir check).
+
+    The escape hatch (`allow_mismatch=True` or FPM_ALLOW_CONFIG_MISMATCH=1) downgrades an
+    *equality mismatch* over a COMPLETE, readable config to a loud warning + a provenance stamp.
+    It never rescues a missing/null/incomplete config — those still fail loud.
+
+    Returns a dict carrying the RuntimeConfig kwargs AND a config-provenance stamp so every
+    downstream gap number can be traced to the config it was computed at:
+        {"vllm_max_num_batched_tokens", "vllm_max_num_seqs", "tp",
+         "config_source": "effective"|"metadata", "config_path": str,
+         "config_mismatch": bool}
+    """
+    import logging
+
+    cfg, source, cfg_path = _load_effective_config(subdir)
+
+    raw_tp = _extract_knob(cfg, _CFG_TP_KEYS)
+    raw_mnbt = _extract_knob(cfg, _CFG_MNBT_KEYS)
+    raw_mns = _extract_knob(cfg, _CFG_MNS_KEYS)
+    # mnbt/mns are the RuntimeConfig knobs (the old silent-fallback landmine) — always required.
+    missing = [name for name, val in
+               (("max_num_batched_tokens", raw_mnbt),
+                ("max_num_seqs", raw_mns)) if val is None]
+    # TP is required whenever a TP cross-check is requested (requested_tp given) or a cross-dir
+    # consistency check will read it. When neither applies (the bare _read_runtime_config shim on
+    # a config that legitimately omits TP), TP is surfaced as None rather than fabricated.
+    tp_required = requested_tp is not None or bool(peer_subdirs)
+    if tp_required and raw_tp is None:
+        missing.insert(0, "tensor_parallel_size")
+    if missing:
+        raise ParityError(
+            f"config-parity: {cfg_path} is missing required knob(s) {missing}; "
+            f"refusing to fabricate them"
+        )
+    tp = int(raw_tp) if raw_tp is not None else None
+    mnbt, mns = int(raw_mnbt), int(raw_mns)
+
+    # Cross-dir consistency: a concurrency-merged CSV spans multiple c*/ dirs; every peer must
+    # agree on the config triple, or the merged gap would mix configs (codex HIGH).
+    for peer in (peer_subdirs or []):
+        if Path(peer) == Path(subdir):
+            continue
+        pcfg, _psrc, ppath = _load_effective_config(Path(peer))
+        p_tp = _extract_knob(pcfg, _CFG_TP_KEYS)
+        p_mnbt = _extract_knob(pcfg, _CFG_MNBT_KEYS)
+        p_mns = _extract_knob(pcfg, _CFG_MNS_KEYS)
+        if None in (p_tp, p_mnbt, p_mns):
+            raise ParityError(
+                f"config-parity: peer run dir {ppath} is missing a required knob; "
+                f"cannot prove the merged FPM CSV is single-config"
+            )
+        if (int(p_tp), int(p_mnbt), int(p_mns)) != (tp, mnbt, mns):
+            raise ParityError(
+                f"config-parity: merged FPM source dirs disagree on config — "
+                f"{cfg_path} is (tp={tp}, mnbt={mnbt}, mns={mns}) but {ppath} is "
+                f"(tp={int(p_tp)}, mnbt={int(p_mnbt)}, mns={int(p_mns)}); "
+                f"the merged gap would mix configs"
+            )
+
+    # Parity checks against caller-supplied values (equality mismatches are escape-hatchable).
+    mismatches = []
+    if requested_tp is not None and int(requested_tp) != tp:
+        mismatches.append(f"tp: requested={int(requested_tp)} effective={tp}")
+    if requested_mnbt is not None and int(requested_mnbt) != mnbt:
+        mismatches.append(f"max_num_batched_tokens: requested={int(requested_mnbt)} effective={mnbt}")
+    if requested_mns is not None and int(requested_mns) != mns:
+        mismatches.append(f"max_num_seqs: requested={int(requested_mns)} effective={mns}")
+
+    config_mismatch = bool(mismatches)
+    if config_mismatch:
+        msg = (
+            "config-parity: AIC prediction config does not match the FPM-run config "
+            f"({'; '.join(mismatches)}); config from {cfg_path}. The gap would be computed at "
+            "the WRONG config (this is the #31 landmine)."
+        )
+        if _allow_mismatch_enabled(allow_mismatch):
+            logging.warning(
+                "%s Proceeding anyway (allow-config-mismatch); using the EFFECTIVE config "
+                "(tp=%d, mnbt=%d, mns=%d) and stamping config_mismatch=True.",
+                msg, tp, mnbt, mns,
+            )
+        else:
+            raise ParityError(
+                msg + " Pass --allow-config-mismatch / FPM_ALLOW_CONFIG_MISMATCH=1 to downgrade "
+                "this to a warning for a known legacy run."
+            )
+
+    return {
+        "vllm_max_num_batched_tokens": mnbt,
+        "vllm_max_num_seqs": mns,
+        "tp": tp,
+        "config_source": source,
+        "config_path": str(cfg_path),
+        "config_mismatch": config_mismatch,
     }
 
 
 def _read_runtime_config(subdir: Path) -> dict:
-    """Pull max_num_batched_tokens / max_num_seqs from the FPM effective config.
+    """Back-compat shim: read the FPM effective config, FAIL LOUD on missing/null/incomplete.
 
-    The real effective_vllm_config.json uses FLATTENED dotted keys
-    (e.g. "scheduler_config.max_num_batched_tokens"); the top-level and
-    nested-object reads are kept as fallbacks. Warn loudly when we cannot read
-    the config and fall back to the 2048/128 constants.
+    Historically this silently fell back to hard-coded max_num_batched_tokens=2048 /
+    max_num_seqs=128 on ANY read failure — a config-parity landmine (AIC-1205 / task #31). It now
+    delegates to `resolve_and_verify_runtime_config` with no requested_tp (so it performs no TP
+    cross-check — callers that know their TP should call the guard directly), and returns the same
+    RuntimeConfig kwargs plus the config-provenance stamp. A missing/null/incomplete config raises
+    ParityError instead of fabricating constants.
     """
-    import json
-    import logging
-    cfg_path = subdir / "effective_vllm_config.json"
-    mnbt, mns = 2048, 128
-    try:
-        cfg = json.loads(cfg_path.read_text())
-        scheduler = cfg.get("scheduler_config") or {}
-        mnbt = int(
-            cfg.get("scheduler_config.max_num_batched_tokens")
-            or cfg.get("max_num_batched_tokens")
-            or scheduler.get("max_num_batched_tokens")
-            or mnbt
-        )
-        mns = int(
-            cfg.get("scheduler_config.max_num_seqs")
-            or cfg.get("max_num_seqs")
-            or scheduler.get("max_num_seqs")
-            or mns
-        )
-    except Exception:  # noqa: BLE001 - fall back to known FPM-run constants
-        logging.warning(
-            "_read_runtime_config: could not read %s; falling back to "
-            "max_num_batched_tokens=%d / max_num_seqs=%d constants",
-            cfg_path, mnbt, mns,
-        )
-    return {"vllm_max_num_batched_tokens": mnbt, "vllm_max_num_seqs": mns}
+    return resolve_and_verify_runtime_config(subdir, requested_tp=None)
 
 
 def _row_base(track, version, tp, phase, *, shape, fpm_ms, samples, extra):
@@ -842,6 +1070,15 @@ def _parse_args():
                    help="FPM workload segment ('sweep' static grid [B300], 'real' [H100 concurrency sweep], or 'all').")
     p.add_argument("--no-mixed", action="store_true", help="Skip the best-effort mixed phase.")
     p.add_argument("--no-html", action="store_true")
+    p.add_argument(
+        "--allow-config-mismatch",
+        action="store_true",
+        default=None,
+        help="Config-parity escape hatch (AIC-1205 / #31): DOWNGRADE a TP/mnbt/mns equality "
+             "mismatch between the AIC prediction config and the FPM-run effective config from a "
+             "hard fail to a loud warning + provenance stamp. For rare known-legacy runs only. "
+             "Missing/null/incomplete configs still fail loud. Env: FPM_ALLOW_CONFIG_MISMATCH=1.",
+    )
     return p.parse_args()
 
 
@@ -860,7 +1097,8 @@ def main():
                  compute_version=args.compute_version, comm_version=args.comm_version,
                  tracks=tracks, layerwise_csv=layerwise_csv,
                  aggregation=args.aggregation, workload_segment=args.workload_segment,
-                 include_mixed=not args.no_mixed)
+                 include_mixed=not args.no_mixed,
+                 allow_config_mismatch=args.allow_config_mismatch)
 
     if not args.no_html:
         try:

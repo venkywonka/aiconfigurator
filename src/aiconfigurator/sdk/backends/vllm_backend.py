@@ -722,7 +722,33 @@ class VLLMBackend(BaseBackend):
             envelope_has_comm = (not _LAYERWISE_GEN_SINGLE_GPU_COMM) or physical_gpus >= float(tp_size)
             if envelope_has_comm:
                 return 0.0
-        return self._layerwise_tp_allreduce_ms(model, database, tp_size, token_count, use_fused=True) * num_layers
+        # tp-group all-reduces per decode layer. A dense transformer does two
+        # (after attention o_proj + after the MLP down_proj), matching the op-wise
+        # models (llama.py generation_ar_1/generation_ar_2; qwen35 dense
+        # attention_ar + ffn_ar). The second collective is topology-dependent:
+        #   - no-op MoE rows: the post-expert tp-group reduce is added SEPARATELY
+        #     as generation_moe_tp_allreduce (see the no-op MoE add-back below), so
+        #     this backbone term counts the attention all-reduce only (avoids a
+        #     double-count). No-op rows carry includes_moe=False, so they must be
+        #     detected via represented_noop_moe_layers, not represented_moe_layers.
+        #   - full-MoE rows (experts measured in-envelope): no add-back fires, so
+        #     when the experts are TP-sharded across the full tp group
+        #     (moe_tp==tp, moe_ep==1, e.g. vLLM DeepSeek) the post-MoE reduce is a
+        #     full tp-group all-reduce and this term must carry both -> 2/layer
+        #     (matches deepseek.py 2*num_layers). With expert parallelism the
+        #     expert collective is an EP-group all-to-all counted elsewhere -> 1.
+        represented_noop_moe_layers = self._layerwise_detail_represented_noop_moe_layers(layer_detail, num_layers)
+        if layer_includes_moe:
+            ar_per_layer = 2 if (moe_tp_size == tp_size and moe_ep_size == 1) else 1
+        elif represented_noop_moe_layers > 0:
+            ar_per_layer = 1
+        else:
+            ar_per_layer = 2
+        return (
+            self._layerwise_tp_allreduce_ms(model, database, tp_size, token_count, use_fused=True)
+            * ar_per_layer
+            * num_layers
+        )
 
     def _layerwise_moe_ep_alltoall_ms(
         self,
