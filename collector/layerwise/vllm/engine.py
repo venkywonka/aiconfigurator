@@ -16,6 +16,11 @@ sys.path.insert(0, str(_COMMON_DIR))
 
 from vllm_deployment import VllmDeploymentConfig, build_engine_args, has_cli_flag
 
+if __package__:
+    from collector.layerwise.common.pipeline_policy import enforce_metadata_dummy_load_format
+else:  # pragma: no cover - direct script compatibility
+    from pipeline_policy import enforce_metadata_dummy_load_format
+
 try:
     from .data import DataPoint
 except ImportError:  # pragma: no cover - direct script compatibility
@@ -38,6 +43,7 @@ def _append_default_vllm_args(extra_vllm_args: list[str]) -> None:
         elif not has_cli_flag(extra_vllm_args, flag):
             extra_vllm_args.extend([flag, value_or_aliases])
 
+
 def _engine_tokens(
     *,
     model_dir: str,
@@ -50,6 +56,7 @@ def _engine_tokens(
     gpu_memory_utilization: float | None = 0.9,
     gen_driver: str = "prefix_cache",
 ) -> list[str]:
+    extra = enforce_metadata_dummy_load_format(extra_vllm_args, os.environ)
     tokens = build_engine_args(
         VllmDeploymentConfig(
             model=model_dir,
@@ -60,6 +67,7 @@ def _engine_tokens(
             gpu_memory_utilization=gpu_memory_utilization,
         )
     )
+
     # The layerwise default disables prefix caching (clean single-turn ctx prefills) by baking
     # --no-enable-prefix-caching into extra_vllm_args. But the prefix_cache GEN driver REPLAYS decode
     # steps against a cached KV and REQUIRES prefix caching (worker.py raises "prefix-cache ctx/gen
@@ -77,11 +85,9 @@ def _engine_tokens(
             return min_bs > 0 and int(dp.batch_size) >= min_bs
         return False
 
-    gen_needs_prefix_cache = (
-        gen_driver == "prefix_cache"
-        and any(dp.phase == "gen" and not _use_live_step(dp) for dp in datapoints)
+    gen_needs_prefix_cache = gen_driver == "prefix_cache" and any(
+        dp.phase == "gen" and not _use_live_step(dp) for dp in datapoints
     )
-    extra = list(extra_vllm_args)
     if gen_needs_prefix_cache:
         # Drop the baked-in disable (and its store_false alias) so it can't win by ordering, then
         # force-enable. Done on a copy so only the gen engine sees it. Chunked prefill stays as-is.
@@ -91,10 +97,12 @@ def _engine_tokens(
     tokens.extend(extra)
     return tokens
 
+
 def _create_llm(engine_tokens: list[str], *, enable_layerwise_nvtx_tracing: bool = True):
     """Create a vLLM LLM instance with collector-specific parser defaults."""
     from vllm.engine.arg_utils import EngineArgs
 
+    engine_tokens = enforce_metadata_dummy_load_format(engine_tokens, os.environ)
     parser = argparse.ArgumentParser(add_help=False)
     EngineArgs.add_cli_args(parser)
     parser.set_defaults(

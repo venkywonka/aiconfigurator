@@ -612,6 +612,33 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
+    policy_args=(--model "${MODEL}")
+    if ! METADATA_MODEL_DIR="$(
+        python3 "${COMMON_DIR}/pipeline_policy.py" \
+            "${policy_args[@]}" \
+            -- "${WORKER_EXTRA_ARGS[@]}"
+    )"; then
+        die "metadata dummy policy validation failed"
+    fi
+    MODEL="${METADATA_MODEL_DIR}"
+    AIC_MODEL_METADATA_DIR="${METADATA_MODEL_DIR}"
+    AIC_LOAD_FORMAT=dummy
+    FPM_REAL_WORKLOAD_SHAPE_SOURCE=synthetic
+    REAL_WORKLOAD_SHAPE_SOURCE=synthetic
+    HF_HUB_OFFLINE=1
+    TRANSFORMERS_OFFLINE=1
+    HF_DATASETS_OFFLINE=1
+    export \
+        AIC_LOAD_FORMAT \
+        AIC_MODEL_METADATA_DIR \
+        AIC_MODEL_MODE \
+        FPM_REAL_WORKLOAD_SHAPE_SOURCE \
+        HF_DATASETS_OFFLINE \
+        HF_HUB_OFFLINE \
+        TRANSFORMERS_OFFLINE
+fi
+
 if [[ "${RUN_DIR}" != /* ]]; then
     RUN_DIR="${PWD}/${RUN_DIR}"
 fi
@@ -651,7 +678,14 @@ elif [[ "${EFFECTIVE_CONFIG_OUTPUT_JSON}" != /* ]]; then
     EFFECTIVE_CONFIG_OUTPUT_JSON="${PWD}/${EFFECTIVE_CONFIG_OUTPUT_JSON}"
 fi
 HF_HOME_HOST_IS_RUN_LOCAL=0
-if [[ -z "${HF_HOME_HOST}" ]]; then
+if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
+    mkdir -p "${RUN_DIR}"
+    if ! HF_HOME_HOST="$(mktemp -d "${RUN_DIR}/metadata-hf-cache.XXXXXX")"; then
+        die "failed to create metadata dummy cache"
+    fi
+    chmod 700 "${HF_HOME_HOST}"
+    HF_HOME_HOST_IS_RUN_LOCAL=1
+elif [[ -z "${HF_HOME_HOST}" ]]; then
     if [[ -d "${HOME}/.cache/huggingface" ]]; then
         HF_HOME_HOST="${HOME}/.cache/huggingface"
     else
@@ -705,6 +739,19 @@ DOCKER_ENV=(
     -e "DYN_FILE_KV=/work/discovery"
     -e "DYN_NAMESPACE=dynamo"
 )
+MODEL_POLICY_DOCKER_ENV=()
+if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
+    MODEL_POLICY_DOCKER_ENV=(
+        -e "AIC_LOAD_FORMAT=dummy"
+        -e "AIC_MODEL_METADATA_DIR=/work/model"
+        -e "AIC_MODEL_MODE=metadata_dummy"
+        -e "FPM_REAL_WORKLOAD_SHAPE_SOURCE=synthetic"
+        -e "HF_DATASETS_OFFLINE=1"
+        -e "HF_HUB_OFFLINE=1"
+        -e "TRANSFORMERS_OFFLINE=1"
+    )
+    DOCKER_ENV+=("${MODEL_POLICY_DOCKER_ENV[@]}")
+fi
 WORKER_DOCKER_ENV=("${DOCKER_ENV[@]}")
 WORKER_DOCKER_ENV+=(
     -e "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR_CONTAINER}"
@@ -741,21 +788,24 @@ if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
         -e "LAYERWISE_DYNAMO_STEP_MARKER=1"
     )
 fi
-HF_TOKEN_FILE_HOST="${HF_TOKEN_FILE:-/home/shadeform/hf.token}"
+HF_TOKEN_FILE_HOST=""
 HF_TOKEN_DOCKER_MOUNTS=()
 HF_TOKEN_DOCKER_ENV=()
 HF_TOKEN_CONTAINER_PREFIX=()
-if [[ -n "${HF_TOKEN:-}" ]]; then
-    # Forward the inherited value by variable name so it never appears in argv/logs.
-    HF_TOKEN_DOCKER_ENV=(-e HF_TOKEN)
-elif [[ -f "${HF_TOKEN_FILE_HOST}" ]]; then
-    HF_TOKEN_DOCKER_MOUNTS=(-v "${HF_TOKEN_FILE_HOST}:/run/secrets/hf.token:ro")
-    HF_TOKEN_CONTAINER_PREFIX=(
-        bash
-        -lc
-        'if [[ -f /run/secrets/hf.token ]]; then export HF_TOKEN="$(tr -d "\r\n" < /run/secrets/hf.token)"; fi; exec "$@"'
-        bash
-    )
+if [[ "${AIC_MODEL_MODE:-}" != "metadata_dummy" ]]; then
+    HF_TOKEN_FILE_HOST="${HF_TOKEN_FILE:-/home/shadeform/hf.token}"
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+        # Forward the inherited value by variable name so it never appears in argv/logs.
+        HF_TOKEN_DOCKER_ENV=(-e HF_TOKEN)
+    elif [[ -f "${HF_TOKEN_FILE_HOST}" ]]; then
+        HF_TOKEN_DOCKER_MOUNTS=(-v "${HF_TOKEN_FILE_HOST}:/run/secrets/hf.token:ro")
+        HF_TOKEN_CONTAINER_PREFIX=(
+            bash
+            -lc
+            'if [[ -f /run/secrets/hf.token ]]; then export HF_TOKEN="$(tr -d "\r\n" < /run/secrets/hf.token)"; fi; exec "$@"'
+            bash
+        )
+    fi
 fi
 
 mkdir -p \
@@ -772,7 +822,9 @@ mkdir -p \
     "${VLLM_CACHE_HOST}" \
     "${VLLM_CACHE_HOST}/tilelang/tmp"
 chmod a+rwx "${RUN_DIR}" "${RUN_DIR}/discovery" "${RUN_DIR}/nsys" "${VLLM_CACHE_HOST}" "${VLLM_CACHE_HOST}/tilelang" "${VLLM_CACHE_HOST}/tilelang/tmp"
-if [[ "${HF_HOME_HOST_IS_RUN_LOCAL}" == "1" ]]; then
+if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
+    chmod 700 "${HF_HOME_HOST}"
+elif [[ "${HF_HOME_HOST_IS_RUN_LOCAL}" == "1" ]]; then
     chmod a+rwx "${HF_HOME_HOST}"
 fi
 
@@ -1125,6 +1177,7 @@ snapshot_effective_vllm_config() {
         -e "HF_HOME=/work/hf-home" \
         -e "HF_HUB_CACHE=/work/hf-home/hub" \
         -e "TRANSFORMERS_CACHE=/work/hf-home/transformers" \
+        "${MODEL_POLICY_DOCKER_ENV[@]}" \
         "${IMAGE}" \
         "${HF_TOKEN_CONTAINER_PREFIX[@]}" \
         python3 /work/vllm_deployment.py snapshot-effective \
@@ -1252,6 +1305,7 @@ send_request_workload() {
         -e "HF_HOME=/work/hf-home" \
         -e "HF_HUB_CACHE=/work/hf-home/hub" \
         -e "TRANSFORMERS_CACHE=/work/hf-home/transformers" \
+        "${MODEL_POLICY_DOCKER_ENV[@]}" \
         "${IMAGE}" \
         "${HF_TOKEN_CONTAINER_PREFIX[@]}" \
         "${request_driver_cmd[@]}" || request_rc=$?

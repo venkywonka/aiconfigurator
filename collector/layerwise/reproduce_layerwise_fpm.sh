@@ -311,18 +311,43 @@ run() {
   printf '%s+ %s%s\n' "$C_DIM" "$*" "$C_OFF"
   if [[ "$DRY_RUN" == "1" ]]; then return 0; fi
   mkdir -p "$(dirname "$logf")"
+  local restore_errexit=0
+  [[ $- == *e* ]] && { restore_errexit=1; set +e; }
   ( "$@" ) 2>&1 | tee "$logf"
-  return "${PIPESTATUS[0]}"
+  local -a pipeline_status=("${PIPESTATUS[@]}")
+  (( restore_errexit == 1 )) && set -e
+  if (( pipeline_status[0] != 0 )); then
+    return "${pipeline_status[0]}"
+  fi
+  return "${pipeline_status[1]}"
 }
 
-# run_env "VAR=val VAR2=val2" <logfile> <cmd...> : like run but with extra env.
+# run_env <logfile> VAR=val VAR2=val2 -- <cmd...> : like run but with extra env.
 run_env() {
-  local envspec="$1" logf="$2"; shift 2
-  printf '%s+ %s %s%s\n' "$C_DIM" "$envspec" "$*" "$C_OFF"
+  local logf="$1"; shift
+  local -a env_args=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    [[ "$1" == *=* ]] || die "run_env expected an environment assignment, got: $1"
+    env_args+=("$1")
+    shift
+  done
+  [[ $# -gt 0 && "$1" == "--" ]] || die "run_env missing -- command separator"
+  shift
+  [[ $# -gt 0 ]] || die "run_env missing command"
+  printf '%s+ env' "$C_DIM"
+  printf ' %s' "${env_args[@]}" "$@"
+  printf '%s\n' "$C_OFF"
   if [[ "$DRY_RUN" == "1" ]]; then return 0; fi
   mkdir -p "$(dirname "$logf")"
-  ( env $envspec "$@" ) 2>&1 | tee "$logf"
-  return "${PIPESTATUS[0]}"
+  local restore_errexit=0
+  [[ $- == *e* ]] && { restore_errexit=1; set +e; }
+  ( env -- "${env_args[@]}" "$@" ) 2>&1 | tee "$logf"
+  local -a pipeline_status=("${PIPESTATUS[@]}")
+  (( restore_errexit == 1 )) && set -e
+  if (( pipeline_status[0] != 0 )); then
+    return "${pipeline_status[0]}"
+  fi
+  return "${pipeline_status[1]}"
 }
 
 done_marker() { echo "$DONE_DIR/$1.done"; }
@@ -334,6 +359,60 @@ hf_token_value() {
   if [[ -n "$HF_TOKEN_FILE" && -f "$HF_TOKEN_FILE" ]]; then cat "$HF_TOKEN_FILE"; return; fi
   [[ -f "$HOME/hf.token" ]] && { cat "$HOME/hf.token"; return; }
   echo ""
+}
+
+PIPELINE_DUMMY_ENV=()
+METADATA_MODEL_CONTAINER=""
+apply_pipeline_policy() {
+  if [[ "${AIC_MODEL_MODE:-}" != "metadata_dummy" ]]; then return; fi
+
+  local resolved_model
+  if ! resolved_model="$(
+    python3 "$SCRIPT_DIR/common/pipeline_policy.py" \
+      --model "${MODEL:-}" \
+      --load-format "${LOAD_FORMAT:-}"
+  )"; then
+    die "metadata dummy policy validation failed"
+  fi
+
+  local metadata_hf_home
+  mkdir -p "$OUT_ROOT"
+  if ! metadata_hf_home="$(mktemp -d "$OUT_ROOT/metadata-hf-cache.XXXXXX")"; then
+    die "failed to create metadata dummy cache"
+  fi
+  chmod 700 "$metadata_hf_home"
+
+  MODEL="$resolved_model"
+  AIC_MODEL_METADATA_DIR="$resolved_model"
+  AIC_LOAD_FORMAT=dummy
+  FPM_REAL_WORKLOAD_SHAPE_SOURCE=synthetic
+  FPM_SHAPE_SOURCE=synthetic
+  LOAD_FORMAT=dummy
+  HF_HUB_OFFLINE=1
+  TRANSFORMERS_OFFLINE=1
+  HF_DATASETS_OFFLINE=1
+  HF_HOME="$metadata_hf_home"
+  HF_TOKEN=""
+  HF_TOKEN_FILE=""
+  METADATA_MODEL_CONTAINER=/aic-model-metadata
+  MODELS=("${MODEL_SLUG:-metadata}|${MODEL}|${MODEL_KIND:-dense}|${MOE_PERF_FILE:-}")
+  PIPELINE_DUMMY_ENV=(
+    "AIC_LOAD_FORMAT=dummy"
+    "AIC_MODEL_METADATA_DIR=${MODEL}"
+    "AIC_MODEL_MODE=metadata_dummy"
+    "FPM_REAL_WORKLOAD_SHAPE_SOURCE=synthetic"
+    "HF_DATASETS_OFFLINE=1"
+    "HF_HUB_OFFLINE=1"
+    "TRANSFORMERS_OFFLINE=1"
+  )
+  export \
+    AIC_LOAD_FORMAT \
+    AIC_MODEL_METADATA_DIR \
+    AIC_MODEL_MODE \
+    FPM_REAL_WORKLOAD_SHAPE_SOURCE \
+    HF_DATASETS_OFFLINE \
+    HF_HUB_OFFLINE \
+    TRANSFORMERS_OFFLINE
 }
 
 # ============================================================================
@@ -369,7 +448,7 @@ preflight() {
   fi
 
   # HF token (fpm needs to pull/serve gated models)
-  if [[ " $STAGES " == *" fpm "* && -z "$(hf_token_value)" ]]; then
+  if [[ "${AIC_MODEL_MODE:-}" != "metadata_dummy" && " $STAGES " == *" fpm "* && -z "$(hf_token_value)" ]]; then
     warn "No HF token (HF_TOKEN / HF_TOKEN_FILE / ~/hf.token). FPM model serve may fail for gated models."
   fi
 
@@ -415,6 +494,28 @@ stage_layerwise() {
     local rdir; rdir="$(lw_run_dir "$slug")"; mkdir -p "$rdir"
     log "Layerwise: $hf ($kind) tp=$LW_TP_LIST -> $rdir/layerwise.csv"
 
+    local collect_model="$hf"
+    local model_mount=()
+    local model_policy_env=()
+    local model_policy_args=()
+    local auth_env=()
+    if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
+      collect_model="$METADATA_MODEL_CONTAINER"
+      model_mount=(-v "$MODEL:$METADATA_MODEL_CONTAINER:ro")
+      model_policy_env=(
+        -e "AIC_LOAD_FORMAT=dummy"
+        -e "AIC_MODEL_METADATA_DIR=$METADATA_MODEL_CONTAINER"
+        -e "AIC_MODEL_MODE=metadata_dummy"
+        -e "FPM_REAL_WORKLOAD_SHAPE_SOURCE=synthetic"
+        -e "HF_DATASETS_OFFLINE=1"
+        -e "HF_HUB_OFFLINE=1"
+        -e "TRANSFORMERS_OFFLINE=1"
+      )
+      model_policy_args=(--extra-vllm-arg=--load-format=dummy)
+    else
+      auth_env=(-e HF_TOKEN="$(hf_token_value)")
+    fi
+
     # In-container collect command (modeled on the committed run_layerwise_smoke.sh).
     # Decode rows must carry the paired FPM scheduler surface; max-decode-batch-size
     # only bounds datapoint generation and does not set max_num_seqs.
@@ -426,7 +527,7 @@ export LD_LIBRARY_PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-li
 nsys --version
 python3 -m collector.layerwise.vllm.collect \
   --run-dir /results \
-  --model "${hf}" --model-kind "${kind}" \
+  --model "${collect_model}" --model-kind "${kind}" \
   --tp-sizes ${LW_TP_LIST} --ep-sizes ${EP} \
   --phases ${LW_PHASES} --run-preset ${LW_RUN_PRESET} \
   --ctx-new-tokens ${LW_CTX_NEW_TOKENS} ${LW_CTX_PAST_KV:+--ctx-past-kv ${LW_CTX_PAST_KV}} --ctx-batch-sizes auto \
@@ -438,7 +539,7 @@ python3 -m collector.layerwise.vllm.collect \
   --gpus ${LW_GPUS} --max-workers 1 \
   --max-model-len ${LW_MAX_MODEL_LEN} \
   --gpu-memory-utilization ${LW_GPU_MEM_UTIL} \
-  --latency-source ${LW_LATENCY_SOURCE}
+  --latency-source ${LW_LATENCY_SOURCE} ${model_policy_args[*]}
 EOS
 )
     HF_TOKEN="$(hf_token_value)" run "$LOG_DIR/${unit}.log" \
@@ -447,10 +548,13 @@ EOS
         -v "$NSYS_IMPORTER_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:ro" \
         -v "$AIC_REPO:/workspace" \
         -v "$rdir:/results" \
+        "${model_mount[@]}" \
         -v "$HF_HOME:/hf-cache" \
         -v "$VLLM_CACHE_HOST:/home/dynamo/.cache/vllm" \
         -v "$VLLM_CACHE_HOST:/root/.cache/vllm" \
-        -e HF_TOKEN -e HF_HOME=/hf-cache -e HF_HUB_CACHE=/hf-cache/hub \
+        -e HF_HOME=/hf-cache -e HF_HUB_CACHE=/hf-cache/hub \
+        "${auth_env[@]}" \
+        "${model_policy_env[@]}" \
         -e TILELANG_CACHE_DIR=/home/dynamo/.cache/vllm/tilelang \
         -e TILELANG_TMP_DIR=/home/dynamo/.cache/vllm/tilelang/tmp \
         -w /workspace "$VLLM_IMAGE" -lc "$incmd"
@@ -507,11 +611,24 @@ stage_fpm() {
       [[ "$ALLOW_VERSION_MISMATCH" == "1" ]] && extra+=(--allow-version-mismatch --expected-vllm-version "$VLLM_VERSION")
       build_fpm_workload_args "$req" "$conc"
       local workload=("${FPM_WORKLOAD_ARGS[@]}")
+      local policy_extra=()
+      local -a fpm_env_args=(
+        "${seed_env[@]}"
+        "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS"
+        "MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS"
+        "ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL"
+      )
+      if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
+        policy_extra=(--extra-vllm-arg=--load-format=dummy)
+        fpm_env_args+=("${PIPELINE_DUMMY_ENV[@]}")
+      else
+        fpm_env_args+=("HF_TOKEN=$(hf_token_value)")
+      fi
 
       # Scheduler parity forced via env (FPM shell reads $MAX_NUM_SEQS / $MAX_NUM_BATCHED_TOKENS;
       # the python wrapper inherits os.environ into the subprocess).
-      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL" \
-        "$LOG_DIR/${unit}.log" \
+      run_env "$LOG_DIR/${unit}.log" \
+        "${fpm_env_args[@]}" -- \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" \
           --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
@@ -522,6 +639,7 @@ stage_fpm() {
           --warmup-requests "$FPM_WARMUP_REQUESTS" \
           --image "$DYNAMO_VLLM_IMAGE" \
           --run-dir "$rdir" \
+          "${policy_extra[@]}" \
           "${extra[@]}"
 
       mark_done "$unit"
@@ -724,8 +842,20 @@ stage_attribute() {
       fi
 
       local collect_rc=0
-      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
-        "$LOG_DIR/${unit}.log" \
+      local -a attribute_env_args=(
+        "${seed_env[@]}"
+        "MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS"
+        "MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS"
+        "ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL"
+      )
+      if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
+        attribute_env_args+=("${PIPELINE_DUMMY_ENV[@]}")
+      else
+        attribute_env_args+=("HF_TOKEN=$(hf_token_value)")
+      fi
+      attribute_env_args+=("NSYS_BIN=$NSYS_ROOT/bin/nsys" "NSYS_HOST_DIR=$NSYS_ROOT")
+      run_env "$LOG_DIR/${unit}.log" \
+        "${attribute_env_args[@]}" -- \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
           --phases "$ATTRIBUTE_PHASES" --decode-past-kv "$DECODE_PAST_KV" \
@@ -750,7 +880,7 @@ stage_attribute() {
       if [ -z "$existing_sqlite" ]; then
         local sqlite_base="${nsysrep%.nsys-rep}"
         log "Exporting nsys report to sqlite: $nsysrep -> ${sqlite_base}.sqlite"
-        run_env "" "$LOG_DIR/${unit}_export.log" \
+        run_env "$LOG_DIR/${unit}_export.log" -- \
           "$NSYS_ROOT/bin/nsys" export --type sqlite --force-overwrite true \
             -o "${sqlite_base}.sqlite" "$nsysrep" \
           || warn "nsys export failed for $nsysrep (rc=$?); decompose may have no sqlite to read"
@@ -785,7 +915,8 @@ stage_attribute() {
       # Decompose imports the aiconfigurator SDK (AIC predictions). On a source-checkout
       # box with no installed dist, put src/ on PYTHONPATH so the import resolves; the
       # __init__ version-fallback makes it work without dist metadata.
-      run_env "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" "$LOG_DIR/${unit}_decompose.log" \
+      run_env "$LOG_DIR/${unit}_decompose.log" \
+        "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" -- \
         python3 -m collector.layerwise.diagnostics.aic_fpm_attribute \
           --sqlite "$sqlite" \
           --fpm-run "$clean_fpm_run" \
@@ -804,7 +935,8 @@ stage_attribute() {
       # pinpoints the broken stage); the .nsys-rep/.sqlite/csv stay on disk for manual
       # decompose, and the unit re-runs on the next pass (no FORCE=1 needed).
       if [[ "$DRY_RUN" != "1" ]]; then
-        run_env "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" "$LOG_DIR/${unit}_assert.log" \
+        run_env "$LOG_DIR/${unit}_assert.log" \
+          "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" -- \
           python3 -m collector.layerwise.diagnostics.assert_attribution_valid \
             --sqlite "$sqlite" \
             --decomposition "$rdir/decomposition.csv" \
@@ -899,6 +1031,7 @@ stage_attribute() {
 # ============================================================================
 main() {
   cd "$AIC_REPO"
+  apply_pipeline_policy
   log "repo=$AIC_REPO"
   preflight
   for stage in $STAGES; do

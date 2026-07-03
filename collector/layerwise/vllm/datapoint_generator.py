@@ -20,6 +20,14 @@ from config_patch import patch_model_path
 from parallel_config_patch import EXPERT_COUNT_KEYS, _load_original_config, patch_for_parallelism
 from vllm_deployment import gpt_oss_runtime_defaults
 
+if __package__:
+    from collector.layerwise.common.pipeline_policy import (
+        MetadataDummyPolicyError,
+        validate_metadata_dummy_runtime,
+    )
+else:  # pragma: no cover - direct script compatibility
+    from pipeline_policy import MetadataDummyPolicyError, validate_metadata_dummy_runtime
+
 try:
     from .data import DataPoint, RepresentativeLayer, WorkUnit
     from .registry import LayerwiseModel
@@ -149,6 +157,8 @@ def _parse_parallelism_pairs(raw: str | None) -> list[tuple[int, int]]:
 def _resolve_real_weight_model_dir(model: str) -> str:
     """Return a local model directory suitable for real-weight loading."""
 
+    if validate_metadata_dummy_runtime(os.environ) is not None:
+        raise MetadataDummyPolicyError("forbidden_override")
     if os.path.isdir(model):
         return model
     from huggingface_hub import snapshot_download
@@ -716,6 +726,12 @@ def _filter_datapoints_for_model_max_len(
 
 def build_work_units(args: argparse.Namespace) -> list[WorkUnit]:
     """Build legacy work units for one model and one requested TP/EP sweep."""
+
+    policy = validate_metadata_dummy_runtime(os.environ, model=args.model)
+    if policy is not None and (
+        bool(getattr(args, "moe_real_router", False)) or bool(getattr(args, "physical_tp_real_weights", False))
+    ):
+        raise MetadataDummyPolicyError("forbidden_override")
 
     ctx_new_tokens = _parse_ints(args.ctx_new_tokens)
     ctx_past_kv = _parse_ints(args.ctx_past_kv)

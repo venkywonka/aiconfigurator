@@ -5,9 +5,15 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from collector.layerwise.common.pipeline_policy import (
+    enforce_metadata_dummy_load_format,
+    metadata_dummy_environment_overrides,
+    validate_metadata_dummy_runtime,
+)
 from collector.layerwise.fpm.datapoint_generator import FpmCase
 
 DEFAULT_IMAGE = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0"
@@ -23,12 +29,19 @@ class FpmShellCommand:
 
 def build_collect_command(args, case: FpmCase, run_dir: Path) -> FpmShellCommand:
     """Build the existing shell-wrapper command for one FPM deployment."""
+    policy = validate_metadata_dummy_runtime(os.environ, model=str(args.model))
+    model = str(policy.model_dir) if policy is not None else args.model
+    shape_source = policy.shape_source if policy is not None else args.real_workload_shape_source
+    extra_vllm_args = enforce_metadata_dummy_load_format(
+        list(args.extra_vllm_arg or []),
+        os.environ,
+    )
     script = Path("collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh")
     argv = [
         "bash",
         str(script),
         "--model",
-        args.model,
+        model,
         "--tp-size",
         str(case.tp_size),
         "--ep-size",
@@ -59,29 +72,31 @@ def build_collect_command(args, case: FpmCase, run_dir: Path) -> FpmShellCommand
     if args.include_sweep:
         argv.append("--include-sweep")
     if args.real_workload:
-        argv.extend([
-            "--real-workload",
-            "--real-workload-requests",
-            str(args.real_workload_requests),
-            "--real-workload-concurrency",
-            str(args.real_workload_concurrency),
-            "--real-workload-dataset",
-            args.real_workload_dataset,
-            "--real-workload-shape-source",
-            args.real_workload_shape_source,
-            "--real-workload-isl-min",
-            str(args.real_workload_isl_min),
-            "--real-workload-isl-max",
-            str(args.real_workload_isl_max),
-            "--real-workload-isl-mean",
-            str(args.real_workload_isl_mean),
-            "--real-workload-osl-min",
-            str(args.real_workload_osl_min),
-            "--real-workload-osl-max",
-            str(args.real_workload_osl_max),
-            "--real-workload-osl-mean",
-            str(args.real_workload_osl_mean),
-        ])
+        argv.extend(
+            [
+                "--real-workload",
+                "--real-workload-requests",
+                str(args.real_workload_requests),
+                "--real-workload-concurrency",
+                str(args.real_workload_concurrency),
+                "--real-workload-dataset",
+                args.real_workload_dataset,
+                "--real-workload-shape-source",
+                shape_source,
+                "--real-workload-isl-min",
+                str(args.real_workload_isl_min),
+                "--real-workload-isl-max",
+                str(args.real_workload_isl_max),
+                "--real-workload-isl-mean",
+                str(args.real_workload_isl_mean),
+                "--real-workload-osl-min",
+                str(args.real_workload_osl_min),
+                "--real-workload-osl-max",
+                str(args.real_workload_osl_max),
+                "--real-workload-osl-mean",
+                str(args.real_workload_osl_mean),
+            ]
+        )
     else:
         argv.append("--no-real-workload")
     if args.warmup_requests is not None:
@@ -102,10 +117,12 @@ def build_collect_command(args, case: FpmCase, run_dir: Path) -> FpmShellCommand
         argv.append("--nsys-full-worker")
     if getattr(args, "nsys_cuda_profiler_window", None):
         argv.extend(["--nsys-cuda-profiler-window", args.nsys_cuda_profiler_window])
-    extra_vllm_args = list(args.extra_vllm_arg or [])
     if not any(arg == "--load-format" or arg.startswith("--load-format=") for arg in extra_vllm_args):
         extra_vllm_args.append("--load-format=dummy")
     if extra_vllm_args:
         argv.append("--")
         argv.extend(extra_vllm_args)
-    return FpmShellCommand(argv=argv)
+    return FpmShellCommand(
+        argv=argv,
+        env=metadata_dummy_environment_overrides(policy),
+    )

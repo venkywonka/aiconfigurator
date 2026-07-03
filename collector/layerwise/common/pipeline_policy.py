@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,3 +127,110 @@ def validate_metadata_dummy_environment(environ: Mapping[str, str]) -> MetadataD
 
     _validate_bundle_entries(model_dir)
     return MetadataDummyPolicy(model_dir=model_dir)
+
+
+def validate_metadata_dummy_runtime(
+    environ: Mapping[str, str],
+    *,
+    model: str | None = None,
+    load_format: str | None = None,
+) -> MetadataDummyPolicy | None:
+    """Validate metadata mode plus runtime aliases and an optional model path."""
+
+    policy = validate_metadata_dummy_environment(environ)
+    if policy is None:
+        return None
+
+    for value in (environ.get("LOAD_FORMAT"), load_format):
+        if value not in (None, ""):
+            runtime_environ = dict(environ)
+            runtime_environ["AIC_LOAD_FORMAT"] = value
+            validate_metadata_dummy_environment(runtime_environ)
+    for variable in ("FPM_SHAPE_SOURCE", "REAL_WORKLOAD_SHAPE_SOURCE"):
+        value = environ.get(variable)
+        if value not in (None, ""):
+            runtime_environ = dict(environ)
+            runtime_environ["FPM_REAL_WORKLOAD_SHAPE_SOURCE"] = value
+            validate_metadata_dummy_environment(runtime_environ)
+
+    if model not in (None, ""):
+        candidate = Path(model)
+        try:
+            candidate = candidate.resolve(strict=True)
+        except OSError:
+            raise MetadataDummyPolicyError("forbidden_override") from None
+        if not candidate.is_dir() or candidate != policy.model_dir:
+            raise MetadataDummyPolicyError("forbidden_override")
+    return policy
+
+
+def enforce_metadata_dummy_load_format(
+    args: list[str] | tuple[str, ...],
+    environ: Mapping[str, str],
+) -> list[str]:
+    """Return CLI args with one fixed dummy load format in metadata mode."""
+
+    policy = validate_metadata_dummy_runtime(environ)
+    if policy is None:
+        return list(args)
+
+    normalized: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--load-format":
+            if index + 1 >= len(args) or args[index + 1] != policy.load_format:
+                raise MetadataDummyPolicyError("forbidden_override")
+            index += 2
+            continue
+        if token.startswith("--load-format="):
+            if token.partition("=")[2] != policy.load_format:
+                raise MetadataDummyPolicyError("forbidden_override")
+            index += 1
+            continue
+        normalized.append(token)
+        index += 1
+    normalized.append(f"--load-format={policy.load_format}")
+    return normalized
+
+
+def metadata_dummy_environment_overrides(policy: MetadataDummyPolicy | None) -> dict[str, str]:
+    """Return the fixed environment inherited by metadata-only subprocesses."""
+
+    if policy is None:
+        return {}
+    return {
+        "AIC_LOAD_FORMAT": policy.load_format,
+        "AIC_MODEL_METADATA_DIR": str(policy.model_dir),
+        "AIC_MODEL_MODE": "metadata_dummy",
+        "FPM_REAL_WORKLOAD_SHAPE_SOURCE": policy.shape_source,
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Validate layerwise metadata-only runtime policy.")
+    parser.add_argument("--model")
+    parser.add_argument("--load-format")
+    parser.add_argument("extra_args", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    extra_args = args.extra_args[1:] if args.extra_args[:1] == ["--"] else args.extra_args
+    try:
+        policy = validate_metadata_dummy_runtime(
+            os.environ,
+            model=args.model,
+            load_format=args.load_format,
+        )
+        enforce_metadata_dummy_load_format(extra_args, os.environ)
+    except MetadataDummyPolicyError as error:
+        print(error, file=sys.stderr)
+        return 2
+    if policy is not None:
+        print(policy.model_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -653,7 +653,9 @@ def test_stage_attribute_reuses_clean_fpm_prompt_seed_for_matching_shapes():
     script = pathlib.Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
 
     assert 'local seed_env=(PROMPT_TOKEN_SEED="$i")' in script
-    assert 'run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS' in script
+    assert "local -a attribute_env_args=(" in script
+    assert '"${seed_env[@]}"' in script
+    assert '"${attribute_env_args[@]}" --' in script
 
 
 def test_select_dominant_context_key_filters_by_resolved_chunk_size():
