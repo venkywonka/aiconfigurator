@@ -7,7 +7,7 @@
 
 : "${ENROOT_BIN:=enroot}"
 : "${SETSID_BIN:=setsid}"
-: "${ENROOT_LAUNCH_CHECK_SECONDS:=0.20}"
+: "${ENROOT_LAUNCH_TIMEOUT_SECONDS:=60}"
 
 _enroot_error() {
     if declare -F runtime_error >/dev/null 2>&1; then
@@ -437,6 +437,17 @@ _enroot_process_starttime() {
     printf '%s\n' "${fields[19]}"
 }
 
+_enroot_process_state() {
+    local pid="$1" stat_line rest
+    [[ -r "/proc/${pid}/stat" ]] || return 1
+    IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+    rest="${stat_line##*) }"
+    local -a fields=()
+    read -r -a fields <<< "${rest}"
+    [[ ${#fields[@]} -gt 0 ]] || return 1
+    printf '%s\n' "${fields[0]}"
+}
+
 _enroot_own_pgid() {
     local pgid
     pgid="$(ps -o pgid= -p "$$" 2>/dev/null)" || return 1
@@ -477,7 +488,8 @@ _enroot_remove_process_state() {
         "${ENROOT_PIDDIR}/${name}.pgid" \
         "${ENROOT_PIDDIR}/${name}.starttime" \
         "${ENROOT_PIDDIR}/${name}.token" \
-        "${ENROOT_PIDDIR}/${name}.launch"
+        "${ENROOT_PIDDIR}/${name}.launch" \
+        "${ENROOT_PIDDIR}/${name}.ready"
 }
 
 _enroot_persist_process_state() {
@@ -561,7 +573,7 @@ _enroot_terminate_owned_group() {
 }
 
 _enroot_active_pid() {
-    local name="$1" pid pgid expected_start actual_start actual_pgid own_pgid
+    local name="$1" pid pgid expected_start actual_start actual_pgid own_pgid process_state
     if [[ ! -f "${ENROOT_PIDDIR}/${name}.pid" || \
           ! -f "${ENROOT_PIDDIR}/${name}.pgid" || \
           ! -f "${ENROOT_PIDDIR}/${name}.starttime" || \
@@ -581,6 +593,8 @@ _enroot_active_pid() {
     [[ "${actual_start}" == "${expected_start}" ]] || {
         return 1
     }
+    process_state="$(_enroot_process_state "${pid}")" || return 1
+    [[ "${process_state}" != "Z" && "${process_state}" != "X" ]] || return 1
     actual_pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null)" || return 1
     actual_pgid="${actual_pgid//[[:space:]]/}"
     own_pgid="$(_enroot_own_pgid)" || return 1
@@ -619,11 +633,47 @@ runtime_enroot_launch_detached() {
     _enroot_command_with_workdir command "$@"
     local name="${NAME_PREFIX}-${role}" gpu_env runtime_token
     _enroot_validate_name "workload" "${name}" || return $?
+    if [[ ! "${ENROOT_LAUNCH_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+        _enroot_error "invalid Enroot launch timeout '${ENROOT_LAUNCH_TIMEOUT_SECONDS}'"
+        return 64
+    fi
     local -a rootfs_options=()
     [[ "${_ENROOT_SHARED_CONTAINER:-0}" == "1" ]] || rootfs_options=(--rw)
     gpu_env="$(_enroot_gpu_env "${gpus}")" || return $?
     runtime_token="${NAME_PREFIX}-${role}-${BASHPID}-${RANDOM}"
     local log_path="${ENROOT_PIDDIR}/${name}.log"
+    local launch_gate="${ENROOT_PIDDIR}/${name}.launch"
+    local launch_ready="${ENROOT_PIDDIR}/${name}.ready"
+    local run_prefix="${RUN_DIR%/}/"
+    if [[ "${launch_ready}" != "${run_prefix}"* ]]; then
+        _enroot_error "Enroot launch readiness path is outside RUN_DIR"
+        return 1
+    fi
+    local launch_ready_container="/work/${launch_ready#"${run_prefix}"}"
+    local handoff_script='
+import errno
+import os
+import sys
+
+fifo = sys.argv[1]
+command = sys.argv[2:]
+if not command:
+    raise SystemExit(126)
+
+fd = os.open(fifo, os.O_WRONLY)
+os.set_inheritable(fd, False)
+os.write(fd, b"ATTEMPT\n")
+try:
+    os.execvp(command[0], command)
+except OSError as error:
+    rc = 127 if error.errno == errno.ENOENT else 126
+    os.write(fd, f"FAIL:{rc}\n".encode())
+    os.close(fd)
+    raise SystemExit(rc)
+'
+    command=(
+        python3 -c "${handoff_script}" "${launch_ready_container}" "${command[@]}"
+    )
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
         runtime_invoke "${ENROOT_BIN}" start "${rootfs_options[@]}" \
             "${_ENROOT_MOUNTS[@]}" \
@@ -639,20 +689,38 @@ runtime_enroot_launch_detached() {
         return 1
     fi
     _enroot_remove_process_state "${name}"
-    local launch_gate="${ENROOT_PIDDIR}/${name}.launch"
+    if ! mkfifo -m 0600 -- "${launch_ready}"; then
+        _enroot_error "failed to create Enroot launch handoff FIFO for '${name}'"
+        return 1
+    fi
+    local launch_bootstrap_fd launch_handoff_fd
+    if ! exec {launch_bootstrap_fd}<>"${launch_ready}"; then
+        _enroot_remove_process_state "${name}"
+        _enroot_error "failed to open Enroot launch handoff FIFO for '${name}'"
+        return 1
+    fi
+    if ! exec {launch_handoff_fd}<"${launch_ready}"; then
+        exec {launch_bootstrap_fd}>&-
+        _enroot_remove_process_state "${name}"
+        _enroot_error "failed to read Enroot launch handoff FIFO for '${name}'"
+        return 1
+    fi
+    exec {launch_bootstrap_fd}>&-
     local parent_pid="${BASHPID}" shell_bin="${BASH:-bash}"
     AIC_ENROOT_RUNTIME_TOKEN="${runtime_token}" \
         "${SETSID_BIN}" "${shell_bin}" -c '
             gate=$1
             parent_pid=$2
-            shift 2
+            handoff_fd=$3
+            shift 3
+            exec {handoff_fd}<&-
             while [[ ! -e "${gate}" ]]; do
                 kill -0 "${parent_pid}" 2>/dev/null || exit 125
                 sleep 0.02
             done
             rm -f -- "${gate}" 2>/dev/null || true
             exec "$@"
-        ' _ "${launch_gate}" "${parent_pid}" \
+        ' _ "${launch_gate}" "${parent_pid}" "${launch_handoff_fd}" \
         "${ENROOT_BIN}" start "${rootfs_options[@]}" \
             "${_ENROOT_MOUNTS[@]}" \
             "${_ENROOT_ENVS[@]}" \
@@ -672,6 +740,7 @@ runtime_enroot_launch_detached() {
     done
     if ! kill -0 "${pid}" 2>/dev/null; then
         local launch_rc=0
+        exec {launch_handoff_fd}<&-
         if wait "${pid}"; then
             launch_rc=1
         else
@@ -686,24 +755,84 @@ runtime_enroot_launch_detached() {
     own_pgid="$(_enroot_own_pgid)" || own_pgid=""
     if [[ ! "${pgid}" =~ ^[0-9]+$ || "${pgid}" != "${pid}" || "${pgid}" == "${own_pgid}" || -z "${starttime}" ]]; then
         _enroot_terminate_pending_launch "${pid}" "${pgid}"
+        exec {launch_handoff_fd}<&-
+        _enroot_remove_process_state "${name}"
         _enroot_error "Enroot workload '${name}' did not enter a private process group"
         return 1
     fi
     if ! _enroot_persist_process_state "${name}" "${pid}" "${pgid}" "${starttime}" "${runtime_token}"; then
         _enroot_terminate_pending_launch "${pid}" "${pgid}"
+        exec {launch_handoff_fd}<&-
+        _enroot_remove_process_state "${name}"
         _enroot_error "failed to persist Enroot workload state for '${name}'"
         return 1
     fi
     if ! : > "${launch_gate}"; then
         _enroot_terminate_pending_launch "${pid}" "${pgid}"
+        exec {launch_handoff_fd}<&-
         _enroot_remove_process_state "${name}"
         _enroot_error "failed to release Enroot workload launch gate for '${name}'"
         return 1
     fi
 
-    sleep "${ENROOT_LAUNCH_CHECK_SECONDS}"
-    if ! kill -0 "${pid}" 2>/dev/null; then
-        local launch_rc=0
+    local launch_start_seconds="${SECONDS}" launch_rc=0 handoff_line="" handoff_read_rc=0
+    local handoff_attempted=0 handoff_complete=0
+    while [[ "${handoff_complete}" != "1" ]]; do
+        handoff_line=""
+        handoff_read_rc=0
+        if IFS= read -r -t 0.02 -u "${launch_handoff_fd}" handoff_line; then
+            if [[ "${handoff_attempted}" == "0" && "${handoff_line}" == "ATTEMPT" ]]; then
+                handoff_attempted=1
+            elif [[ "${handoff_attempted}" == "1" && "${handoff_line}" =~ ^FAIL:([0-9]+)$ ]]; then
+                launch_rc="${BASH_REMATCH[1]}"
+                handoff_complete=1
+            else
+                exec {launch_handoff_fd}<&-
+                _enroot_terminate_owned_group "${name}"
+                wait "${pid}" 2>/dev/null || true
+                _enroot_remove_process_state "${name}"
+                _enroot_error "Enroot workload '${name}' produced an invalid command handoff status"
+                return 125
+            fi
+        else
+            handoff_read_rc=$?
+            if [[ "${handoff_attempted}" == "1" && "${handoff_read_rc}" == "1" ]]; then
+                handoff_complete=1
+            fi
+        fi
+        [[ "${handoff_complete}" == "1" ]] && break
+        if ! _enroot_active_pid "${name}" >/dev/null; then
+            exec {launch_handoff_fd}<&-
+            _enroot_terminate_owned_group "${name}"
+            if wait "${pid}"; then
+                launch_rc=1
+            else
+                launch_rc=$?
+            fi
+            _enroot_remove_process_state "${name}"
+            _enroot_log "Enroot workload '${name}' failed during launch (rc=${launch_rc}); log: ${log_path}"
+            [[ -f "${log_path}" ]] && cat "${log_path}" >&2
+            return "${launch_rc}"
+        fi
+        if (( SECONDS - launch_start_seconds >= ENROOT_LAUNCH_TIMEOUT_SECONDS )); then
+            exec {launch_handoff_fd}<&-
+            _enroot_terminate_pending_launch "${pid}" "${pgid}"
+            _enroot_remove_process_state "${name}"
+            _enroot_error "Enroot workload '${name}' timed out before command handoff" || true
+            return 124
+        fi
+        [[ "${handoff_read_rc}" == "1" ]] && sleep 0.02
+    done
+    exec {launch_handoff_fd}<&-
+    if [[ "${launch_rc}" != "0" ]]; then
+        _enroot_terminate_owned_group "${name}"
+        wait "${pid}" 2>/dev/null || true
+        _enroot_remove_process_state "${name}"
+        _enroot_log "Enroot workload '${name}' failed command handoff (rc=${launch_rc}); log: ${log_path}"
+        [[ -f "${log_path}" ]] && cat "${log_path}" >&2
+        return "${launch_rc}"
+    fi
+    if ! _enroot_active_pid "${name}" >/dev/null; then
         _enroot_terminate_owned_group "${name}"
         if wait "${pid}"; then
             launch_rc=1
@@ -711,10 +840,11 @@ runtime_enroot_launch_detached() {
             launch_rc=$?
         fi
         _enroot_remove_process_state "${name}"
-        _enroot_log "Enroot workload '${name}' failed during launch (rc=${launch_rc}); log: ${log_path}"
+        _enroot_log "Enroot workload '${name}' exited during command handoff (rc=${launch_rc}); log: ${log_path}"
         [[ -f "${log_path}" ]] && cat "${log_path}" >&2
         return "${launch_rc}"
     fi
+    rm -f -- "${launch_ready}"
     _enroot_log "Enroot workload '${name}' started (pid=${pid}, log=${log_path})"
 }
 

@@ -96,7 +96,26 @@ import sys
 import time
 
 
+def hold_workload():
+    print(os.environ.get("FAKE_ENROOT_WORKLOAD_LOG", "contract workload log"), flush=True)
+    pid_path = Path(os.environ["FAKE_ENROOT_CHILD_PID_DIR"]) / f"{{os.getpid()}}.pid"
+    pid_path.write_text(str(os.getpid()))
+
+    def stop(signum, _frame):
+        with open(os.environ["FAKE_ENROOT_SIGNAL_LOG"], "a") as stream:
+            stream.write(f"{{os.getpid()}}:{{signal.Signals(signum).name}}\\n")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while True:
+        time.sleep(0.05)
+
+
 args = sys.argv[1:]
+if args == ["__fake_hold__"]:
+    hold_workload()
+
 with open(os.environ["FAKE_ENROOT_LOG"], "a") as stream:
     stream.write(json.dumps(args) + "\\n")
 
@@ -128,9 +147,6 @@ if operation == "remove":
         shutil.rmtree(Path(os.environ["ENROOT_DATA_PATH"]) / name, ignore_errors=True)
     raise SystemExit(0)
 if operation == "start":
-    launch_rc = int(os.environ.get("FAKE_ENROOT_LAUNCH_RC", "0"))
-    if launch_rc:
-        raise SystemExit(launch_rc)
     start_args = args[1:]
     child_env = os.environ.copy()
     index = 0
@@ -150,6 +166,25 @@ if operation == "start":
             index += 1
         else:
             raise SystemExit(64)
+    if index >= len(start_args):
+        raise SystemExit(64)
+    command = start_args[index + 1 :]
+    handoff_contract = (
+        len(command) >= 4
+        and command[0] == "python3"
+        and command[1] == "-c"
+        and "os.set_inheritable(fd, False)" in command[2]
+    )
+    if os.environ.get("FAKE_ENROOT_REQUIRE_READY_CONTRACT") == "1" and not handoff_contract:
+        parent_pid = os.getppid()
+        while os.getppid() == parent_pid:
+            time.sleep(0.01)
+    if os.environ.get("FAKE_ENROOT_BLOCK_BEFORE_HANDOFF") == "1":
+        while True:
+            time.sleep(0.05)
+    launch_rc = int(os.environ.get("FAKE_ENROOT_LAUNCH_RC", "0"))
+    if launch_rc:
+        raise SystemExit(launch_rc)
     fork_survivor_rc = int(os.environ.get("FAKE_ENROOT_FORK_SURVIVOR_RC", "0"))
     if fork_survivor_rc:
         survivor_code = '''
@@ -178,10 +213,8 @@ while True:
                 break
             time.sleep(0.01)
         raise SystemExit(fork_survivor_rc)
-    if index >= len(start_args):
-        raise SystemExit(64)
-    command = start_args[index + 1 :]
     mapped = [item.replace("/work", os.environ["RUN_DIR"]) for item in command]
+    long_running = os.environ.get("FAKE_ENROOT_HOLD") == "1"
     if os.environ.get("FAKE_ENROOT_DRIVER_MODE") == "1":
         joined = " ".join(command)
         if "vllm.__version__" in joined:
@@ -194,25 +227,23 @@ while True:
         long_running = module in {"dynamo.frontend", "dynamo.vllm"} or "fpm_collect.py" in joined
         if not long_running:
             raise SystemExit(0)
+    if handoff_contract:
+        # Exercise the real injected FIFO/CLOEXEC wrapper. Only replace its payload
+        # when the test needs a deterministic long-running workload.
+        if long_running:
+            mapped = mapped[:4] + [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "__fake_hold__",
+            ]
+        os.execvpe(mapped[0], mapped, child_env)
     elif os.environ.get("FAKE_ENROOT_HOLD") != "1":
         if not command:
             raise SystemExit(0)
         result = subprocess.run(mapped, env=child_env, check=False)
         raise SystemExit(result.returncode)
     os.environ.update(child_env)
-    print(os.environ.get("FAKE_ENROOT_WORKLOAD_LOG", "contract workload log"), flush=True)
-    pid_path = Path(os.environ["FAKE_ENROOT_CHILD_PID_DIR"]) / f"{{os.getpid()}}.pid"
-    pid_path.write_text(str(os.getpid()))
-
-    def stop(signum, _frame):
-        with open(os.environ["FAKE_ENROOT_SIGNAL_LOG"], "a") as stream:
-            stream.write(f"{{os.getpid()}}:{{signal.Signals(signum).name}}\\n")
-        raise SystemExit(0)
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    while True:
-        time.sleep(0.05)
+    hold_workload()
 if operation == "exec":
     command = args[2:]
     mapped = [
@@ -362,6 +393,11 @@ case "$operation" in
         prepare_backend
         export FAKE_ENROOT_HOLD=1
         runtime_launch_detached worker "" opts -- true
+        ;;
+    exec-handoff-failure)
+        prepare_backend
+        export FAKE_ENROOT_HOLD=0
+        runtime_launch_detached worker "" opts -- /definitely/missing-aic-command
         ;;
     state-write-failure)
         prepare_backend
@@ -905,7 +941,10 @@ def test_enroot_launch_failure_preserves_status_and_leaves_no_live_process(
 ) -> None:
     result = runtime_harness.run(
         "launch-failure",
-        env_updates={"FAKE_ENROOT_LAUNCH_RC": "73"},
+        env_updates={
+            "FAKE_ENROOT_LAUNCH_RC": "73",
+            "FAKE_ENROOT_REQUIRE_READY_CONTRACT": "1",
+        },
     )
 
     assert result.returncode == 73, _combined_output(result)
@@ -914,12 +953,41 @@ def test_enroot_launch_failure_preserves_status_and_leaves_no_live_process(
     assert runtime_harness.child_pids() == []
 
 
+def test_enroot_launch_reports_actual_command_exec_failure(
+    runtime_harness: RuntimeHarness,
+) -> None:
+    result = runtime_harness.run("exec-handoff-failure")
+
+    assert result.returncode == 127, _combined_output(result)
+    assert list(runtime_harness.state_dir.rglob("*.pid")) == []
+
+
+def test_enroot_launch_handoff_timeout_reaps_pre_exec_process_group(
+    runtime_harness: RuntimeHarness,
+) -> None:
+    result = runtime_harness.run(
+        "launch-failure",
+        env_updates={
+            "ENROOT_LAUNCH_TIMEOUT_SECONDS": "1",
+            "FAKE_ENROOT_BLOCK_BEFORE_HANDOFF": "1",
+        },
+        timeout=5,
+    )
+
+    assert result.returncode == 124, _combined_output(result)
+    _assert_reason(_combined_output(result), r"timed out before command handoff")
+    assert list(runtime_harness.state_dir.rglob("*.pid")) == []
+
+
 def test_post_gate_launch_failure_reaps_token_owned_process_group(
     runtime_harness: RuntimeHarness,
 ) -> None:
     result = runtime_harness.run(
         "launch-failure",
-        env_updates={"FAKE_ENROOT_FORK_SURVIVOR_RC": "73"},
+        env_updates={
+            "FAKE_ENROOT_FORK_SURVIVOR_RC": "73",
+            "FAKE_ENROOT_REQUIRE_READY_CONTRACT": "1",
+        },
     )
 
     deadline = time.monotonic() + 2
