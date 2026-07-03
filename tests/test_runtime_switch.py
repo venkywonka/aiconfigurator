@@ -183,6 +183,21 @@ def test_missing_report_path_invokes_profile_diagnostics():
     assert "runtime_dump_profile_diagnostics" in missing_report_branch
 
 
+def test_driver_never_renders_huggingface_token_value_in_commands():
+    driver = pathlib.Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+
+    assert "HF_TOKEN=$(hf_token_value)" not in driver
+    assert '-e HF_TOKEN="$(hf_token_value)"' not in driver
+    assert "/run/secrets/hf.token" in driver
+
+
+def test_smoke_scheduler_budget_is_not_below_vllm_model_length():
+    driver = pathlib.Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+    smoke_block = driver.split('if [[ "$SMOKE" == "1" ]]', maxsplit=1)[1].split("fi", maxsplit=1)[0]
+
+    assert 'FPM_MAX_NUM_BATCHED_TOKENS="40960"' in smoke_block
+
+
 def test_docker_mode_dumps_frontend_and_worker_logs_when_model_registration_fails():
     """If the frontend is alive but /v1/models never contains the target model,
     the failure branch must dump frontend/worker logs so CI postmortems can see

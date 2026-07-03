@@ -239,7 +239,7 @@ if [[ "$SMOKE" == "1" ]]; then
   LW_PHASES="both"; LW_CTX_NEW_TOKENS="1,128"; LW_GEN_BATCH_SIZES="1,4"; LW_GEN_PAST_KV="1,4096"
   LW_MAX_MODEL_LEN="8192"; LW_MAX_DECODE_BATCH_SIZE="8"
   PARETO_NAMES=(c2); PARETO_CONCURRENCY=(2); FPM_REQ_MIN="2"; FPM_REQ_MAX="8"; FPM_WARMUP_REQUESTS="1"
-  FPM_MAX_NUM_SEQS="8"; FPM_MAX_NUM_BATCHED_TOKENS="2048"; PLOT_PARETO="c2"
+  FPM_MAX_NUM_SEQS="8"; FPM_MAX_NUM_BATCHED_TOKENS="40960"; PLOT_PARETO="c2"
   LW_RUN_PRESET="smoke"
 fi
 
@@ -335,6 +335,18 @@ hf_token_value() {
   echo ""
 }
 
+materialize_hf_token_file() {
+  local token target
+  token="$(hf_token_value)"
+  [[ -n "$token" ]] || return 1
+  target="$OUT_ROOT/.secrets/hf.token"
+  mkdir -p "$(dirname "$target")"
+  umask 022
+  printf '%s' "$token" > "$target"
+  chmod 0644 "$target"
+  printf '%s\n' "$target"
+}
+
 # ============================================================================
 # Preflight
 # ============================================================================
@@ -415,9 +427,13 @@ stage_layerwise() {
     log "Layerwise: $hf ($kind) tp=$LW_TP_LIST -> $rdir/layerwise.csv"
 
     # In-container collect command (modeled on the committed run_layerwise_smoke.sh).
-    local incmd
+    local incmd hf_token_file
+    local hf_secret_mount=()
+    hf_token_file="$(materialize_hf_token_file || true)"
+    [[ -n "$hf_token_file" ]] && hf_secret_mount=(-v "$hf_token_file:/run/secrets/hf.token:ro")
     incmd=$(cat <<EOS
 set -euo pipefail
+if [[ -s /run/secrets/hf.token ]]; then export HF_TOKEN="\$(tr -d '\\n' < /run/secrets/hf.token)"; fi
 export PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:\$PATH"
 export LD_LIBRARY_PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:\${LD_LIBRARY_PATH:-}"
 nsys --version
@@ -446,8 +462,8 @@ EOS
         -v "$HF_HOME:/hf-cache" \
         -v "$VLLM_CACHE_HOST:/home/dynamo/.cache/vllm" \
         -v "$VLLM_CACHE_HOST:/root/.cache/vllm" \
+        "${hf_secret_mount[@]}" \
         -e HF_HOME=/hf-cache -e HF_HUB_CACHE=/hf-cache/hub \
-        -e HF_TOKEN="$(hf_token_value)" \
         -e TILELANG_CACHE_DIR=/home/dynamo/.cache/vllm/tilelang \
         -e TILELANG_TMP_DIR=/home/dynamo/.cache/vllm/tilelang/tmp \
         -w /workspace "$VLLM_IMAGE" -lc "$incmd"
@@ -483,7 +499,7 @@ stage_fpm() {
 
       # Scheduler parity forced via env (FPM shell reads $MAX_NUM_SEQS / $MAX_NUM_BATCHED_TOKENS;
       # the python wrapper inherits os.environ into the subprocess).
-      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL HF_TOKEN=$(hf_token_value)" \
+      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" \
@@ -711,7 +727,7 @@ stage_attribute() {
       fi
 
       local collect_rc=0
-      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
+      run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
