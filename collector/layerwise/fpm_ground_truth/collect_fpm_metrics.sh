@@ -313,14 +313,14 @@ run() {
     fi
 }
 
-# Source the RUNTIME indirection helpers (docker|process).
+# Source the RUNTIME indirection helpers (docker|enroot|process).
 # Requires: run(), log(), die(), container_exists(), IMAGE, RUN_DIR, NAME_PREFIX,
 #           WORKER_NAME, NSYS_BIN, NSYS_SESSION_NAME, DRY_RUN.
 # shellcheck source=runtime.sh
 source "$(dirname "${BASH_SOURCE[0]}")/runtime.sh"
 
 container_exists() {
-    docker ps -a --format '{{.Names}}' | grep -Fxq "$1"
+    runtime_container_exists "$1"
 }
 
 csv_count() {
@@ -1020,15 +1020,17 @@ if [[ "${VARY_ISL_OSL}" == "1" && "${WORKLOAD_PLAN}" == "legacy" ]]; then
     fi
 fi
 
-if [[ "${DRY_RUN}" != "1" ]]; then
-    command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
-    docker image inspect "${IMAGE}" >/dev/null 2>&1 || die "Docker image '${IMAGE}' was not found locally. Build it or pass --image / DYNAMO_VLLM_IMAGE."
-fi
+CLEANUP_ENABLED=1
+runtime_prepare || die "runtime '${RUNTIME}' preparation failed for image '${IMAGE}'"
 
 if [[ "${DRY_RUN}" != "1" ]]; then
+    VERSION_CHECK_RUNTIME_OPTS=(--network none)
+    if [[ "${RUNTIME}" == "enroot" ]]; then
+        VERSION_CHECK_RUNTIME_OPTS=(--network host)
+    fi
     log "Verifying image '${IMAGE}' uses vLLM ${EXPECTED_VLLM_VERSION}"
     actual_version="$(
-        docker run --rm --network none "${IMAGE}" \
+        runtime_run_oneshot "" "" VERSION_CHECK_RUNTIME_OPTS -- \
             python3 -c 'import vllm; print(vllm.__version__)' |
         sed -nE 's/^[[:space:]]*([0-9]+[.][0-9]+[.][0-9]+).*$/\1/p' \
         | tail -n 1
@@ -1042,7 +1044,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
         fi
     fi
 
-    docker run --rm --network none "${IMAGE}" \
+    runtime_run_oneshot "" "" VERSION_CHECK_RUNTIME_OPTS -- \
         python3 -c 'import dynamo.common.forward_pass_metrics; import dynamo.vllm.instrumented_scheduler' \
         >/dev/null
 fi
@@ -1169,7 +1171,7 @@ snapshot_effective_vllm_config() {
         return
     fi
     local snapshot_rc=0
-    run docker run --rm \
+    local snapshot_runtime_opts=(
         --network host \
         --gpus "${GPUS}" \
         -v "${RUN_DIR}:/work" \
@@ -1179,8 +1181,9 @@ snapshot_effective_vllm_config() {
         -e "HF_HOME=/work/hf-home" \
         -e "HF_HUB_CACHE=/work/hf-home/hub" \
         -e "TRANSFORMERS_CACHE=/work/hf-home/transformers" \
-        "${MODEL_POLICY_DOCKER_ENV[@]}" \
-        "${IMAGE}" \
+        "${MODEL_POLICY_DOCKER_ENV[@]}"
+    )
+    runtime_run_oneshot "" "" snapshot_runtime_opts -- \
         "${HF_TOKEN_CONTAINER_PREFIX[@]}" \
         python3 /work/vllm_deployment.py snapshot-effective \
             --args-json "${VLLM_DEPLOYMENT_ARGS_JSON}" \
@@ -1297,8 +1300,7 @@ send_request_workload() {
         request_driver_cmd+=(--ignore-eos)
     fi
 
-    run docker run --rm \
-        --name "${NAME_PREFIX}-${container_suffix}" \
+    local request_runtime_opts=(
         --network host \
         -v "${RUN_DIR}:/work" \
         -v "${HF_HOME_HOST}:/work/hf-home" \
@@ -1307,8 +1309,9 @@ send_request_workload() {
         -e "HF_HOME=/work/hf-home" \
         -e "HF_HUB_CACHE=/work/hf-home/hub" \
         -e "TRANSFORMERS_CACHE=/work/hf-home/transformers" \
-        "${MODEL_POLICY_DOCKER_ENV[@]}" \
-        "${IMAGE}" \
+        "${MODEL_POLICY_DOCKER_ENV[@]}"
+    )
+    runtime_run_oneshot "${container_suffix}" "" request_runtime_opts -- \
         "${HF_TOKEN_CONTAINER_PREFIX[@]}" \
         "${request_driver_cmd[@]}" || request_rc=$?
 
@@ -1408,7 +1411,6 @@ if [[ "${WARMUP_REQUESTS}" != "0" ]]; then
     log "Warmup workload CSV: ${WARMUP_WORKLOAD_OUTPUT_CSV}"
 fi
 
-CLEANUP_ENABLED=1
 start_file_discovery_touch_loop
 build_vllm_deployment_args
 snapshot_effective_vllm_config
@@ -1477,21 +1479,22 @@ runtime_launch_detached "worker" "${GPUS}" "WORKER_FULL_DOCKER_OPTS" -- \
     "${WORKER_CONTAINER_CMD[@]}"
 
 if [[ "${DRY_RUN}" != "1" ]]; then
+    WAIT_RUNTIME_OPTS=(--network host -v "${RUN_DIR}:/work")
     log "Waiting for frontend health"
-    docker run --rm --network host -v "${RUN_DIR}:/work" "${IMAGE}" \
+    runtime_run_oneshot "" "" WAIT_RUNTIME_OPTS -- \
         python3 /work/wait_http.py \
             --url "http://127.0.0.1:${HTTP_PORT}/health" \
             --timeout "${START_TIMEOUT_SECONDS}" >/dev/null
 
     log "Waiting for model registration (${MODEL_REQUEST_NAME})"
-    if ! docker run --rm --network host -v "${RUN_DIR}:/work" "${IMAGE}" \
+    if ! runtime_run_oneshot "" "" WAIT_RUNTIME_OPTS -- \
         python3 /work/wait_http.py \
             --url "http://127.0.0.1:${HTTP_PORT}/v1/models" \
             --contains "${MODEL_REQUEST_NAME}" \
             --timeout "${START_TIMEOUT_SECONDS}" >/dev/null; then
         log "ERROR: model registration timed out; dumping frontend/worker logs"
-        docker logs "${FRONTEND_NAME}" 2>&1 || true
-        docker logs "${WORKER_NAME}" 2>&1 || true
+        runtime_logs "${FRONTEND_NAME}" 2>&1 || true
+        runtime_logs "${WORKER_NAME}" 2>&1 || true
         return 1
     fi
 fi
@@ -1658,7 +1661,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     sleep "${POST_REQUEST_COLLECT_SECONDS}"
 
     if [[ "${KEEP_RUNNING}" != "1" ]] && container_exists "${COLLECTOR_NAME}"; then
-        docker stop -t 2 "${COLLECTOR_NAME}" >/dev/null || true
+        runtime_stop "${COLLECTOR_NAME}" 2 >/dev/null || true
     fi
     if [[ "${NSYS_PROFILE_WORKER}" == "1" && "${KEEP_RUNNING}" != "1" ]] && container_exists "${WORKER_NAME}"; then
         log "Stopping profiled worker container to flush Nsight report"
@@ -1714,7 +1717,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
         fi
         if [[ "${rows}" == "0" ]]; then
             log "No FPM rows were collected. Worker log tail:"
-            docker logs --tail=120 "${WORKER_NAME}" >&2 || true
+            runtime_logs "${WORKER_NAME}" --tail=120 >&2 || true
             exit 2
         fi
         log "First rows:"

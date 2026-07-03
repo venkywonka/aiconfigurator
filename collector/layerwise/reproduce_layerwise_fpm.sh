@@ -350,6 +350,44 @@ run_env() {
   return "${pipeline_status[1]}"
 }
 
+# The shared runtime backend normally calls run <cmd...>.  This outer driver
+# has a log-file-first run helper, so inject the equivalent command invoker.
+RUNTIME_LOG_FILE=""
+runtime_invoke() {
+  if [[ -z "${RUNTIME_LOG_FILE:-}" ]]; then
+    err "runtime command log path is not configured"
+    return 64
+  fi
+  run "$RUNTIME_LOG_FILE" "$@"
+}
+
+# shellcheck source=fpm_ground_truth/runtime.sh
+source "$SCRIPT_DIR/fpm_ground_truth/runtime.sh"
+
+reset_outer_runtime_state() {
+  unset ENROOT_STATE_DIR ENROOT_PIDDIR ENROOT_CACHE_PATH ENROOT_TEMP_PATH \
+    ENROOT_RUNTIME_PATH ENROOT_CONTAINER_NAME _ENROOT_SHARED_CONTAINER
+  if [[ -z "${ENROOT_IMAGE_MAP:-}" ]]; then
+    unset ENROOT_DATA_PATH
+  fi
+}
+
+runtime_image_version() (
+  local IMAGE="$1"
+  local RUN_DIR="$OUT_ROOT/.runtime/image-version"
+  local NAME_PREFIX="aic-image-version-${BASHPID}"
+  local RUNTIME_LOG_FILE="$LOG_DIR/image-version.log"
+  local -a version_runtime_opts=(--network none)
+  if [[ "${RUNTIME}" == "enroot" ]]; then
+    version_runtime_opts=(--network host)
+  fi
+  reset_outer_runtime_state
+  trap 'runtime_teardown >/dev/null 2>&1 || true' EXIT
+  runtime_prepare || return 1
+  runtime_run_oneshot "" "" version_runtime_opts -- \
+    python3 -c 'import vllm,sys; sys.stdout.write(vllm.__version__)'
+)
+
 done_marker() { echo "$DONE_DIR/$1.done"; }
 is_done()     { [[ "$FORCE" != "1" && -f "$(done_marker "$1")" ]]; }
 mark_done()   { [[ "$DRY_RUN" == "1" ]] || { mkdir -p "$DONE_DIR"; date -u +%Y-%m-%dT%H:%M:%SZ > "$(done_marker "$1")"; }; }
@@ -422,14 +460,16 @@ preflight() {
   log "Preflight (SYSTEM=$SYSTEM backend=$BACKEND data_version=$DATA_VERSION vllm=$VLLM_VERSION; SMOKE=$SMOKE DRY_RUN=$DRY_RUN)"
   mkdir -p "$OUT_ROOT" "$LOG_DIR" "$DONE_DIR" "$HF_HOME" "$VLLM_CACHE_HOST/tilelang/tmp"
 
-  command -v docker >/dev/null 2>&1 || warn "docker not found on PATH (required for fpm + layerwise stages)."
-
   # GPU count
   if command -v nvidia-smi >/dev/null 2>&1; then
-    local ngpu; ngpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
-    log "Visible GPUs: $ngpu"
-    [[ " $STAGES " == *" fpm "* && "$ngpu" -lt "$TP" ]] && warn "fpm stage needs >= $TP GPUs (TP=$TP) but only $ngpu visible."
-    [[ " $STAGES " == *" layerwise "* && "$ngpu" -lt 1 ]] && warn "layerwise stage needs >= 1 GPU."
+    local ngpu
+    if ngpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"; then
+      log "Visible GPUs: $ngpu"
+      [[ " $STAGES " == *" fpm "* && "$ngpu" -lt "$TP" ]] && warn "fpm stage needs >= $TP GPUs (TP=$TP) but only $ngpu visible."
+      [[ " $STAGES " == *" layerwise "* && "$ngpu" -lt 1 ]] && warn "layerwise stage needs >= 1 GPU."
+    else
+      warn "nvidia-smi is installed but unavailable -- cannot verify GPU count."
+    fi
   else
     warn "nvidia-smi not found -- cannot verify GPU count."
   fi
@@ -467,7 +507,12 @@ preflight() {
   # Optional: verify the FPM image's vLLM version (the shell hard-fails on mismatch)
   if [[ " $STAGES " == *" fpm "* ]]; then
     if [[ "$PREFLIGHT_IMAGE_CHECK" == "1" && "$DRY_RUN" != "1" ]]; then
-      local v; v="$(docker run --rm "$DYNAMO_VLLM_IMAGE" python -c 'import vllm,sys; sys.stdout.write(vllm.__version__)' 2>/dev/null || echo '?')"
+      local v version_output
+      if version_output="$(runtime_image_version "$DYNAMO_VLLM_IMAGE" 2>/dev/null)"; then
+        v="${version_output##*$'\n'}"
+      else
+        v="?"
+      fi
       log "FPM image vLLM version: $v (expected $VLLM_VERSION)"
       if [[ "$v" != "$VLLM_VERSION" && "$ALLOW_VERSION_MISMATCH" != "1" ]]; then
         die "FPM image vLLM=$v != $VLLM_VERSION and ALLOW_VERSION_MISMATCH!=1. The FPM shell will die. Set ALLOW_VERSION_MISMATCH=1 or use a matching image."
@@ -485,7 +530,15 @@ preflight() {
 lw_run_dir() { echo "$OUT_ROOT/layerwise/$1"; }
 lw_csv()     { echo "$(lw_run_dir "$1")/layerwise.csv"; }
 
-stage_layerwise() {
+stage_layerwise() (
+  local IMAGE="$VLLM_IMAGE"
+  local RUN_DIR="$OUT_ROOT/.runtime/layerwise"
+  local NAME_PREFIX="aic-layerwise-${BASHPID}"
+  local RUNTIME_LOG_FILE="$LOG_DIR/layerwise-runtime.log"
+  reset_outer_runtime_state
+  trap 'runtime_teardown >/dev/null 2>&1 || true' EXIT
+  runtime_prepare || die "runtime '${RUNTIME}' preparation failed for image '${IMAGE}'"
+
   local slug hf kind moe; local m
   for m in "${MODELS[@]}"; do
     IFS='|' read -r slug hf kind moe <<<"$m"
@@ -499,6 +552,7 @@ stage_layerwise() {
     local model_policy_env=()
     local model_policy_args=()
     local auth_env=()
+    local runtime_hf_token=""
     if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
       collect_model="$METADATA_MODEL_CONTAINER"
       model_mount=(-v "$MODEL:$METADATA_MODEL_CONTAINER:ro")
@@ -513,7 +567,8 @@ stage_layerwise() {
       )
       model_policy_args=(--extra-vllm-arg=--load-format=dummy)
     else
-      auth_env=(-e HF_TOKEN="$(hf_token_value)")
+      runtime_hf_token="$(hf_token_value)"
+      auth_env=(-e HF_TOKEN)
     fi
 
     # In-container collect command (modeled on the committed run_layerwise_smoke.sh).
@@ -542,8 +597,8 @@ python3 -m collector.layerwise.vllm.collect \
   --latency-source ${LW_LATENCY_SOURCE} ${model_policy_args[*]}
 EOS
 )
-    HF_TOKEN="$(hf_token_value)" run "$LOG_DIR/${unit}.log" \
-      docker run --rm --entrypoint bash --gpus "\"device=${LW_GPUS}\"" --ipc=host --network=host \
+    local -a layerwise_runtime_opts=(
+      --entrypoint bash --ipc=host --network=host \
         -v "$NSYS_TARGET_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:ro" \
         -v "$NSYS_IMPORTER_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:ro" \
         -v "$AIC_REPO:/workspace" \
@@ -557,12 +612,16 @@ EOS
         "${model_policy_env[@]}" \
         -e TILELANG_CACHE_DIR=/home/dynamo/.cache/vllm/tilelang \
         -e TILELANG_TMP_DIR=/home/dynamo/.cache/vllm/tilelang/tmp \
-        -w /workspace "$VLLM_IMAGE" -lc "$incmd"
+        -w /workspace
+    )
+    RUNTIME_LOG_FILE="$LOG_DIR/${unit}.log"
+    HF_TOKEN="$runtime_hf_token" runtime_run_oneshot "" "\"device=${LW_GPUS}\"" layerwise_runtime_opts -- \
+      -lc "$incmd"
 
     [[ "$DRY_RUN" == "1" || -f "$rdir/layerwise.csv" ]] || die "layerwise.csv not produced in $rdir"
     mark_done "$unit"
   done
-}
+)
 
 # ============================================================================
 # Stage: fpm (8xGPU real Dynamo deployment, one run per pareto point)

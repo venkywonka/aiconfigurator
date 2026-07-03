@@ -4,10 +4,12 @@
 # DRY_RUN transcript tests for the RUNTIME indirection in collect_fpm_metrics.sh.
 import os
 import pathlib
+import re
 import subprocess
 
 SCRIPT = "collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh"
 RUNTIME_SCRIPT = "collector/layerwise/fpm_ground_truth/runtime.sh"
+OUTER_SCRIPT = "collector/layerwise/reproduce_layerwise_fpm.sh"
 
 
 def _dry_run(env_extra):
@@ -30,6 +32,26 @@ def _dry_run(env_extra):
     return out.stdout + out.stderr
 
 
+def _outer_dry_run(tmp_path, env_extra):
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "STAGES": "layerwise",
+        "MODEL": "Qwen/Qwen3-0.6B",
+        "OUT_ROOT": str(tmp_path / "outer-output"),
+    }
+    env.pop("AIC_MODEL_MODE", None)
+    env.update(env_extra)
+    result = subprocess.run(
+        ["bash", OUTER_SCRIPT],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return result, result.stdout + result.stderr
+
+
 def test_runtime_indirection_was_wired():
     """Fail-first guard: pre-Task-1, RUNTIME was not sourced; docker run -d
     appeared regardless of RUNTIME=process.  Post-Task-1, runtime.sh routes
@@ -38,8 +60,7 @@ def test_runtime_indirection_was_wired():
     """
     t = _dry_run({"RUNTIME": "process"})
     assert "docker run -d" not in t, (
-        "RUNTIME=process must NOT emit docker run -d "
-        "(runtime.sh indirection was not wired)"
+        "RUNTIME=process must NOT emit docker run -d (runtime.sh indirection was not wired)"
     )
     assert "process mode not implemented" in t, (
         "RUNTIME=process must print the 'process mode not implemented' die message"
@@ -72,12 +93,8 @@ def test_docker_mode_nsys_exec_in_transcript():
     that runtime_exec_worker emits the correct docker exec command.
     """
     t = _dry_run({"RUNTIME": "docker", "NSYS_PROFILE_WORKER": "1"})
-    assert "docker exec" in t, (
-        "NSYS_PROFILE_WORKER=1 must emit 'docker exec' via runtime_exec_worker"
-    )
-    assert "nsys" in t, (
-        "NSYS_PROFILE_WORKER=1 must include 'nsys' in the exec command"
-    )
+    assert "docker exec" in t, "NSYS_PROFILE_WORKER=1 must emit 'docker exec' via runtime_exec_worker"
+    assert "nsys" in t, "NSYS_PROFILE_WORKER=1 must include 'nsys' in the exec command"
 
 
 def test_full_worker_nsys_waits_for_primary_application_only():
@@ -248,7 +265,34 @@ def test_smoke_scheduler_budget_is_not_below_vllm_model_length():
     assert 'FPM_MAX_NUM_BATCHED_TOKENS="40960"' in smoke_block
 
 
-def test_docker_mode_dumps_frontend_and_worker_logs_when_model_registration_fails():
+def test_enroot_mode_nsys_dry_run_previews_exec_without_live_pid():
+    t = _dry_run({"RUNTIME": "enroot", "NSYS_PROFILE_WORKER": "1"})
+
+    assert "Enroot worker" not in t
+    assert "not running" not in t
+    assert "enroot exec" in t
+    assert "nsys" in t
+
+
+def test_enroot_dry_run_needs_no_runtime_binary_image_or_state(tmp_path):
+    run_dir = tmp_path / "enroot-preview"
+    t = _dry_run(
+        {
+            "RUNTIME": "enroot",
+            "RUN_DIR": str(run_dir),
+            "NAME_PREFIX": "enroot-preview",
+            "ENROOT_BIN": str(tmp_path / "missing-enroot"),
+            "SETSID_BIN": str(tmp_path / "missing-setsid"),
+            "ENROOT_IMAGE_PATH": str(tmp_path / "missing-image.sqsh"),
+        }
+    )
+
+    assert "runtime error" not in t.lower()
+    assert "enroot start" in t
+    assert not (run_dir / ".runtime/enroot").exists()
+
+
+def test_runtime_dumps_frontend_and_worker_logs_when_model_registration_fails():
     """If the frontend is alive but /v1/models never contains the target model,
     the failure branch must dump frontend/worker logs so CI postmortems can see
     whether the worker crashed, is downloading config/tokenizer, or registered a
@@ -258,8 +302,126 @@ def test_docker_mode_dumps_frontend_and_worker_logs_when_model_registration_fail
     source = pathlib.Path(SCRIPT).read_text()
 
     assert "model registration timed out" in source
-    assert 'docker logs "${FRONTEND_NAME}"' in source
-    assert 'docker logs "${WORKER_NAME}"' in source
+    assert 'runtime_logs "${FRONTEND_NAME}"' in source
+    assert 'runtime_logs "${WORKER_NAME}"' in source
+
+
+def test_collect_driver_routes_every_docker_dependency_through_runtime():
+    """Explicit Enroot mode must not require any collector-side Docker binary."""
+    source = pathlib.Path(SCRIPT).read_text()
+    raw_docker = re.compile(r"\bdocker\b")
+    offending_lines = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or stripped.startswith("log "):
+            continue
+        if raw_docker.search(stripped):
+            offending_lines.append(stripped)
+
+    assert offending_lines == []
+    for runtime_api in (
+        "runtime_prepare",
+        "runtime_container_exists",
+        "runtime_run_oneshot",
+        "runtime_logs",
+        "runtime_stop",
+    ):
+        assert runtime_api in source
+
+
+def test_version_probe_keeps_docker_network_isolation_and_uses_host_for_enroot():
+    source = pathlib.Path(SCRIPT).read_text()
+    block = re.search(
+        r"VERSION_CHECK_RUNTIME_OPTS=.*?log \"Verifying image",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert block is not None
+    assert "--network none" in block.group(0)
+    assert '"${RUNTIME}" == "enroot"' in block.group(0)
+    assert "--network host" in block.group(0)
+
+
+def test_outer_version_probe_keeps_docker_network_isolation_and_uses_host_for_enroot():
+    source = pathlib.Path(OUTER_SCRIPT).read_text()
+    block = re.search(
+        r"runtime_image_version\(\).*?runtime_prepare",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert block is not None
+    assert "--network none" in block.group(0)
+    assert '"${RUNTIME}" == "enroot"' in block.group(0)
+    assert "--network host" in block.group(0)
+
+
+def test_cleanup_is_armed_before_every_runtime_prepare():
+    inner = pathlib.Path(SCRIPT).read_text()
+    outer = pathlib.Path(OUTER_SCRIPT).read_text()
+
+    assert inner.index("CLEANUP_ENABLED=1") < inner.index("runtime_prepare")
+    for function_name in ("runtime_image_version()", "stage_layerwise()"):
+        function_start = outer.index(function_name)
+        prepare = outer.index("runtime_prepare", function_start)
+        trap = outer.index("trap 'runtime_teardown", function_start)
+        assert trap < prepare
+
+
+def test_outer_driver_routes_every_docker_dependency_through_runtime():
+    """Layerwise must use the same native backend as the nested FPM driver."""
+    source = pathlib.Path(OUTER_SCRIPT).read_text()
+    raw_docker = re.compile(r"\bdocker\b")
+    offending_lines = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or stripped.startswith(("log ", "warn ")):
+            continue
+        executable = stripped.split("#", 1)[0]
+        if raw_docker.search(executable):
+            offending_lines.append(executable.rstrip())
+
+    assert offending_lines == []
+    assert "runtime_prepare" in source
+    assert "runtime_run_oneshot" in source
+
+
+def test_outer_layerwise_enroot_dry_run_needs_no_docker_or_runtime_binary(tmp_path):
+    result, transcript = _outer_dry_run(
+        tmp_path,
+        {
+            "RUNTIME": "enroot",
+            "ENROOT_BIN": str(tmp_path / "missing-enroot"),
+            "SETSID_BIN": str(tmp_path / "missing-setsid"),
+            "ENROOT_IMAGE_PATH": str(tmp_path / "missing-image.sqsh"),
+            "NSYS_TARGET_HOST_DIR": str(tmp_path / "missing-nsys-target"),
+            "NSYS_IMPORTER_HOST_DIR": str(tmp_path / "missing-nsys-importer"),
+        },
+    )
+
+    assert result.returncode == 0, transcript
+    assert "docker run" not in transcript
+    assert "enroot start" in transcript
+
+
+def test_outer_layerwise_docker_dry_run_does_not_execute_runtime_binary(tmp_path):
+    docker_marker = tmp_path / "docker-executed"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f"#!/usr/bin/env bash\nprintf executed > {docker_marker!s}\nexit 97\n")
+    fake_docker.chmod(0o755)
+
+    result, transcript = _outer_dry_run(
+        tmp_path,
+        {
+            "RUNTIME": "docker",
+            "DOCKER_BIN": str(fake_docker),
+        },
+    )
+
+    assert result.returncode == 0, transcript
+    assert str(fake_docker) in transcript
+    assert not docker_marker.exists()
 
 
 def test_docker_mode_worker_command_uses_clean_weightless_defaults():
