@@ -145,6 +145,42 @@ def test_send_requests_real_workload_scales_dataset_shapes_to_large_distribution
     assert max(osls) == 4096
 
 
+def test_send_requests_synthetic_shapes_are_deterministic_without_dataset_access(
+    tmp_path,
+    monkeypatch,
+):
+    def fail_dataset_access(*args, **kwargs):
+        raise AssertionError("synthetic shape generation must not touch a dataset or network helper")
+
+    monkeypatch.setattr(send_requests, "load_openassistant_shapes", fail_dataset_access)
+    monkeypatch.setattr(send_requests, "load_openassistant_shapes_with_datasets", fail_dataset_access)
+    monkeypatch.setattr(send_requests, "load_openassistant_shapes_with_hub_jsonl", fail_dataset_access)
+    first = _send_args(
+        tmp_path,
+        requests=16,
+        max_model_len=32768,
+        prompt_token_seed=2026,
+        real_workload=True,
+        real_workload_dataset="must-not-be-read/dataset",
+        real_workload_shape_source="synthetic",
+    )
+    second = _send_args(
+        tmp_path,
+        requests=16,
+        max_model_len=32768,
+        prompt_token_seed=2026,
+        real_workload=True,
+        real_workload_dataset="must-not-be-read/dataset",
+        real_workload_shape_source="synthetic",
+    )
+
+    first_shapes, first_source = send_requests.real_workload_values(first)
+    second_shapes, second_source = send_requests.real_workload_values(second)
+
+    assert first_shapes == second_shapes
+    assert first_source == second_source == "synthetic_large_shape_distribution"
+
+
 def test_summarize_fpm_classifies_context_decode_and_mixed_rows(tmp_path):
     detail_path = tmp_path / "detail.csv"
     output_path = tmp_path / "phase.csv"

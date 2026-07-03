@@ -641,6 +641,29 @@ def test_inner_fpm_driver_metadata_mode_stages_local_model_and_forces_offline_du
     assert "hf.token" not in transcript
 
 
+def test_inner_fpm_metadata_mode_pins_synthetic_shape_seed_without_outer_driver(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / "bundle"
+    _create_metadata_bundle(bundle)
+
+    result = _run_inner_driver(
+        tmp_path,
+        bundle,
+        overrides={
+            "REAL_WORKLOAD_REQUESTS": "1",
+            "SKIP_REQUESTS": "0",
+            "WARMUP_REQUESTS": "0",
+        },
+    )
+    transcript = result.stdout + result.stderr
+
+    assert result.returncode == 0, transcript
+    assert " --real-workload-shape-source synthetic --real-workload-isl-min " in transcript
+    # The real-workload segment adds its stable 2e9 offset to the metadata-mode base seed 0.
+    assert " --prompt-token-seed 2000000000 --real-workload " in transcript
+
+
 def test_inner_fpm_metadata_mode_uses_private_job_cache_for_worker_and_requests(
     tmp_path: Path,
 ) -> None:

@@ -626,6 +626,7 @@ if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
     AIC_LOAD_FORMAT=dummy
     FPM_REAL_WORKLOAD_SHAPE_SOURCE=synthetic
     REAL_WORKLOAD_SHAPE_SOURCE=synthetic
+    PROMPT_TOKEN_SEED="${PROMPT_TOKEN_SEED:-0}"
     HF_HUB_OFFLINE=1
     TRANSFORMERS_OFFLINE=1
     HF_DATASETS_OFFLINE=1
@@ -636,6 +637,7 @@ if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
         FPM_REAL_WORKLOAD_SHAPE_SOURCE \
         HF_DATASETS_OFFLINE \
         HF_HUB_OFFLINE \
+        PROMPT_TOKEN_SEED \
         TRANSFORMERS_OFFLINE
 fi
 
