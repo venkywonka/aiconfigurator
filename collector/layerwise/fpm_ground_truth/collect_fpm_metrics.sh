@@ -1117,6 +1117,7 @@ snapshot_effective_vllm_config() {
     local snapshot_rc=0
     run docker run --rm \
         --network host \
+        --gpus "${GPUS}" \
         -v "${RUN_DIR}:/work" \
         -v "${HF_HOME_HOST}:/work/hf-home" \
         "${HF_TOKEN_DOCKER_MOUNTS[@]}" \

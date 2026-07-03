@@ -272,3 +272,18 @@ def test_docker_mode_worker_command_uses_clean_weightless_defaults():
     assert "--load-format dummy" in t or "--load-format=dummy" in t
     assert "--no-enable-prefix-caching" in t
     assert "--no-enable-chunked-prefill" in t
+
+
+def test_effective_config_snapshot_container_has_worker_gpu_visibility():
+    """Resolving vLLM's effective config requires CUDA device inference.
+
+    The snapshot helper runs in a short-lived container before the worker.  It
+    must receive the same Docker GPU selection as the worker or vLLM 0.20.1
+    fails device inference and writes metadata with ``effective_config=null``.
+    """
+    source = pathlib.Path(SCRIPT).read_text()
+    snapshot = source.split("snapshot_effective_vllm_config()", maxsplit=1)[1].split(
+        "resolved_max_model_len()", maxsplit=1
+    )[0]
+
+    assert '--gpus "${GPUS}"' in snapshot
