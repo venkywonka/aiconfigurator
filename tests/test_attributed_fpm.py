@@ -300,6 +300,69 @@ def test_profiled_rows_are_sliced_to_requested_step_windows():
     ]
 
 
+def test_decode_step_window_is_relative_to_joinable_decode_steps():
+    """A fixed global window can cover only warmup at high concurrency.
+
+    Preserve the requested ordinal window width, but rebase it onto the ordered
+    real-workload steps that can join the clean FPM lane so c64/c128 attribution
+    still samples useful decode work.
+    """
+    from collector.layerwise.diagnostics.aic_fpm_attribute import (
+        filter_profiled_decode_step_window,
+    )
+
+    # Warmup decode is present in the absolute 40-200 window, but none of its
+    # shapes occur in the clean FPM lane.
+    rows = [
+        {"step": step, "measure_run": 0, "batch_size": 1, "past_kv": 1_000 + step}
+        for step in range(1, 301)
+    ]
+    # Duplicate each joinable real-workload step to model --per-pid output.
+    # Selection is by unique step ordinal, not by row count or rank count.
+    rows += [
+        {
+            "step": step,
+            "measure_run": 0,
+            "batch_size": 64,
+            "past_kv": 10_000 + step,
+            "pid": pid,
+        }
+        for step in range(301, 601)
+        for pid in (0, 1)
+    ]
+    clean_fpm_shapes = {(64, 10_000 + step) for step in range(301, 601)}
+
+    selected = filter_profiled_decode_step_window(
+        rows, "40-200", shape_keys=clean_fpm_shapes
+    )
+
+    assert {row["step"] for row in selected} == set(range(340, 501))
+    assert len(selected) == 161 * 2
+    assert all(row["batch_size"] > 0 for row in selected)
+
+
+def test_collect_generation_batch_grid_from_fresh_layerwise_layout():
+    from collector.layerwise.diagnostics.aic_fpm_attribute import (
+        _collect_generation_batch_grid,
+    )
+
+    layerwise = {
+        "qwen/qwen3-32b": {
+            "GEN": {
+                8: {
+                    1: {4096: {"latency_ms": 1.0}},
+                    16: {4096: {"latency_ms": 2.0}},
+                    64: {4096: {"latency_ms": 3.0}},
+                }
+            }
+        }
+    }
+
+    assert _collect_generation_batch_grid(
+        layerwise, model="Qwen/Qwen3-32B", tp_size=8
+    ) == {1, 16, 64}
+
+
 def test_attribute_driver_threads_window_into_posthoc_decomposition():
     from pathlib import Path
 

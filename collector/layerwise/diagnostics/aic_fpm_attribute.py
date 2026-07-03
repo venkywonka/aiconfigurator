@@ -27,11 +27,7 @@ from collections import defaultdict
 from typing import Any
 
 
-def filter_profiled_step_window(rows: list[dict[str, Any]], spec: str) -> list[dict[str, Any]]:
-    """Keep rows whose bench-step ordinal falls in ``lo-hi[,lo-hi...]``."""
-    if not spec.strip():
-        return list(rows)
-
+def _parse_step_window(spec: str) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     for part in spec.split(","):
         bounds = part.strip().split("-", maxsplit=1)
@@ -43,11 +39,63 @@ def filter_profiled_step_window(rows: list[dict[str, Any]], spec: str) -> list[d
         if lo > hi:
             raise ValueError(f"invalid descending step window {part!r}")
         ranges.append((lo, hi))
+    return ranges
 
+
+def filter_profiled_step_window(rows: list[dict[str, Any]], spec: str) -> list[dict[str, Any]]:
+    """Keep rows whose absolute bench-step ordinal is in ``lo-hi[,lo-hi...]``."""
+    if not spec.strip():
+        return list(rows)
+
+    ranges = _parse_step_window(spec)
     return [
         row
         for row in rows
         if any(lo <= int(row["step"]) <= hi for lo, hi in ranges)
+    ]
+
+
+def filter_profiled_decode_step_window(
+    rows: list[dict[str, Any]],
+    spec: str,
+    *,
+    shape_keys: set[tuple[int, int]] | None = None,
+) -> list[dict[str, Any]]:
+    """Apply a step window relative to joinable decode steps in each measure run.
+
+    At high concurrency the requested absolute bench-step window can be entirely
+    warmup or pure prefill. This selector preserves the requested ordinal ranges
+    but applies them to ordered unique decode steps, optionally limited to shapes
+    present in the clean FPM lane. Duplicate per-PID rows therefore do not change
+    the selected window.
+    """
+    decode_rows = [
+        row
+        for row in rows
+        if int(row.get("batch_size", 0)) > 0
+        and (
+            shape_keys is None
+            or (int(row["batch_size"]), int(row["past_kv"])) in shape_keys
+        )
+    ]
+    if not spec.strip():
+        return decode_rows
+
+    ranges = _parse_step_window(spec)
+    steps_by_run: dict[int, set[int]] = defaultdict(set)
+    for row in decode_rows:
+        steps_by_run[int(row.get("measure_run", 0))].add(int(row["step"]))
+
+    selected: set[tuple[int, int]] = set()
+    for measure_run, steps in steps_by_run.items():
+        for ordinal, step in enumerate(sorted(steps), start=1):
+            if any(lo <= ordinal <= hi for lo, hi in ranges):
+                selected.add((measure_run, step))
+
+    return [
+        row
+        for row in decode_rows
+        if (int(row.get("measure_run", 0)), int(row["step"])) in selected
     ]
 
 
@@ -501,6 +549,28 @@ def _collect_context_kv_grid(
     return kv_grid
 
 
+def _collect_generation_batch_grid(
+    layerwise_data: dict[str, Any], *, model: str, tp_size: int
+) -> set[int]:
+    """Return batch sizes with collected GEN rows for the requested model/TP."""
+    try:
+        model_data = layerwise_data[model.lower()]["GEN"][tp_size]
+    except (KeyError, TypeError):
+        return set()
+
+    batches: set[int] = set()
+    if not isinstance(model_data, dict):
+        return batches
+    for batch_size, seq_data in model_data.items():
+        if not isinstance(seq_data, dict) or not seq_data:
+            continue
+        try:
+            batches.add(int(batch_size))
+        except (TypeError, ValueError):
+            continue
+    return batches
+
+
 def _resolve_config_lane(gap_mod, run_dir, tp, out_dir):
     """Resolve the effective-config subdir + peers for one FPM lane (AIC-1205 / #31).
 
@@ -552,8 +622,9 @@ def _main(argv=None):
     p.add_argument(
         "--step-window",
         default="",
-        help="post-hoc bench-step ordinal window(s), lo-hi[,lo-hi...], used to slice "
-             "full-worker Nsight captures to the measured workload interval",
+        help="post-hoc bench-step ordinal window(s), lo-hi[,lo-hi...]; decode ordinals "
+             "are relative to clean-FPM-joinable real-workload steps, while context "
+             "continues to use absolute bench-step ordinals",
     )
     p.add_argument(
         "--per-pid",
@@ -719,13 +790,45 @@ def _main(argv=None):
     # Reduce the nsys lane once; both decode and context phases share the profiled rows
     # (decode keys on per-(batch,kv) rows, context aggregates the bs0 pure-prefill rows).
     from collector.layerwise.diagnostics.analyze_nsys_comm_overlap import analyze_sqlite
-    profiled_rows, _meta = analyze_sqlite(args.sqlite, per_pid=args.per_pid)
-    profiled_rows = filter_profiled_step_window(profiled_rows, args.step_window)
+    all_profiled_rows, _meta = analyze_sqlite(args.sqlite, per_pid=args.per_pid)
+    profiled_rows = filter_profiled_step_window(all_profiled_rows, args.step_window)
     if args.step_window and not profiled_rows:
         raise SystemExit(f"no profiled rows matched --step-window {args.step_window!r}")
 
+    fpm_shape_keys = set(_bin_fpm_wall_to_profiled_key(fpm_wall))
+    generation_batches = _collect_generation_batch_grid(
+        db.layerwise, model=G.MODEL_NAME, tp_size=args.tp
+    )
+    attributable_shape_keys = {
+        key
+        for key in fpm_shape_keys
+        if not generation_batches or key[0] in generation_batches
+    }
+
+    if args.step_window:
+        decode_profiled_rows = filter_profiled_decode_step_window(
+            all_profiled_rows,
+            args.step_window,
+            shape_keys=attributable_shape_keys,
+        )
+        if not decode_profiled_rows:
+            raise SystemExit(
+                f"no decode rows shared by the clean FPM lane and layerwise GEN grid "
+                f"matched relative --step-window "
+                f"{args.step_window!r}"
+            )
+        selected_steps = sorted({int(row["step"]) for row in decode_profiled_rows})
+        print(
+            f"[attribute] applied --step-window {args.step_window!r} relative to "
+            f"{len(selected_steps)} attributable real-workload decode steps "
+            f"(global {selected_steps[0]}-{selected_steps[-1]})",
+            file=sys.stderr,
+        )
+    else:
+        decode_profiled_rows = all_profiled_rows
+
     rows = run_decode_attribution(
-        sqlite_path=args.sqlite, profiled_rows=profiled_rows,
+        sqlite_path=args.sqlite, profiled_rows=decode_profiled_rows,
         fpm_wall_by_shape=fpm_wall, aic_predict=aic_predict,
         discard_first_n=args.discard_first_n,
         ranks=args.tp, per_pid=args.per_pid,
