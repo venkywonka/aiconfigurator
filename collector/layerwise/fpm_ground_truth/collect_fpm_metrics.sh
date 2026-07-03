@@ -106,6 +106,9 @@ REQUEST_RETRIES="${REQUEST_RETRIES:-3}"
 REQUEST_RETRY_BACKOFF_SECONDS="${REQUEST_RETRY_BACKOFF_SECONDS:-2}"
 REQUEST_ALLOW_FAILURES="${REQUEST_ALLOW_FAILURES:-0}"
 START_TIMEOUT_SECONDS="${START_TIMEOUT_SECONDS:-900}"
+FPM_COLLECTOR_READY_TIMEOUT_SECONDS="${FPM_COLLECTOR_READY_TIMEOUT_SECONDS:-30}"
+FPM_COLLECTOR_DATA_READY_TIMEOUT_SECONDS="${FPM_COLLECTOR_DATA_READY_TIMEOUT_SECONDS:-30}"
+FPM_READINESS_PROBE_IN_SKIP_REQUESTS="${FPM_READINESS_PROBE_IN_SKIP_REQUESTS:-0}"
 POST_REQUEST_COLLECT_SECONDS="${POST_REQUEST_COLLECT_SECONDS:-3}"
 VARY_ISL_OSL="${VARY_ISL_OSL:-1}"
 REQUEST_ENDPOINT="${REQUEST_ENDPOINT:-completions}"
@@ -120,6 +123,13 @@ MEASUREMENT_MODE="${MEASUREMENT_MODE:-deployment-parity}"
 NSYS_PROFILE_WORKER="${NSYS_PROFILE_WORKER:-0}"
 NSYS_BIN="${NSYS_BIN:-nsys}"
 NSYS_HOST_DIR="${NSYS_HOST_DIR:-}"
+AIC_NODE_ARCH="${AIC_NODE_ARCH:-}"
+NSYS_TARGET_HOST_DIR="${NSYS_TARGET_HOST_DIR:-}"
+NSYS_IMPORTER_HOST_DIR="${NSYS_IMPORTER_HOST_DIR:-}"
+NSYS_CONTAINER_ROOT="${NSYS_CONTAINER_ROOT:-/opt/nvidia/nsight-systems}"
+NSYS_TARGET_CONTAINER_DIR="${NSYS_TARGET_CONTAINER_DIR:-}"
+NSYS_IMPORTER_CONTAINER_DIR="${NSYS_IMPORTER_CONTAINER_DIR:-}"
+NSYS_BIN_CONTAINER="${NSYS_BIN_CONTAINER:-}"
 NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx}"
 NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE:-node}"
 NSYS_PROFILE_TRAFFIC_ONLY="${NSYS_PROFILE_TRAFFIC_ONLY:-1}"
@@ -301,6 +311,32 @@ log() {
 die() {
     log "ERROR: $*"
     exit 1
+}
+
+resolve_nsight_architecture() {
+    [[ "${NSYS_PROFILE_WORKER}" == "1" ]] || return 0
+
+    local observed expected layout_output
+    observed="$(uname -m)" || die "failed to read allocated node architecture"
+    expected="${AIC_NODE_ARCH:-${observed}}"
+    if ! layout_output="$(
+        python3 "${COMMON_DIR}/nsight_arch.py" \
+            --expected "${expected}" --observed "${observed}" 2>&1
+    )"; then
+        die "Nsight architecture validation failed: ${layout_output}"
+    fi
+
+    local -a layout=()
+    mapfile -t layout <<< "${layout_output}"
+    [[ "${#layout[@]}" == "2" && -n "${layout[0]}" && -n "${layout[1]}" ]] || \
+        die "Nsight architecture resolver returned an invalid layout"
+
+    AIC_NODE_ARCH="${expected}"
+    export AIC_NODE_ARCH
+    NSYS_TARGET_HOST_DIR="${NSYS_TARGET_HOST_DIR:-${NSYS_HOST_DIR:+${NSYS_HOST_DIR}/${layout[0]}}}"
+    NSYS_IMPORTER_HOST_DIR="${NSYS_IMPORTER_HOST_DIR:-${NSYS_HOST_DIR:+${NSYS_HOST_DIR}/${layout[1]}}}"
+    NSYS_TARGET_CONTAINER_DIR="${NSYS_TARGET_CONTAINER_DIR:-${NSYS_CONTAINER_ROOT}/${layout[0]}}"
+    NSYS_IMPORTER_CONTAINER_DIR="${NSYS_IMPORTER_CONTAINER_DIR:-${NSYS_CONTAINER_ROOT}/${layout[1]}}"
 }
 
 run() {
@@ -720,11 +756,18 @@ REQUEST_WORKLOAD_CSV="${RUN_DIR}/request_workload.csv"
 REQUEST_WORKLOAD_IN_CONTAINER="/work/request_workload.csv"
 WARMUP_WORKLOAD_CSV="${RUN_DIR}/warmup_workload.csv"
 WARMUP_WORKLOAD_IN_CONTAINER="/work/warmup_workload.csv"
+READINESS_PROBE_WORKLOAD_IN_CONTAINER="/work/readiness_probe_workload.csv"
 RUN_METADATA_JSON="${RUN_DIR}/vllm_metadata.json"
 RUN_EFFECTIVE_CONFIG_JSON="${RUN_DIR}/effective_vllm_config.json"
 RUN_EFFECTIVE_CONFIG_IN_CONTAINER="/work/effective_vllm_config.json"
 SEGMENT_FILE="${RUN_DIR}/fpm_segment.txt"
 SEGMENT_IN_CONTAINER="/work/fpm_segment.txt"
+FPM_COLLECTOR_READY_FILE="${RUN_DIR}/fpm_collector.ready"
+FPM_COLLECTOR_READY_IN_CONTAINER="/work/fpm_collector.ready"
+FPM_COLLECTOR_READY_TOKEN="${NAME_PREFIX}-collector-ready-${BASHPID}-${RANDOM}-${RANDOM}"
+FPM_COLLECTOR_DATA_READY_FILE="${RUN_DIR}/fpm_collector.data-ready"
+FPM_COLLECTOR_DATA_READY_IN_CONTAINER="/work/fpm_collector.data-ready"
+FPM_COLLECTOR_DATA_READY_TOKEN="${NAME_PREFIX}-collector-data-ready-${BASHPID}-${RANDOM}-${RANDOM}"
 NSYS_WORKER_OUTPUT_BASE="${RUN_DIR}/nsys/fpm_worker"
 NSYS_WORKER_OUTPUT_IN_CONTAINER="/work/nsys/fpm_worker"
 MODEL_IN_CONTAINER="${MODEL}"
@@ -770,6 +813,7 @@ if [ -n "$NSYS_CUDA_PROFILER_WINDOW" ]; then
     )
 fi
 NSYS_DOCKER_MOUNTS=()
+NSYS_COMMAND_PREFIX=()
 # When the worker is profiled under nsys, bind-mount the aiconfigurator repo
 # read-only and put it on PYTHONPATH so the spawned `python3 -m dynamo.vllm`
 # worker auto-imports sitecustomize (collector/layerwise/vllm), which installs
@@ -833,10 +877,49 @@ fi
 if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
     if [[ -z "${NSYS_HOST_DIR}" && "${NSYS_BIN}" == /* && -x "${NSYS_BIN}" ]]; then
         NSYS_HOST_DIR="$(dirname "${NSYS_BIN}")"
+        if [[ "$(basename "${NSYS_HOST_DIR}")" == "bin" ]]; then
+            NSYS_HOST_DIR="$(dirname "${NSYS_HOST_DIR}")"
+        fi
     fi
+fi
+resolve_nsight_architecture
+if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
     if [[ -n "${NSYS_HOST_DIR}" ]]; then
-        [[ -d "${NSYS_HOST_DIR}" ]] || die "--nsys-host-dir does not exist: ${NSYS_HOST_DIR}"
-        NSYS_DOCKER_MOUNTS=(-v "${NSYS_HOST_DIR}:${NSYS_HOST_DIR}:ro")
+        NSYS_BIN_HOST="${NSYS_BIN}"
+        if [[ "${NSYS_BIN_HOST}" != /* ]]; then
+            NSYS_BIN_HOST="${NSYS_HOST_DIR}/bin/${NSYS_BIN_HOST}"
+        fi
+        NSYS_BIN_CONTAINER="${NSYS_BIN_CONTAINER:-${NSYS_CONTAINER_ROOT}/bin/$(basename "${NSYS_BIN_HOST}")}"
+        if [[ "${DRY_RUN}" != "1" ]]; then
+            [[ -d "${NSYS_TARGET_HOST_DIR}" ]] || \
+                die "Nsight target directory missing: ${NSYS_TARGET_HOST_DIR}"
+            [[ -d "${NSYS_IMPORTER_HOST_DIR}" ]] || \
+                die "Nsight importer directory missing: ${NSYS_IMPORTER_HOST_DIR}"
+            [[ -x "${NSYS_BIN_HOST}" ]] || \
+                die "Nsight nsys executable missing: ${NSYS_BIN_HOST}"
+        fi
+        NSYS_DOCKER_MOUNTS=(
+            -v "${NSYS_TARGET_HOST_DIR}:${NSYS_TARGET_CONTAINER_DIR}:ro"
+            -v "${NSYS_IMPORTER_HOST_DIR}:${NSYS_IMPORTER_CONTAINER_DIR}:ro"
+            -v "$(dirname "${NSYS_BIN_HOST}"):$(dirname "${NSYS_BIN_CONTAINER}"):ro"
+        )
+        NSYS_BIN="${NSYS_BIN_CONTAINER}"
+        NSYS_COMMAND_PREFIX=(
+            sh -c '
+                nsys_bin_dir=$1
+                nsys_target=$2
+                nsys_importer=$3
+                shift 3
+                export PATH="${nsys_bin_dir}:${nsys_target}:${PATH}"
+                if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+                    export LD_LIBRARY_PATH="${nsys_target}:${nsys_importer}:${LD_LIBRARY_PATH}"
+                else
+                    export LD_LIBRARY_PATH="${nsys_target}:${nsys_importer}"
+                fi
+                exec "$@"
+            ' _ "$(dirname "${NSYS_BIN_CONTAINER}")" \
+            "${NSYS_TARGET_CONTAINER_DIR}" "${NSYS_IMPORTER_CONTAINER_DIR}"
+        )
     fi
 fi
 
@@ -862,6 +945,20 @@ if (( REQUEST_ALLOW_FAILURES < 0 )); then
 fi
 if (( FILE_DISCOVERY_TOUCH_SECONDS < 0 )); then
     die "invalid file discovery touch interval: ${FILE_DISCOVERY_TOUCH_SECONDS}"
+fi
+if ! [[ "${FPM_COLLECTOR_READY_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    die "FPM_COLLECTOR_READY_TIMEOUT_SECONDS must be a positive integer, got '${FPM_COLLECTOR_READY_TIMEOUT_SECONDS}'"
+fi
+if ! [[ "${FPM_COLLECTOR_DATA_READY_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    die "FPM_COLLECTOR_DATA_READY_TIMEOUT_SECONDS must be a positive integer, got '${FPM_COLLECTOR_DATA_READY_TIMEOUT_SECONDS}'"
+fi
+if [[ "${FPM_READINESS_PROBE_IN_SKIP_REQUESTS}" != "0" && \
+      "${FPM_READINESS_PROBE_IN_SKIP_REQUESTS}" != "1" ]]; then
+    die "FPM_READINESS_PROBE_IN_SKIP_REQUESTS must be 0 or 1, got '${FPM_READINESS_PROBE_IN_SKIP_REQUESTS}'"
+fi
+REQUIRE_FPM_DATA_READY=1
+if [[ "${SKIP_REQUESTS}" == "1" && "${FPM_READINESS_PROBE_IN_SKIP_REQUESTS}" != "1" ]]; then
+    REQUIRE_FPM_DATA_READY=0
 fi
 if [[ -n "${TP_SIZE}" ]]; then
     TP_SIZE="$(single_parallel_size "TP_SIZE" "${TP_SIZE}")"
@@ -1319,6 +1416,56 @@ send_request_workload() {
     return "${request_rc}"
 }
 
+send_fpm_readiness_probe() {
+    local probe_driver_cmd=(
+        python3 /work/send_requests.py
+        --url "http://127.0.0.1:${HTTP_PORT}"
+        --model "${MODEL_REQUEST_NAME}"
+        --requests 1
+        --concurrency 1
+        --max-tokens 1
+        --prompt-token-mode "${PROMPT_TOKEN_MODE}"
+        --prompt-token-seed "${PROMPT_TOKEN_SEED:-0}"
+        --endpoint "${REQUEST_ENDPOINT}"
+        --isl-min 1
+        --isl-max 1
+        --osl-min 1
+        --osl-max 1
+        --isl-values 1
+        --osl-values 1
+        --vary-isl-osl
+        --workload-output "${READINESS_PROBE_WORKLOAD_IN_CONTAINER}"
+        --workload-label readiness-probe
+        --request-index-offset 0
+        # The collector subscribes to the base FPM port, which belongs to DP
+        # rank 0. Pin the probe so internal DP load balancing cannot send its
+        # only active frame to an unobserved rank.
+        --dp-rank 0
+        --timeout "${REQUEST_TIMEOUT_SECONDS}"
+        --retries "${REQUEST_RETRIES}"
+        --retry-backoff "${REQUEST_RETRY_BACKOFF_SECONDS}"
+        --allow-failures 0
+    )
+    if [[ "${IGNORE_EOS}" == "1" ]]; then
+        probe_driver_cmd+=(--ignore-eos)
+    fi
+
+    local probe_runtime_opts=(
+        --network host
+        -v "${RUN_DIR}:/work"
+        -v "${HF_HOME_HOST}:/work/hf-home"
+        "${HF_TOKEN_DOCKER_MOUNTS[@]}"
+        -e "HF_HOME=/work/hf-home"
+        -e "HF_HUB_CACHE=/work/hf-home/hub"
+        -e "TRANSFORMERS_CACHE=/work/hf-home/transformers"
+        "${MODEL_POLICY_DOCKER_ENV[@]}"
+    )
+    log "Sending synchronous one-request FPM readiness probe"
+    runtime_run_oneshot "readiness-probe-driver" "" probe_runtime_opts -- \
+        "${HF_TOKEN_CONTAINER_PREFIX[@]}" \
+        "${probe_driver_cmd[@]}"
+}
+
 decode_prefix_warmup_enabled() {
     [[ "${WORKLOAD_PLAN}" == "sweep" ]] || return 1
     [[ "${DECODE_PREFIX_WARMUP}" == "1" ]] || return 1
@@ -1372,12 +1519,111 @@ warm_decode_prefix_cache() {
     return "${warmup_rc}"
 }
 
+fail_fpm_collector_readiness() {
+    log "ERROR: $1"
+    log "FPM collector log tail:"
+    runtime_logs "${COLLECTOR_NAME}" --tail=120 >&2 || true
+    return 1
+}
+
+wait_for_fpm_collector_ready() {
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        return 0
+    fi
+
+    local started_at="${SECONDS}" marker_payload=""
+    while true; do
+        if [[ -L "${FPM_COLLECTOR_READY_FILE}" || \
+              ( -e "${FPM_COLLECTOR_READY_FILE}" && ! -f "${FPM_COLLECTOR_READY_FILE}" ) ]]; then
+            fail_fpm_collector_readiness \
+                "invalid FPM collector readiness marker (expected a regular file, never a symlink)"
+            return 1
+        fi
+        if [[ -f "${FPM_COLLECTOR_READY_FILE}" ]]; then
+            if ! marker_payload="$(<"${FPM_COLLECTOR_READY_FILE}")"; then
+                continue
+            fi
+            if [[ "${marker_payload}" != "${FPM_COLLECTOR_READY_TOKEN}" ]]; then
+                fail_fpm_collector_readiness \
+                    "invalid FPM collector readiness marker token"
+                return 1
+            fi
+            if ! runtime_status "${COLLECTOR_NAME}"; then
+                fail_fpm_collector_readiness \
+                    "FPM collector exited before readiness could be accepted"
+                return 1
+            fi
+            rm -f -- "${FPM_COLLECTOR_READY_FILE}"
+            log "FPM collector transport handshake is ready"
+            return 0
+        fi
+        if ! runtime_status "${COLLECTOR_NAME}"; then
+            fail_fpm_collector_readiness \
+                "FPM collector exited before transport readiness"
+            return 1
+        fi
+        if (( SECONDS - started_at >= FPM_COLLECTOR_READY_TIMEOUT_SECONDS )); then
+            fail_fpm_collector_readiness \
+                "timed out after ${FPM_COLLECTOR_READY_TIMEOUT_SECONDS}s waiting for FPM collector transport handshake"
+            return 1
+        fi
+        sleep 0.05
+    done
+}
+
+wait_for_fpm_collector_data_ready() {
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        return 0
+    fi
+
+    local started_at="${SECONDS}" marker_payload=""
+    while true; do
+        if [[ -L "${FPM_COLLECTOR_DATA_READY_FILE}" || \
+              ( -e "${FPM_COLLECTOR_DATA_READY_FILE}" && \
+                ! -f "${FPM_COLLECTOR_DATA_READY_FILE}" ) ]]; then
+            fail_fpm_collector_readiness \
+                "invalid FPM collector data-readiness marker (expected a regular file, never a symlink)"
+            return 1
+        fi
+        if [[ -f "${FPM_COLLECTOR_DATA_READY_FILE}" ]]; then
+            if ! marker_payload="$(<"${FPM_COLLECTOR_DATA_READY_FILE}")"; then
+                continue
+            fi
+            if [[ "${marker_payload}" != "${FPM_COLLECTOR_DATA_READY_TOKEN}" ]]; then
+                fail_fpm_collector_readiness \
+                    "invalid FPM collector data-readiness marker token"
+                return 1
+            fi
+            if ! runtime_status "${COLLECTOR_NAME}"; then
+                fail_fpm_collector_readiness \
+                    "FPM collector exited before data readiness could be accepted"
+                return 1
+            fi
+            rm -f -- "${FPM_COLLECTOR_DATA_READY_FILE}"
+            log "FPM collector decoded data path is ready"
+            return 0
+        fi
+        if ! runtime_status "${COLLECTOR_NAME}"; then
+            fail_fpm_collector_readiness \
+                "FPM collector exited before data readiness"
+            return 1
+        fi
+        if (( SECONDS - started_at >= FPM_COLLECTOR_DATA_READY_TIMEOUT_SECONDS )); then
+            fail_fpm_collector_readiness \
+                "timed out after ${FPM_COLLECTOR_DATA_READY_TIMEOUT_SECONDS}s waiting for FPM collector data readiness"
+            return 1
+        fi
+        sleep 0.05
+    done
+}
+
 start_nsys_worker_collection() {
     if [[ "${NSYS_PROFILE_WORKER}" != "1" || "${NSYS_PROFILE_TRAFFIC_ONLY}" != "1" ]]; then
         return
     fi
     log "Starting Nsight worker collection session ${NSYS_SESSION_NAME}"
-    runtime_exec_worker "${NSYS_BIN}" start --session "${NSYS_SESSION_NAME}" || \
+    runtime_exec_worker "${NSYS_COMMAND_PREFIX[@]}" \
+        "${NSYS_BIN}" start --session "${NSYS_SESSION_NAME}" || \
         log "WARNING: failed to start Nsight session ${NSYS_SESSION_NAME}"
 }
 
@@ -1386,7 +1632,8 @@ stop_nsys_worker_collection() {
         return
     fi
     log "Stopping Nsight worker collection session ${NSYS_SESSION_NAME}"
-    runtime_exec_worker "${NSYS_BIN}" stop --session "${NSYS_SESSION_NAME}" || \
+    runtime_exec_worker "${NSYS_COMMAND_PREFIX[@]}" \
+        "${NSYS_BIN}" stop --session "${NSYS_SESSION_NAME}" || \
         log "WARNING: failed to stop Nsight session ${NSYS_SESSION_NAME}"
 }
 
@@ -1439,6 +1686,7 @@ WORKER_CMD=(
 WORKER_CONTAINER_CMD=("${WORKER_CMD[@]}")
 if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
     WORKER_CONTAINER_CMD=(
+        "${NSYS_COMMAND_PREFIX[@]}"
         "${NSYS_BIN}" profile
         "--trace=${NSYS_TRACE}"
         "--cuda-graph-trace=${NSYS_CUDA_GRAPH_TRACE}"
@@ -1525,16 +1773,53 @@ fi
 
 log "Starting FPM collector container ${COLLECTOR_NAME}"
 COLLECTOR_DOCKER_OPTS=()
-runtime_launch_detached "collector" "" "COLLECTOR_DOCKER_OPTS" -- \
-    python3 /work/fpm_collect.py \
-        --port "${FPM_PORT}" \
-        --output "${COLLECTOR_OUTPUT_IN_CONTAINER}" \
-        --detail-output "${COLLECTOR_DETAIL_IN_CONTAINER}" \
-        --segment-file "${SEGMENT_IN_CONTAINER}"
-
 if [[ "${DRY_RUN}" != "1" ]]; then
-    # Avoid ZMQ slow-joiner loss on the first prefill iteration.
-    sleep 1
+    if [[ -L "${FPM_COLLECTOR_READY_FILE}" || -f "${FPM_COLLECTOR_READY_FILE}" ]]; then
+        rm -f -- "${FPM_COLLECTOR_READY_FILE}"
+    elif [[ -e "${FPM_COLLECTOR_READY_FILE}" ]]; then
+        die "cannot replace non-file FPM collector readiness path: ${FPM_COLLECTOR_READY_FILE}"
+    fi
+    if [[ "${REQUIRE_FPM_DATA_READY}" == "1" ]]; then
+        if [[ -L "${FPM_COLLECTOR_DATA_READY_FILE}" || \
+              -f "${FPM_COLLECTOR_DATA_READY_FILE}" ]]; then
+            rm -f -- "${FPM_COLLECTOR_DATA_READY_FILE}"
+        elif [[ -e "${FPM_COLLECTOR_DATA_READY_FILE}" ]]; then
+            die "cannot replace non-file FPM collector data-readiness path: ${FPM_COLLECTOR_DATA_READY_FILE}"
+        fi
+    fi
+fi
+FPM_COLLECTOR_CMD=(
+    python3 /work/fpm_collect.py
+    --port "${FPM_PORT}"
+    --output "${COLLECTOR_OUTPUT_IN_CONTAINER}"
+    --detail-output "${COLLECTOR_DETAIL_IN_CONTAINER}"
+    --segment-file "${SEGMENT_IN_CONTAINER}"
+    --ready-file "${FPM_COLLECTOR_READY_IN_CONTAINER}"
+    --ready-token "${FPM_COLLECTOR_READY_TOKEN}"
+    --ready-timeout "${FPM_COLLECTOR_READY_TIMEOUT_SECONDS}"
+)
+if [[ "${REQUIRE_FPM_DATA_READY}" == "1" ]]; then
+    FPM_COLLECTOR_CMD+=(
+        --data-ready-file "${FPM_COLLECTOR_DATA_READY_IN_CONTAINER}"
+        --data-ready-token "${FPM_COLLECTOR_DATA_READY_TOKEN}"
+    )
+fi
+runtime_launch_detached "collector" "" "COLLECTOR_DOCKER_OPTS" -- \
+    "${FPM_COLLECTOR_CMD[@]}"
+
+wait_for_fpm_collector_ready || die "FPM collector readiness failed"
+
+if [[ "${REQUIRE_FPM_DATA_READY}" == "1" ]]; then
+    if [[ "${DRY_RUN}" != "1" ]]; then
+        printf '%s\n' "readiness-probe" > "${SEGMENT_FILE}"
+    fi
+    send_fpm_readiness_probe || die "FPM readiness probe failed"
+    wait_for_fpm_collector_data_ready || die "FPM collector data readiness failed"
+    if [[ "${DRY_RUN}" != "1" ]]; then
+        printf '%s\n' "measurement-pending" > "${SEGMENT_FILE}"
+    fi
+else
+    log "SKIP_REQUESTS manual mode is transport-ready only; decoded data readiness was not claimed"
 fi
 
 start_nsys_worker_collection
@@ -1627,7 +1912,11 @@ send_real_workload() {
 
 REQUEST_SEND_RC=0
 if [[ "${SKIP_REQUESTS}" == "1" ]]; then
-    log "Skipping sample requests. Collector is running; send traffic to http://127.0.0.1:${HTTP_PORT}."
+    if [[ "${REQUIRE_FPM_DATA_READY}" == "1" ]]; then
+        log "Skipping measured sample requests after readiness probe. Collector is running; send traffic to http://127.0.0.1:${HTTP_PORT}."
+    else
+        log "Collector is running; send traffic to http://127.0.0.1:${HTTP_PORT}."
+    fi
 elif [[ "${WORKLOAD_PLAN}" == "sweep" ]]; then
     if [[ "${RUN_SWEEP}" == "1" ]]; then
         send_sweep_workloads || REQUEST_SEND_RC=$?

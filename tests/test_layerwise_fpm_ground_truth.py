@@ -61,6 +61,36 @@ def test_send_requests_labels_and_appends_workload_csv(tmp_path):
     assert [int(row["target_isl"]) for row in rows] == [4, 8, 4, 16]
 
 
+def test_send_requests_uses_supported_nvext_for_only_an_explicit_dp_rank(monkeypatch):
+    payloads = []
+
+    def capture_payload(_url, payload, _timeout):
+        payloads.append(payload)
+        return 200, b""
+
+    monkeypatch.setattr(send_requests, "post_json", capture_payload)
+    args = argparse.Namespace(
+        model="test-model",
+        ignore_eos=False,
+        endpoint="completions",
+        url="http://127.0.0.1:8000",
+        timeout=1.0,
+        retries=0,
+        retry_backoff=0.0,
+        dp_rank=0,
+    )
+    spec = {"index": 0, "prompt": "probe", "target_osl": 1}
+
+    send_requests.send_one(spec, args)
+    args.dp_rank = None
+    send_requests.send_one(spec, args)
+
+    assert payloads[0]["nvext"] == {"dp_rank": 0}
+    assert "routing" not in payloads[0]
+    assert "nvext" not in payloads[1]
+    assert "routing" not in payloads[1]
+
+
 def test_send_requests_prompt_seed_is_optional_and_reproducible_when_set(tmp_path):
     seeded_first = _send_args(tmp_path, prompt_token_seed=123, prompt_rng=random.Random(999))
     seeded_second = _send_args(tmp_path, prompt_token_seed=123, prompt_rng=random.Random(111))

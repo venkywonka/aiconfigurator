@@ -120,8 +120,12 @@ ALLOW_VERSION_MISMATCH="${ALLOW_VERSION_MISMATCH:-0}"
 # ----------------------------------------------------------------------------
 NSYS_VERSION_DIR="${NSYS_VERSION_DIR:-2026.3.1}"
 NSYS_ROOT="${NSYS_ROOT:-$HOME/.local/opt/nsight-systems-cli-${NSYS_VERSION_DIR}/opt/nvidia/nsight-systems-cli/${NSYS_VERSION_DIR}}"
-NSYS_TARGET_HOST_DIR="${NSYS_TARGET_HOST_DIR:-$NSYS_ROOT/target-linux-x64}"
-NSYS_IMPORTER_HOST_DIR="${NSYS_IMPORTER_HOST_DIR:-$NSYS_ROOT/host-linux-x64}"
+AIC_NODE_ARCH="${AIC_NODE_ARCH:-}"
+NSYS_TARGET_HOST_DIR="${NSYS_TARGET_HOST_DIR:-}"
+NSYS_IMPORTER_HOST_DIR="${NSYS_IMPORTER_HOST_DIR:-}"
+NSYS_TARGET_CONTAINER_DIR=""
+NSYS_IMPORTER_CONTAINER_DIR=""
+NSYS_BIN_CONTAINER_DIR=""
 
 # ----------------------------------------------------------------------------
 # Caches / auth
@@ -305,6 +309,55 @@ warn() { printf '%s[driver WARN]%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
 err()  { printf '%s[driver ERROR]%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
+layerwise_needs_nsight() {
+  case "$LW_LATENCY_SOURCE" in
+    auto|schedule_to_update|worker_wall|execute_model_gpu) return 1;;
+    *) return 0;;
+  esac
+}
+
+resolve_nsight_architecture() {
+  local stage requires_nsight=0
+  for stage in $STAGES; do
+    if [[ "$stage" == "attribute" ]] || \
+       { [[ "$stage" == "layerwise" ]] && layerwise_needs_nsight; }; then
+      requires_nsight=1
+    fi
+  done
+  [[ "$requires_nsight" == "1" ]] || return 0
+
+  local observed expected layout_output
+  observed="$(uname -m)" || die "failed to read allocated node architecture"
+  expected="${AIC_NODE_ARCH:-$observed}"
+  if ! layout_output="$(
+    python3 "$SCRIPT_DIR/common/nsight_arch.py" \
+      --expected "$expected" --observed "$observed" 2>&1
+  )"; then
+    die "Nsight architecture validation failed: $layout_output"
+  fi
+  local -a layout=()
+  mapfile -t layout <<< "$layout_output"
+  [[ "${#layout[@]}" == "2" && -n "${layout[0]}" && -n "${layout[1]}" ]] || \
+    die "Nsight architecture resolver returned an invalid layout"
+
+  AIC_NODE_ARCH="$expected"
+  export AIC_NODE_ARCH
+  NSYS_TARGET_HOST_DIR="${NSYS_TARGET_HOST_DIR:-$NSYS_ROOT/${layout[0]}}"
+  NSYS_IMPORTER_HOST_DIR="${NSYS_IMPORTER_HOST_DIR:-$NSYS_ROOT/${layout[1]}}"
+  NSYS_TARGET_CONTAINER_DIR="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/${layout[0]}"
+  NSYS_IMPORTER_CONTAINER_DIR="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/${layout[1]}"
+  NSYS_BIN_CONTAINER_DIR="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/bin"
+
+  if [[ "$DRY_RUN" != "1" ]]; then
+    [[ -d "$NSYS_TARGET_HOST_DIR" ]] || \
+      die "Nsight target directory missing: $NSYS_TARGET_HOST_DIR"
+    [[ -d "$NSYS_IMPORTER_HOST_DIR" ]] || \
+      die "Nsight importer directory missing: $NSYS_IMPORTER_HOST_DIR"
+    [[ -x "$NSYS_ROOT/bin/nsys" ]] || \
+      die "Nsight nsys executable missing: $NSYS_ROOT/bin/nsys"
+  fi
+}
+
 # run <logfile> <cmd...> : echo, then exec (or just echo under DRY_RUN), tee to log.
 run() {
   local logf="$1"; shift
@@ -481,8 +534,9 @@ preflight() {
     *) warn "OUT_ROOT=$OUT_ROOT fstype=$fstype -- nsys export may fail with 'database is locked'. Use local ext4.";;
   esac
 
-  # NSYS host dirs (layerwise)
-  if [[ " $STAGES " == *" layerwise "* ]]; then
+  # NSYS host dirs (attribute or an explicitly nsys-backed layerwise source)
+  if [[ " $STAGES " == *" attribute "* ]] || \
+     { [[ " $STAGES " == *" layerwise "* ]] && layerwise_needs_nsight; }; then
     [[ -d "$NSYS_TARGET_HOST_DIR" ]]   || warn "NSYS target dir missing: $NSYS_TARGET_HOST_DIR (set NSYS_ROOT/NSYS_TARGET_HOST_DIR)."
     [[ -d "$NSYS_IMPORTER_HOST_DIR" ]] || warn "NSYS importer dir missing: $NSYS_IMPORTER_HOST_DIR."
   fi
@@ -574,12 +628,30 @@ stage_layerwise() (
     # In-container collect command (modeled on the committed run_layerwise_smoke.sh).
     # Decode rows must carry the paired FPM scheduler surface; max-decode-batch-size
     # only bounds datapoint generation and does not set max_num_seqs.
-    local incmd
+    local incmd nsys_preamble=""
+    local -a layerwise_nsys_args=(--nsys-capture none)
+    local -a layerwise_nsys_mounts=()
+    if layerwise_needs_nsight; then
+      nsys_preamble=$(cat <<EOS
+export PATH="${NSYS_BIN_CONTAINER_DIR}:${NSYS_TARGET_CONTAINER_DIR}:\$PATH"
+if [[ -n "\${LD_LIBRARY_PATH:-}" ]]; then
+  export LD_LIBRARY_PATH="${NSYS_TARGET_CONTAINER_DIR}:${NSYS_IMPORTER_CONTAINER_DIR}:\${LD_LIBRARY_PATH}"
+else
+  export LD_LIBRARY_PATH="${NSYS_TARGET_CONTAINER_DIR}:${NSYS_IMPORTER_CONTAINER_DIR}"
+fi
+${NSYS_BIN_CONTAINER_DIR}/nsys --version
+EOS
+)
+      layerwise_nsys_args=(--nsys-capture full)
+      layerwise_nsys_mounts=(
+        -v "$NSYS_ROOT/bin:$NSYS_BIN_CONTAINER_DIR:ro"
+        -v "$NSYS_TARGET_HOST_DIR:$NSYS_TARGET_CONTAINER_DIR:ro"
+        -v "$NSYS_IMPORTER_HOST_DIR:$NSYS_IMPORTER_CONTAINER_DIR:ro"
+      )
+    fi
     incmd=$(cat <<EOS
 set -euo pipefail
-export PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:\$PATH"
-export LD_LIBRARY_PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:\${LD_LIBRARY_PATH:-}"
-nsys --version
+${nsys_preamble}
 python3 -m collector.layerwise.vllm.collect \
   --run-dir /results \
   --model "${collect_model}" --model-kind "${kind}" \
@@ -594,13 +666,12 @@ python3 -m collector.layerwise.vllm.collect \
   --gpus ${LW_GPUS} --max-workers 1 \
   --max-model-len ${LW_MAX_MODEL_LEN} \
   --gpu-memory-utilization ${LW_GPU_MEM_UTIL} \
-  --latency-source ${LW_LATENCY_SOURCE} ${model_policy_args[*]}
+  --latency-source ${LW_LATENCY_SOURCE} ${layerwise_nsys_args[*]} ${model_policy_args[*]}
 EOS
 )
     local -a layerwise_runtime_opts=(
       --entrypoint bash --ipc=host --network=host \
-        -v "$NSYS_TARGET_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:ro" \
-        -v "$NSYS_IMPORTER_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:ro" \
+        "${layerwise_nsys_mounts[@]}" \
         -v "$AIC_REPO:/workspace" \
         -v "$rdir:/results" \
         "${model_mount[@]}" \
@@ -883,6 +954,8 @@ stage_attribute() {
       # LOAD_FORMAT=dummy -> vLLM random weights (no checkpoint download). Valid for the
       # timing/comm mechanism study: kernels are shape-driven (value-independent), Qwen3-32B
       # is dense (no MoE routing), and IGNORE_EOS fixes decode length. Default empty = real weights.
+      local extra=()
+      [[ "$ALLOW_VERSION_MISMATCH" == "1" ]] && extra+=(--allow-version-mismatch --expected-vllm-version "$VLLM_VERSION")
       local extra_vllm=()
       [[ -n "${LOAD_FORMAT:-}" ]] && extra_vllm+=(--extra-vllm-arg="--load-format=${LOAD_FORMAT}")
 
@@ -912,7 +985,15 @@ stage_attribute() {
       else
         attribute_env_args+=("HF_TOKEN=$(hf_token_value)")
       fi
-      attribute_env_args+=("NSYS_BIN=$NSYS_ROOT/bin/nsys" "NSYS_HOST_DIR=$NSYS_ROOT")
+      attribute_env_args+=(
+        "NSYS_BIN=$NSYS_ROOT/bin/nsys"
+        "NSYS_HOST_DIR=$NSYS_ROOT"
+        "NSYS_CONTAINER_ROOT=/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}"
+        "NSYS_TARGET_HOST_DIR=$NSYS_TARGET_HOST_DIR"
+        "NSYS_IMPORTER_HOST_DIR=$NSYS_IMPORTER_HOST_DIR"
+        "NSYS_TARGET_CONTAINER_DIR=$NSYS_TARGET_CONTAINER_DIR"
+        "NSYS_IMPORTER_CONTAINER_DIR=$NSYS_IMPORTER_CONTAINER_DIR"
+      )
       run_env "$LOG_DIR/${unit}.log" \
         "${attribute_env_args[@]}" -- \
         python3 -m collector.layerwise.fpm.collect \
@@ -921,6 +1002,7 @@ stage_attribute() {
           "${workload[@]}" \
           --prompt-token-mode safe_ascii --warmup-requests "$FPM_WARMUP_REQUESTS" \
           --image "$DYNAMO_VLLM_IMAGE" --run-dir "$rdir" \
+          "${extra[@]}" \
           "${extra_vllm[@]}" \
           "${attribute_nsys_flags[@]}" || collect_rc=$?
 
@@ -1059,8 +1141,8 @@ stage_attribute() {
     local measured_segment="real"
     [[ "$ATTRIBUTE_REAL_WORKLOAD" == "0" ]] && measured_segment="sweep"
     local lwcsv; lwcsv="$(lw_csv "$slug")"
-    run_env "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" \
-      "$LOG_DIR/${semantic_unit}.log" \
+    run_env "$LOG_DIR/${semantic_unit}.log" \
+      "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" -- \
       python3 -m collector.layerwise.diagnostics.semantic_fpm_stage1 \
         "${cohort_args[@]}" \
         --output-dir "$semantic_out" \
@@ -1091,6 +1173,7 @@ stage_attribute() {
 main() {
   cd "$AIC_REPO"
   apply_pipeline_policy
+  resolve_nsight_architecture
   log "repo=$AIC_REPO"
   preflight
   for stage in $STAGES; do

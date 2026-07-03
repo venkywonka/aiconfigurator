@@ -7,6 +7,8 @@ import pathlib
 import re
 import subprocess
 
+import pytest
+
 SCRIPT = "collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh"
 RUNTIME_SCRIPT = "collector/layerwise/fpm_ground_truth/runtime.sh"
 OUTER_SCRIPT = "collector/layerwise/reproduce_layerwise_fpm.sh"
@@ -449,3 +451,123 @@ def test_effective_config_snapshot_container_has_worker_gpu_visibility():
     )[0]
 
     assert '--gpus "${GPUS}"' in snapshot
+
+
+@pytest.mark.parametrize("runtime", ("docker", "enroot"))
+def test_collector_dry_run_previews_tokenized_readiness_without_waiting(tmp_path, runtime):
+    run_dir = tmp_path / "readiness-preview"
+
+    transcript = _dry_run(
+        {
+            "RUNTIME": runtime,
+            "RUN_DIR": str(run_dir),
+            "FPM_COLLECTOR_READY_TIMEOUT_SECONDS": "7",
+            "FPM_READINESS_PROBE_IN_SKIP_REQUESTS": "1",
+            "ENROOT_BIN": str(tmp_path / "missing-enroot"),
+            "SETSID_BIN": str(tmp_path / "missing-setsid"),
+            "ENROOT_IMAGE_PATH": str(tmp_path / "missing-image.sqsh"),
+        }
+    )
+
+    assert "--ready-file /work/fpm_collector.ready" in transcript
+    assert "--ready-token " in transcript
+    assert "--ready-timeout 7" in transcript
+    assert "--data-ready-file /work/fpm_collector.data-ready" in transcript
+    assert "--data-ready-token " in transcript
+    assert "--workload-label readiness-probe" in transcript
+    assert "--dp-rank 0" in transcript
+    assert "--isl-values 1" in transcript
+    assert "--osl-values 1" in transcript
+    assert "Skipping measured sample requests after readiness probe" in transcript
+    assert not (run_dir / "fpm_collector.ready").exists(), "dry-run must not create or poll the readiness marker"
+    assert not (run_dir / "fpm_collector.data-ready").exists()
+
+
+@pytest.mark.parametrize("runtime", ("docker", "enroot"))
+def test_skip_requests_defaults_to_transport_only_without_claiming_data_ready(tmp_path, runtime):
+    run_dir = tmp_path / "transport-only-preview"
+
+    transcript = _dry_run(
+        {
+            "RUNTIME": runtime,
+            "RUN_DIR": str(run_dir),
+            "ENROOT_BIN": str(tmp_path / "missing-enroot"),
+            "SETSID_BIN": str(tmp_path / "missing-setsid"),
+            "ENROOT_IMAGE_PATH": str(tmp_path / "missing-image.sqsh"),
+        }
+    )
+
+    assert "--ready-file /work/fpm_collector.ready" in transcript
+    assert "--data-ready-file" not in transcript
+    assert "--workload-label readiness-probe" not in transcript
+    assert ("SKIP_REQUESTS manual mode is transport-ready only; decoded data readiness was not claimed") in transcript
+    assert not (run_dir / "fpm_collector.data-ready").exists()
+
+
+def test_collector_start_uses_readiness_contract_instead_of_fixed_sleep():
+    source = pathlib.Path(SCRIPT).read_text()
+
+    assert "wait_for_fpm_collector_ready" in source
+    assert "wait_for_fpm_collector_data_ready" in source
+    assert "Avoid ZMQ slow-joiner loss" not in source
+    assert not re.search(r"Starting FPM collector.*?\bsleep 1\b", source, flags=re.DOTALL)
+
+
+def test_probe_data_ack_precedes_nsys_and_measured_traffic():
+    source = pathlib.Path(SCRIPT).read_text()
+    collector_start = source.index('log "Starting FPM collector container')
+    probe_start = source.index("printf '%s\\n' \"readiness-probe\"", collector_start)
+    probe_send = source.index("send_fpm_readiness_probe", probe_start)
+    data_wait = source.index("wait_for_fpm_collector_data_ready", probe_send)
+    measurement_pending = source.index("printf '%s\\n' \"measurement-pending\"", data_wait)
+    nsys_start = source.index("start_nsys_worker_collection", measurement_pending)
+    measured_dispatch = source.index('if [[ "${SKIP_REQUESTS}" == "1" ]]', nsys_start)
+
+    assert collector_start < probe_start < probe_send < data_wait
+    assert data_wait < measurement_pending < nsys_start < measured_dispatch
+    assert "readiness-probe-complete" not in source
+
+
+def test_docker_status_requires_running_state_not_name_existence(tmp_path):
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        """#!/usr/bin/env bash
+set -eu
+case "$1" in
+  ps)
+    printf '%s\n' stopped-collector
+    ;;
+  inspect)
+    printf '%s\n' false
+    ;;
+  *)
+    exit 97
+    ;;
+esac
+"""
+    )
+    fake_docker.chmod(0o755)
+    runtime_script = pathlib.Path("collector/layerwise/fpm_ground_truth/runtime.sh").resolve()
+    harness = f"""
+set -Eeuo pipefail
+RUNTIME=docker
+DRY_RUN=0
+DOCKER_BIN={fake_docker!s}
+run() {{ "$@"; }}
+source {runtime_script!s}
+runtime_container_exists stopped-collector
+if runtime_status stopped-collector; then
+  printf 'stopped container reported running\n' >&2
+  exit 92
+fi
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

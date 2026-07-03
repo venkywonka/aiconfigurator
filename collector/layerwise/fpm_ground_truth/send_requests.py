@@ -286,11 +286,7 @@ def load_openassistant_shapes_with_hub_jsonl(dataset_name, *, count, seed, max_m
 
     try:
         files = list_repo_files(dataset_name, repo_type="dataset")
-        candidates = [
-            name
-            for name in files
-            if name.endswith(".jsonl.gz") and ("messages" in name or "trees" in name)
-        ]
+        candidates = [name for name in files if name.endswith(".jsonl.gz") and ("messages" in name or "trees" in name)]
         if not candidates:
             print(f"real_workload_hub_no_jsonl dataset={dataset_name!r}", flush=True)
             return []
@@ -488,8 +484,7 @@ def load_safe_ascii_prompt_token_ids(model, token_config):
     if candidates:
         if load_error is not None:
             print(
-                "safe_ascii_prompt_tokens_loaded_from=tokenizer_json "
-                f"after_error={type(load_error).__name__}",
+                f"safe_ascii_prompt_tokens_loaded_from=tokenizer_json after_error={type(load_error).__name__}",
                 flush=True,
             )
         return candidates
@@ -579,6 +574,8 @@ def send_one(spec, args):
     }
     if args.ignore_eos:
         payload["ignore_eos"] = True
+    if getattr(args, "dp_rank", None) is not None:
+        payload["nvext"] = {"dp_rank": args.dp_rank}
 
     if args.endpoint == "completions":
         payload["prompt"] = spec["prompt"]
@@ -660,6 +657,7 @@ def main() -> int:
     parser.add_argument("--isl-values", default="")
     parser.add_argument("--osl-values", default="")
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--dp-rank", type=int, default=None)
     parser.add_argument("--workload-output", required=True)
     parser.add_argument("--workload-label", default="measured")
     parser.add_argument("--append-workload", action="store_true")
@@ -669,6 +667,8 @@ def main() -> int:
     parser.add_argument("--retry-backoff", type=float, default=2.0)
     parser.add_argument("--allow-failures", type=int, default=0)
     args = parser.parse_args()
+    if args.dp_rank is not None and args.dp_rank < 0:
+        parser.error("--dp-rank must be non-negative")
     args.prompt_rng = random.Random(args.prompt_token_seed)
     args.prompt_token_config = load_random_prompt_token_config(
         args.model,
@@ -726,9 +726,7 @@ def main() -> int:
 
     elapsed = time.monotonic() - start
     print(
-        f"completed={ok}/{args.requests} "
-        f"failed={failed} "
-        f"elapsed_seconds={elapsed:.3f}",
+        f"completed={ok}/{args.requests} failed={failed} elapsed_seconds={elapsed:.3f}",
         flush=True,
     )
     return 0 if ok + failed == args.requests and failed <= args.allow_failures else 1

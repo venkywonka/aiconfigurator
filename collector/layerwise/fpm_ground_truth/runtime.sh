@@ -68,7 +68,7 @@ runtime_docker_container_exists() {
 }
 
 runtime_docker_status() {
-    runtime_docker_container_exists "$1"
+    [[ "$("${DOCKER_BIN}" inspect --format '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]
 }
 
 runtime_docker_launch_detached() {

@@ -611,7 +611,8 @@ runtime_enroot_container_exists() {
 }
 
 runtime_enroot_status() {
-    runtime_enroot_container_exists "$1"
+    _enroot_validate_name "workload" "$1" || return $?
+    _enroot_active_pid "$1" >/dev/null
 }
 
 runtime_enroot_launch_detached() {
@@ -989,6 +990,7 @@ runtime_enroot_logs() {
 
 runtime_enroot_stop() {
     local name="$1" timeout="${2:-10}" pid="" pgid="" own_pgid start_seconds
+    local remaining_pid="" remaining_pgid=""
     _enroot_validate_name "workload" "${name}" || return $?
     [[ "${timeout}" =~ ^[0-9]+$ ]] || {
         _enroot_error "unsupported Enroot stop timeout '${timeout}'"
@@ -1009,11 +1011,12 @@ runtime_enroot_stop() {
     if [[ -n "${pid}" ]]; then
         kill -TERM "${pid}" 2>/dev/null || true
         start_seconds="${SECONDS}"
-        while kill -0 "${pid}" 2>/dev/null; do
+        while _enroot_active_pid "${name}" >/dev/null; do
             (( SECONDS - start_seconds >= timeout )) && break
             sleep 0.05
         done
-        if kill -0 "${pid}" 2>/dev/null && _enroot_active_pid "${name}" >/dev/null; then
+        remaining_pid="$(_enroot_active_pid "${name}")" || remaining_pid=""
+        if [[ "${remaining_pid}" == "${pid}" ]]; then
             kill -KILL "${pid}" 2>/dev/null || true
         fi
         wait "${pid}" 2>/dev/null || true
@@ -1023,11 +1026,12 @@ runtime_enroot_stop() {
     if [[ -n "${pgid}" ]]; then
         kill -TERM -- "-${pgid}" 2>/dev/null || true
         start_seconds="${SECONDS}"
-        while kill -0 -- "-${pgid}" 2>/dev/null; do
+        while _enroot_owned_group_from_state "${name}" >/dev/null; do
             (( SECONDS - start_seconds >= timeout )) && break
             sleep 0.05
         done
-        if kill -0 -- "-${pgid}" 2>/dev/null && _enroot_owned_group_from_state "${name}" >/dev/null; then
+        remaining_pgid="$(_enroot_owned_group_from_state "${name}")" || remaining_pgid=""
+        if [[ "${remaining_pgid}" == "${pgid}" ]]; then
             kill -KILL -- "-${pgid}" 2>/dev/null || true
         fi
     fi
