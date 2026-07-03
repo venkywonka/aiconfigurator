@@ -61,6 +61,18 @@ def _run_main_capturing_layerwise_csv(argv):
 
     with mock.patch.object(G, "DEFAULT_REPO_ROOT", "/repo"), \
             mock.patch.object(G, "_import_repo", return_value=fake_api), \
+            mock.patch.object(
+                G,
+                "resolve_and_verify_runtime_config",
+                return_value={
+                    "tp": 8,
+                    "vllm_max_num_batched_tokens": 40960,
+                    "vllm_max_num_seqs": 256,
+                    "config_source": "test",
+                    "config_mismatch": False,
+                    "config_path": "/run/effective_vllm_config.json",
+                },
+            ), \
             mock.patch.object(G, "build_model_and_db", side_effect=fake_build):
         with pytest.raises(_StopAfterBuild):
             A._main(argv)

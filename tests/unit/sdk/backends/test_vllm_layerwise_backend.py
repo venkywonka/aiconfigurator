@@ -1235,9 +1235,13 @@ def test_mixed_step_adds_decode_only_when_it_exceeds_context_envelope(monkeypatc
         )
 
     def _decode_step(model, database, runtime_config, *, batch_size, past_kv):
-        del model, database, runtime_config, batch_size, past_kv
+        del model, database, runtime_config, batch_size
+        # The mixed-step path subtracts an attention-free past_kv=1 floor.
+        # Keep the full-KV decode 1.5 ms above that floor so this test exercises
+        # the intended additive decode-attention contribution.
+        generation_layerwise = 0.75 if past_kv == 1 else 2.25
         return (
-            {"generation_layerwise": 2.25, "generation_moe": 0.5},
+            {"generation_layerwise": generation_layerwise, "generation_moe": 0.5},
             {"generation_layerwise": 0.25, "generation_moe": 0.5},
             {"generation_layerwise": "silicon", "generation_moe": "silicon"},
         )
