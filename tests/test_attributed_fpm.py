@@ -307,6 +307,23 @@ def test_attribute_driver_threads_window_into_posthoc_decomposition():
     assert '--step-window "$ATTRIBUTE_WINDOW"' in script
 
 
+def test_attribute_driver_refuses_to_mark_empty_decomposition_done():
+    from pathlib import Path
+
+    script = Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+    attribute_stage = script.split("stage_attribute() {", maxsplit=1)[1].split(
+        "# ============================================================================\n# Main", maxsplit=1
+    )[0]
+
+    assert "--allow-empty" not in attribute_stage
+    assert "--allow-empty-decomposition" not in attribute_stage
+    decompose = attribute_stage.index("aic_fpm_attribute")
+    validity_gate = attribute_stage.index("assert_attribution_valid")
+    mark_done = attribute_stage.index('mark_done "$unit"')
+    assert decompose < validity_gate < mark_done
+    assert "|| die" in attribute_stage[decompose:mark_done]
+
+
 # ---------------------------------------------------------------------------
 # TASK A: dynamo_step_marker pure-logic helpers
 # ---------------------------------------------------------------------------

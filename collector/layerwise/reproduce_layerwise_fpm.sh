@@ -747,9 +747,8 @@ stage_attribute() {
       # unit must NOT be stamped .done (the .nsys-rep is retained on disk for manual
       # export+decompose). Aborting loudly forces the run to be fixed and re-attempted.
       if [ -z "$sqlite" ]; then die "no .sqlite under $rdir/nsys for $unit; capture retained, refusing to mark done"; fi
-      # Guard the decompose so a failure (e.g. AIC has no layerwise data for this model)
-      # warns + retains the .nsys-rep/.sqlite for manual decompose instead of aborting the
-      # driver under `set -e` -- the expensive capture must never be lost to a downstream step.
+      # Fail locally when decomposition is empty or invalid. The .nsys-rep/.sqlite stay
+      # under the node-local run directory for diagnosis, and no .done marker is written.
       # --fpm-run is the CLEAN non-profiled FPM run for this pareto point: its wall timing is
       # authoritative and is not perturbed by nsys. --profiled-fpm-run is this attribute run
       # ($rdir), used for runtime-config/provenance only; the sqlite supplies the profiled
@@ -783,8 +782,7 @@ stage_attribute() {
           "${perpid[@]}" \
           "${lwarg[@]}" \
           --out "$rdir/decomposition.csv" \
-          --allow-empty \
-        || warn "decompose failed for $unit (rc=$?); .nsys-rep + .sqlite retained under $rdir/nsys for manual decompose"
+        || die "decompose failed for $unit; .nsys-rep + .sqlite retained under $rdir/nsys, refusing to mark done"
 
       # Fail-closed attribution-validity gate (spec Fix 2): a unit is only stamped
       # .done when attribution is real -- >=1 CUPTI kernel row, >=1 bench_step:: NVTX
@@ -796,7 +794,6 @@ stage_attribute() {
           python3 -m collector.layerwise.diagnostics.assert_attribution_valid \
             --sqlite "$sqlite" \
             --decomposition "$rdir/decomposition.csv" \
-            --allow-empty-decomposition \
           || die "attribution-validity gate failed for $unit; artifacts retained under $rdir, refusing to mark done"
       fi
 
