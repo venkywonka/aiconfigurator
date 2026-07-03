@@ -166,6 +166,10 @@ FPM_WARMUP_REQUESTS="${FPM_WARMUP_REQUESTS:-4}"
 # label step) passed through to --nsys-cuda-profiler-window; ATTRIBUTE_DISCARD_N drops
 # the first N sync-drained boundary steps of each cohort before reducing.
 ATTRIBUTE_WINDOW="${ATTRIBUTE_WINDOW:-100-115}"
+# Full-worker capture records CUPTI kernels across the worker lifetime; the
+# profile is sliced to ATTRIBUTE_WINDOW during analysis.  The legacy
+# cudaProfilerApi window can produce a report with zero kernel rows.
+ATTRIBUTE_FULL_WORKER="${ATTRIBUTE_FULL_WORKER:-1}"
 ATTRIBUTE_DISCARD_N="${ATTRIBUTE_DISCARD_N:-3}"
 # ATTRIBUTE_PER_PID=1 passes --per-pid to aic_fpm_attribute so the decomposition CSV
 # carries accurate per-rank rows (pid column) ALONGSIDE the cross-rank aggregate
@@ -689,6 +693,13 @@ stage_attribute() {
         [[ -n "${DECODE_OSL:-}" ]] && workload+=(--decode-osl "$DECODE_OSL")
       fi
 
+      local attribute_nsys_flags=(--nsys-profile-worker)
+      if [[ "$ATTRIBUTE_FULL_WORKER" == "1" ]]; then
+        attribute_nsys_flags+=(--nsys-full-worker)
+      else
+        attribute_nsys_flags+=(--nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW")
+      fi
+
       local collect_rc=0
       run_env "${seed_env[@]} MAX_NUM_SEQS=$FPM_MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS=$FPM_MAX_NUM_BATCHED_TOKENS ENABLE_CHUNKED_PREFILL=$FPM_ENABLE_CHUNKED_PREFILL HF_TOKEN=$(hf_token_value) NSYS_BIN=$NSYS_ROOT/bin/nsys NSYS_HOST_DIR=$NSYS_ROOT" \
         "$LOG_DIR/${unit}.log" \
@@ -699,7 +710,7 @@ stage_attribute() {
           --prompt-token-mode safe_ascii --warmup-requests "$FPM_WARMUP_REQUESTS" \
           --image "$DYNAMO_VLLM_IMAGE" --run-dir "$rdir" \
           "${extra_vllm[@]}" \
-          --nsys-profile-worker --nsys-cuda-profiler-window "$ATTRIBUTE_WINDOW" || collect_rc=$?
+          "${attribute_nsys_flags[@]}" || collect_rc=$?
 
       local nsysrep; nsysrep="$(ls -1 "$rdir"/nsys/*.nsys-rep 2>/dev/null | head -1 || true)"
       if [[ "$DRY_RUN" != "1" && -z "$nsysrep" ]]; then

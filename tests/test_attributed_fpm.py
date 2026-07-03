@@ -246,6 +246,31 @@ def test_collect_threads_nsys_flags_to_inner_shell():
         assert i < argv.index("--")
 
 
+def test_collect_threads_full_worker_nsys_flag_to_inner_shell():
+    """Full-worker capture must survive both Python forwarding layers.
+
+    The attribute driver needs this mode because the legacy profiler-window
+    capture can produce an nsys report with zero CUPTI kernel rows.
+    """
+    import types
+    from pathlib import Path
+
+    from collector.layerwise.fpm import collect as C
+    from collector.layerwise.fpm import docker as D
+
+    case = types.SimpleNamespace(tp_size=1, ep_size=1, decode_past_kv=4096)
+    args = C._build_arg_parser().parse_args(
+        ["--model", "Qwen/Qwen3-0.6B", "--nsys-profile-worker", "--nsys-full-worker"]
+    )
+
+    assert args.nsys_full_worker is True
+    argv = D.build_collect_command(args, case, Path("/tmp/x")).argv
+    assert "--nsys-profile-worker" in argv
+    assert "--nsys-full-worker" in argv
+    if "--" in argv:
+        assert argv.index("--nsys-full-worker") < argv.index("--")
+
+
 def test_collect_omits_nsys_flags_when_unset():
     import types
     from collector.layerwise.fpm import collect as C
@@ -254,6 +279,7 @@ def test_collect_omits_nsys_flags_when_unset():
     case = types.SimpleNamespace(tp_size=1, ep_size=1, decode_past_kv=4096)
     args = C._build_arg_parser().parse_args(["--model", "Qwen/Qwen3-0.6B"])
     assert args.nsys_profile_worker is False
+    assert args.nsys_full_worker is False
     assert args.nsys_cuda_profiler_window is None
     argv = D.build_collect_command(args, case, __import__("pathlib").Path("/tmp/x")).argv
     assert "--nsys-profile-worker" not in argv

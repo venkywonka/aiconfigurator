@@ -98,6 +98,8 @@ def build_collect_command(args, case: FpmCase, run_dir: Path) -> FpmShellCommand
         argv.append("--allow-version-mismatch")
     if getattr(args, "nsys_profile_worker", False):
         argv.append("--nsys-profile-worker")
+    if getattr(args, "nsys_full_worker", False):
+        argv.append("--nsys-full-worker")
     if getattr(args, "nsys_cuda_profiler_window", None):
         argv.extend(["--nsys-cuda-profiler-window", args.nsys_cuda_profiler_window])
     extra_vllm_args = list(args.extra_vllm_arg or [])

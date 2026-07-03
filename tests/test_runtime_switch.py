@@ -7,6 +7,7 @@ import pathlib
 import subprocess
 
 SCRIPT = "collector/layerwise/fpm_ground_truth/collect_fpm_metrics.sh"
+RUNTIME_SCRIPT = "collector/layerwise/fpm_ground_truth/runtime.sh"
 
 
 def _dry_run(env_extra):
@@ -77,6 +78,109 @@ def test_docker_mode_nsys_exec_in_transcript():
     assert "nsys" in t, (
         "NSYS_PROFILE_WORKER=1 must include 'nsys' in the exec command"
     )
+
+
+def test_full_worker_shutdown_interrupts_profiler_then_waits_for_report_flush():
+    """A service-shaped worker never exits on its own.
+
+    Sending Docker's default SIGTERM to the nsys PID and exhausting the stop
+    timeout leads to SIGKILL, which loses the report.  Full-worker capture must
+    instead use the profiler's interactive SIGINT path and wait for nsys to
+    finish writing the report.
+    """
+    shell = f"""
+set -euo pipefail
+RUN_DIR=/tmp/aic-fpm-test
+WORKER_NAME=test-worker
+DRY_RUN=1
+RUNTIME=docker
+run() {{
+  printf '+'
+  printf ' %q' "$@"
+  printf '\\n'
+}}
+log() {{ printf '%s\\n' "$*"; }}
+die() {{ printf '%s\\n' "$*" >&2; return 1; }}
+source {RUNTIME_SCRIPT}
+runtime_flush_profiled_worker
+"""
+    result = subprocess.run(
+        ["bash", "-c", shell],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    transcript = result.stdout + result.stderr
+
+    assert result.returncode == 0, transcript
+    assert "docker kill --signal=SIGINT test-worker" in transcript
+    assert "timeout 180 docker wait test-worker" in transcript
+
+
+def test_full_worker_flush_timeout_dumps_diagnostics_before_fallback_stop():
+    """A failed graceful flush must leave enough evidence to diagnose nsys."""
+    shell = f"""
+set -euo pipefail
+RUN_DIR=/tmp/aic-fpm-test
+WORKER_NAME=test-worker
+DRY_RUN=0
+RUNTIME=docker
+run() {{ "$@"; }}
+log() {{ printf '%s\\n' "$*"; }}
+die() {{ printf '%s\\n' "$*" >&2; return 1; }}
+docker() {{ printf 'docker'; printf ' %s' "$@"; printf '\\n'; return 0; }}
+timeout() {{ printf 'timeout'; printf ' %s' "$@"; printf '\\n'; return 124; }}
+source {RUNTIME_SCRIPT}
+runtime_flush_profiled_worker
+"""
+    result = subprocess.run(
+        ["bash", "-c", shell],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    transcript = result.stdout + result.stderr
+
+    assert result.returncode == 0, transcript
+    assert "docker top test-worker" in transcript
+    assert "docker logs test-worker" in transcript
+    assert "docker stop -t 10 test-worker" in transcript
+
+
+def test_profile_diagnostics_preserve_nsys_and_worker_evidence():
+    shell = f"""
+set -euo pipefail
+RUN_DIR=/tmp/aic-fpm-test
+WORKER_NAME=test-worker
+DRY_RUN=0
+RUNTIME=docker
+run() {{ "$@"; }}
+log() {{ printf '%s\\n' "$*"; }}
+die() {{ printf '%s\\n' "$*" >&2; return 1; }}
+docker() {{ printf 'docker'; printf ' %s' "$@"; printf '\\n'; return 0; }}
+source {RUNTIME_SCRIPT}
+runtime_dump_profile_diagnostics
+"""
+    result = subprocess.run(
+        ["bash", "-c", shell],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    transcript = result.stdout + result.stderr
+
+    assert result.returncode == 0, transcript
+    assert "docker inspect" in transcript
+    assert "test-worker" in transcript
+    assert "docker logs test-worker" in transcript
+
+
+def test_missing_report_path_invokes_profile_diagnostics():
+    script = pathlib.Path(SCRIPT).read_text()
+    missing_report_branch = script.split(
+        'log "WARNING: no Nsight worker report found under ${RUN_DIR}/nsys"', maxsplit=1
+    )[1].split("\n        fi", maxsplit=1)[0]
+    assert "runtime_dump_profile_diagnostics" in missing_report_branch
 
 
 def test_docker_mode_dumps_frontend_and_worker_logs_when_model_registration_fails():

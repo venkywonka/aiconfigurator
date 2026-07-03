@@ -1597,12 +1597,13 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     fi
     if [[ "${NSYS_PROFILE_WORKER}" == "1" && "${KEEP_RUNNING}" != "1" ]] && container_exists "${WORKER_NAME}"; then
         log "Stopping profiled worker container to flush Nsight report"
-        docker stop -t 60 "${WORKER_NAME}" >/dev/null || true
+        runtime_flush_profiled_worker
         if compgen -G "${RUN_DIR}/nsys/fpm_worker*.nsys-rep" >/dev/null; then
             log "Nsight worker report(s):"
             find "${RUN_DIR}/nsys" -maxdepth 1 -type f -name 'fpm_worker*.nsys-rep' -print >&2
         else
             log "WARNING: no Nsight worker report found under ${RUN_DIR}/nsys"
+            runtime_dump_profile_diagnostics
         fi
     fi
 

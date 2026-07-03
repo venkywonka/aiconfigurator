@@ -102,6 +102,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "profile and write reports under RUN_DIR/nsys (used by the attributed-FPM 'attribute' stage).",
     )
     advanced.add_argument(
+        "--nsys-full-worker",
+        action="store_true",
+        help="Forward to the FPM shell as --nsys-full-worker so Nsight profiles the worker's "
+        "whole lifetime instead of relying on a cudaProfilerApi window.",
+    )
+    advanced.add_argument(
         "--nsys-cuda-profiler-window",
         default=None,
         help="Forward to the FPM shell as --nsys-cuda-profiler-window: windowed "
