@@ -27,6 +27,30 @@ from collections import defaultdict
 from typing import Any
 
 
+def filter_profiled_step_window(rows: list[dict[str, Any]], spec: str) -> list[dict[str, Any]]:
+    """Keep rows whose bench-step ordinal falls in ``lo-hi[,lo-hi...]``."""
+    if not spec.strip():
+        return list(rows)
+
+    ranges: list[tuple[int, int]] = []
+    for part in spec.split(","):
+        bounds = part.strip().split("-", maxsplit=1)
+        try:
+            lo = int(bounds[0])
+            hi = int(bounds[1]) if len(bounds) == 2 else lo
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"invalid step window {part!r}; expected lo-hi[,lo-hi...]") from exc
+        if lo > hi:
+            raise ValueError(f"invalid descending step window {part!r}")
+        ranges.append((lo, hi))
+
+    return [
+        row
+        for row in rows
+        if any(lo <= int(row["step"]) <= hi for lo, hi in ranges)
+    ]
+
+
 def decompose_shape(
     *,
     wall_ms: float,
@@ -526,6 +550,12 @@ def _main(argv=None):
     p.add_argument("--tp", type=int, default=8)
     p.add_argument("--discard-first-n", type=int, default=3)
     p.add_argument(
+        "--step-window",
+        default="",
+        help="post-hoc bench-step ordinal window(s), lo-hi[,lo-hi...], used to slice "
+             "full-worker Nsight captures to the measured workload interval",
+    )
+    p.add_argument(
         "--per-pid",
         action="store_true",
         help="ALSO emit accurate per-rank rows (pid column) alongside the cross-rank "
@@ -690,6 +720,9 @@ def _main(argv=None):
     # (decode keys on per-(batch,kv) rows, context aggregates the bs0 pure-prefill rows).
     from collector.layerwise.diagnostics.analyze_nsys_comm_overlap import analyze_sqlite
     profiled_rows, _meta = analyze_sqlite(args.sqlite, per_pid=args.per_pid)
+    profiled_rows = filter_profiled_step_window(profiled_rows, args.step_window)
+    if args.step_window and not profiled_rows:
+        raise SystemExit(f"no profiled rows matched --step-window {args.step_window!r}")
 
     rows = run_decode_attribution(
         sqlite_path=args.sqlite, profiled_rows=profiled_rows,

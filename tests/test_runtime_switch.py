@@ -189,6 +189,8 @@ def test_driver_never_renders_huggingface_token_value_in_commands():
     assert "HF_TOKEN=$(hf_token_value)" not in driver
     assert '-e HF_TOKEN="$(hf_token_value)"' not in driver
     assert "/run/secrets/hf.token" in driver
+    assert '$OUT_ROOT/.secrets/hf.token' not in driver
+    assert '$HF_HOME/.secrets/hf.token' in driver
 
 
 def test_smoke_scheduler_budget_is_not_below_vllm_model_length():

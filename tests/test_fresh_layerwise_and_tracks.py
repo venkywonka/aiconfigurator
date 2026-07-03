@@ -34,7 +34,7 @@ def test_make_tracks_drops_calibration_lane():
     assert layerwise[-1] == 0.0
 
 
-class _StopAfterBuild(Exception):
+class _StopAfterBuildError(Exception):
     """Raised by the fake build_model_and_db to halt _main right after the call we assert on."""
 
 
@@ -51,7 +51,7 @@ def _run_main_capturing_layerwise_csv(argv):
 
     def fake_build(*args, **kwargs):
         captured["layerwise_csv"] = kwargs.get("layerwise_csv")
-        raise _StopAfterBuild
+        raise _StopAfterBuildError
 
     fake_api = {
         "VLLMBackend": mock.Mock(),
@@ -73,9 +73,8 @@ def _run_main_capturing_layerwise_csv(argv):
                     "config_path": "/run/effective_vllm_config.json",
                 },
             ), \
-            mock.patch.object(G, "build_model_and_db", side_effect=fake_build):
-        with pytest.raises(_StopAfterBuild):
-            A._main(argv)
+            mock.patch.object(G, "build_model_and_db", side_effect=fake_build), pytest.raises(_StopAfterBuildError):
+        A._main(argv)
     return captured["layerwise_csv"]
 
 

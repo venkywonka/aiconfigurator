@@ -1,7 +1,7 @@
 # tests/test_attributed_fpm.py
 import os
-import sys
 import pathlib
+import sys
 from unittest import mock
 
 import pytest
@@ -224,6 +224,7 @@ def test_collect_threads_nsys_flags_to_inner_shell():
     """stage_attribute -> collect.py -> docker.build_collect_command -> collect_fpm_metrics.sh.
     The nsys flags must be parsed by collect.py and threaded into the inner shell argv."""
     import types
+
     from collector.layerwise.fpm import collect as C
     from collector.layerwise.fpm import docker as D
 
@@ -273,6 +274,7 @@ def test_collect_threads_full_worker_nsys_flag_to_inner_shell():
 
 def test_collect_omits_nsys_flags_when_unset():
     import types
+
     from collector.layerwise.fpm import collect as C
     from collector.layerwise.fpm import docker as D
 
@@ -284,6 +286,25 @@ def test_collect_omits_nsys_flags_when_unset():
     argv = D.build_collect_command(args, case, __import__("pathlib").Path("/tmp/x")).argv
     assert "--nsys-profile-worker" not in argv
     assert "--nsys-cuda-profiler-window" not in argv
+
+
+def test_profiled_rows_are_sliced_to_requested_step_windows():
+    from collector.layerwise.diagnostics.aic_fpm_attribute import filter_profiled_step_window
+
+    rows = [{"step": step} for step in (1, 5, 10, 11, 20, 30)]
+
+    assert filter_profiled_step_window(rows, "5-10,20-20") == [
+        {"step": 5},
+        {"step": 10},
+        {"step": 20},
+    ]
+
+
+def test_attribute_driver_threads_window_into_posthoc_decomposition():
+    from pathlib import Path
+
+    script = Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+    assert '--step-window "$ATTRIBUTE_WINDOW"' in script
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +395,8 @@ def test_bench_step_label_exact_format():
 
 
 def test_bench_step_label_roundtrips_through_parser_regex():
-    from collector.layerwise.vllm.dynamo_step_marker import _bench_step_label
     from collector.layerwise.common.parse_nsys_step_sweep import _BENCH_STEP_RE
+    from collector.layerwise.vllm.dynamo_step_marker import _bench_step_label
 
     label = _bench_step_label(42, 64, 4096)
     m = _BENCH_STEP_RE.search(label)

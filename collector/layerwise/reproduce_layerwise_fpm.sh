@@ -339,7 +339,7 @@ materialize_hf_token_file() {
   local token target
   token="$(hf_token_value)"
   [[ -n "$token" ]] || return 1
-  target="$OUT_ROOT/.secrets/hf.token"
+  target="$HF_HOME/.secrets/hf.token"
   mkdir -p "$(dirname "$target")"
   umask 022
   printf '%s' "$token" > "$target"
@@ -795,6 +795,7 @@ stage_attribute() {
           --fpm-run "$clean_fpm_run" \
           --profiled-fpm-run "$rdir" \
           --system "$SYSTEM" --model "$hf" --tp "$TP" \
+          --step-window "$ATTRIBUTE_WINDOW" \
           --discard-first-n "$ATTRIBUTE_DISCARD_N" \
           "${perpid[@]}" \
           "${lwarg[@]}" \
