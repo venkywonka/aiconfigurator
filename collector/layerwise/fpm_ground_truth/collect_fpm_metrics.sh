@@ -1384,6 +1384,7 @@ if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
         "--trace=${NSYS_TRACE}"
         "--cuda-graph-trace=${NSYS_CUDA_GRAPH_TRACE}"
         --trace-fork-before-exec=false
+        --wait=primary
         --sample=none
         --cpuctxsw=none
         --force-overwrite=true

@@ -80,6 +80,22 @@ def test_docker_mode_nsys_exec_in_transcript():
     )
 
 
+def test_full_worker_nsys_waits_for_primary_application_only():
+    """Nsight must not wait forever on multiprocessing children re-parented at shutdown."""
+    transcript = _dry_run(
+        {
+            "RUNTIME": "docker",
+            "NSYS_PROFILE_WORKER": "1",
+            "NSYS_PROFILE_TRAFFIC_ONLY": "0",
+        }
+    )
+    profile_command = next(
+        line for line in transcript.splitlines() if "nsys profile" in line
+    )
+
+    assert "--wait=primary" in profile_command
+
+
 def test_full_worker_shutdown_interrupts_profiler_then_waits_for_report_flush():
     """A service-shaped worker never exits on its own.
 
