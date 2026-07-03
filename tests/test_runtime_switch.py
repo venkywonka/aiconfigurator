@@ -183,14 +183,46 @@ def test_missing_report_path_invokes_profile_diagnostics():
     assert "runtime_dump_profile_diagnostics" in missing_report_branch
 
 
-def test_driver_never_renders_huggingface_token_value_in_commands():
-    driver = pathlib.Path("collector/layerwise/reproduce_layerwise_fpm.sh").read_text()
+def test_layerwise_driver_passes_hf_token_without_rendering_or_materializing_it(tmp_path):
+    token = "sentinel-hf-token-must-stay-secret"
+    env = {
+        **os.environ,
+        "AIC_REPO": str(pathlib.Path.cwd()),
+        "DRY_RUN": "1",
+        "STAGES": "layerwise",
+        "OUT_ROOT": str(tmp_path / "out"),
+        "HF_HOME": str(tmp_path / "hf-cache"),
+        "VLLM_CACHE_HOST": str(tmp_path / "vllm-cache"),
+        "HF_TOKEN": token,
+    }
+    result = subprocess.run(
+        ["bash", "collector/layerwise/reproduce_layerwise_fpm.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    transcript = result.stdout + result.stderr
 
-    assert "HF_TOKEN=$(hf_token_value)" not in driver
-    assert '-e HF_TOKEN="$(hf_token_value)"' not in driver
-    assert "/run/secrets/hf.token" in driver
-    assert '$OUT_ROOT/.secrets/hf.token' not in driver
-    assert '$HF_HOME/.secrets/hf.token' in driver
+    assert result.returncode == 0, transcript
+    assert "-e HF_TOKEN" in transcript
+    assert token not in transcript
+    assert not list(tmp_path.rglob("hf.token"))
+
+
+def test_fpm_driver_passes_inherited_hf_token_to_docker_by_name_only():
+    token = "sentinel-fpm-hf-token-must-stay-secret"
+    transcript = _dry_run(
+        {
+            "RUNTIME": "docker",
+            "HF_TOKEN": token,
+            "HF_TOKEN_FILE": "/definitely/missing/hf.token",
+        }
+    )
+
+    assert "-e HF_TOKEN" in transcript
+    assert token not in transcript
+    assert "/run/secrets/hf.token" not in transcript
 
 
 def test_smoke_scheduler_budget_is_not_below_vllm_model_length():

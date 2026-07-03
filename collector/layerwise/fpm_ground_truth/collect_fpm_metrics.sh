@@ -743,8 +743,12 @@ if [[ "${NSYS_PROFILE_WORKER}" == "1" ]]; then
 fi
 HF_TOKEN_FILE_HOST="${HF_TOKEN_FILE:-/home/shadeform/hf.token}"
 HF_TOKEN_DOCKER_MOUNTS=()
+HF_TOKEN_DOCKER_ENV=()
 HF_TOKEN_CONTAINER_PREFIX=()
-if [[ -f "${HF_TOKEN_FILE_HOST}" ]]; then
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    # Forward the inherited value by variable name so it never appears in argv/logs.
+    HF_TOKEN_DOCKER_ENV=(-e HF_TOKEN)
+elif [[ -f "${HF_TOKEN_FILE_HOST}" ]]; then
     HF_TOKEN_DOCKER_MOUNTS=(-v "${HF_TOKEN_FILE_HOST}:/run/secrets/hf.token:ro")
     HF_TOKEN_CONTAINER_PREFIX=(
         bash
@@ -1116,6 +1120,7 @@ snapshot_effective_vllm_config() {
         -v "${RUN_DIR}:/work" \
         -v "${HF_HOME_HOST}:/work/hf-home" \
         "${HF_TOKEN_DOCKER_MOUNTS[@]}" \
+        "${HF_TOKEN_DOCKER_ENV[@]}" \
         -e "HF_HOME=/work/hf-home" \
         -e "HF_HUB_CACHE=/work/hf-home/hub" \
         -e "TRANSFORMERS_CACHE=/work/hf-home/transformers" \
@@ -1242,6 +1247,7 @@ send_request_workload() {
         -v "${RUN_DIR}:/work" \
         -v "${HF_HOME_HOST}:/work/hf-home" \
         "${HF_TOKEN_DOCKER_MOUNTS[@]}" \
+        "${HF_TOKEN_DOCKER_ENV[@]}" \
         -e "HF_HOME=/work/hf-home" \
         -e "HF_HUB_CACHE=/work/hf-home/hub" \
         -e "TRANSFORMERS_CACHE=/work/hf-home/transformers" \
@@ -1398,6 +1404,7 @@ WORKER_FULL_DOCKER_OPTS=(
     -v "${VLLM_CACHE_HOST}:/home/dynamo/.cache/vllm"
     -v "${VLLM_CACHE_HOST}:/root/.cache/vllm"
     "${HF_TOKEN_DOCKER_MOUNTS[@]}"
+    "${HF_TOKEN_DOCKER_ENV[@]}"
     "${NSYS_DOCKER_MOUNTS[@]}"
     "${NSYS_REPO_DOCKER_MOUNTS[@]}"
     "${WORKER_DOCKER_ENV[@]}"

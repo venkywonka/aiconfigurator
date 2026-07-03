@@ -335,18 +335,6 @@ hf_token_value() {
   echo ""
 }
 
-materialize_hf_token_file() {
-  local token target
-  token="$(hf_token_value)"
-  [[ -n "$token" ]] || return 1
-  target="$HF_HOME/.secrets/hf.token"
-  mkdir -p "$(dirname "$target")"
-  umask 022
-  printf '%s' "$token" > "$target"
-  chmod 0644 "$target"
-  printf '%s\n' "$target"
-}
-
 # ============================================================================
 # Preflight
 # ============================================================================
@@ -427,13 +415,9 @@ stage_layerwise() {
     log "Layerwise: $hf ($kind) tp=$LW_TP_LIST -> $rdir/layerwise.csv"
 
     # In-container collect command (modeled on the committed run_layerwise_smoke.sh).
-    local incmd hf_token_file
-    local hf_secret_mount=()
-    hf_token_file="$(materialize_hf_token_file || true)"
-    [[ -n "$hf_token_file" ]] && hf_secret_mount=(-v "$hf_token_file:/run/secrets/hf.token:ro")
+    local incmd
     incmd=$(cat <<EOS
 set -euo pipefail
-if [[ -s /run/secrets/hf.token ]]; then export HF_TOKEN="\$(tr -d '\\n' < /run/secrets/hf.token)"; fi
 export PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:\$PATH"
 export LD_LIBRARY_PATH="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:\${LD_LIBRARY_PATH:-}"
 nsys --version
@@ -453,7 +437,7 @@ python3 -m collector.layerwise.vllm.collect \
   --latency-source ${LW_LATENCY_SOURCE}
 EOS
 )
-    run "$LOG_DIR/${unit}.log" \
+    HF_TOKEN="$(hf_token_value)" run "$LOG_DIR/${unit}.log" \
       docker run --rm --entrypoint bash --gpus "\"device=${LW_GPUS}\"" --ipc=host --network=host \
         -v "$NSYS_TARGET_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64:ro" \
         -v "$NSYS_IMPORTER_HOST_DIR:/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/host-linux-x64:ro" \
@@ -462,8 +446,7 @@ EOS
         -v "$HF_HOME:/hf-cache" \
         -v "$VLLM_CACHE_HOST:/home/dynamo/.cache/vllm" \
         -v "$VLLM_CACHE_HOST:/root/.cache/vllm" \
-        "${hf_secret_mount[@]}" \
-        -e HF_HOME=/hf-cache -e HF_HUB_CACHE=/hf-cache/hub \
+        -e HF_TOKEN -e HF_HOME=/hf-cache -e HF_HUB_CACHE=/hf-cache/hub \
         -e TILELANG_CACHE_DIR=/home/dynamo/.cache/vllm/tilelang \
         -e TILELANG_TMP_DIR=/home/dynamo/.cache/vllm/tilelang/tmp \
         -w /workspace "$VLLM_IMAGE" -lc "$incmd"
