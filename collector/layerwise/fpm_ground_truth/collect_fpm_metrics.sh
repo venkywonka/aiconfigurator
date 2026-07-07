@@ -504,8 +504,24 @@ apply_vllm_runtime_defaults() {
     done
 }
 
+restore_enroot_mount_targets() {
+    [[ "${RUNTIME}" == "enroot" ]] || return 0
+    local target="${RUN_DIR}/hf-home"
+    if [[ ! -e "${target}" && ! -L "${target}" ]]; then
+        return 0
+    fi
+    if [[ -L "${target}" || ! -d "${target}" || ! -O "${target}" ]]; then
+        log "Enroot left an unsafe HF mount target: ${target}"
+        return 1
+    fi
+    chmod 0700 -- "${target}" || {
+        log "Failed to restore private HF mount target: ${target}"
+        return 1
+    }
+}
+
 cleanup() {
-    local rc=$?
+    local rc=$? cleanup_rc=0 restore_rc=0
     if [[ -n "${DISCOVERY_TOUCH_PID}" ]]; then
         kill "${DISCOVERY_TOUCH_PID}" >/dev/null 2>&1 || true
         wait "${DISCOVERY_TOUCH_PID}" >/dev/null 2>&1 || true
@@ -526,7 +542,10 @@ cleanup() {
         exit "${rc}"
     fi
 
-    runtime_teardown
+    runtime_teardown || cleanup_rc=$?
+    restore_enroot_mount_targets || restore_rc=$?
+    ((cleanup_rc != 0)) || cleanup_rc=$restore_rc
+    ((rc != 0 || cleanup_rc == 0)) || rc=$cleanup_rc
     exit "${rc}"
 }
 trap cleanup EXIT
@@ -864,10 +883,12 @@ mkdir -p \
     "${METADATA_OUTPUT_DIR}" \
     "${EFFECTIVE_CONFIG_OUTPUT_DIR}" \
     "${RUN_DIR}/nsys" \
+    "${RUN_DIR}/hf-home" \
     "${HF_HOME_HOST}" \
     "${VLLM_CACHE_HOST}" \
     "${VLLM_CACHE_HOST}/tilelang/tmp"
 chmod a+rwx "${RUN_DIR}" "${RUN_DIR}/discovery" "${RUN_DIR}/nsys" "${VLLM_CACHE_HOST}" "${VLLM_CACHE_HOST}/tilelang" "${VLLM_CACHE_HOST}/tilelang/tmp"
+chmod 700 "${RUN_DIR}/hf-home"
 if [[ "${AIC_MODEL_MODE:-}" == "metadata_dummy" ]]; then
     chmod 700 "${HF_HOME_HOST}"
 elif [[ "${HF_HOME_HOST_IS_RUN_LOCAL}" == "1" ]]; then

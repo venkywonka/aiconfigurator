@@ -68,6 +68,13 @@ def _outer_driver_shell_function(name: str) -> str:
     return script[start:end]
 
 
+def _inner_driver_shell_function(name: str) -> str:
+    script = INNER_FPM_DRIVER.read_text()
+    start = script.index(f"{name}() {{")
+    end = script.index("\n}\n", start) + 3
+    return script[start:end]
+
+
 def _run_outer_driver(
     tmp_path: Path,
     bundle: Path,
@@ -699,6 +706,68 @@ def test_inner_fpm_metadata_mode_uses_private_job_cache_for_worker_and_requests(
     assert stat.S_IMODE(job_cache.stat().st_mode) == 0o700
     assert not (job_cache / "token").exists()
     assert not (job_cache / "config.json").exists()
+    mount_target = tmp_path / "inner-run" / "hf-home"
+    assert mount_target.is_dir()
+    assert stat.S_IMODE(mount_target.stat().st_mode) == 0o700
+    assert not tuple(mount_target.iterdir())
+
+
+def test_enroot_cleanup_restores_private_hf_mount_target_for_packaging(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    mount_target = run_dir / "hf-home"
+    mount_target.mkdir(parents=True)
+    mount_target.chmod(0o000)
+    function = _inner_driver_shell_function("restore_enroot_mount_targets")
+    body = f"""
+set -euo pipefail
+{function}
+log() {{ :; }}
+RUNTIME=enroot
+RUN_DIR={str(run_dir)!r}
+restore_enroot_mount_targets
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", body],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(mount_target.stat().st_mode) == 0o700
+
+
+def test_enroot_cleanup_rejects_symlinked_hf_mount_target(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o750)
+    outside_mode = stat.S_IMODE(outside.stat().st_mode)
+    mount_target = run_dir / "hf-home"
+    mount_target.symlink_to(outside, target_is_directory=True)
+    function = _inner_driver_shell_function("restore_enroot_mount_targets")
+    body = f"""
+set -euo pipefail
+{function}
+log() {{ :; }}
+RUNTIME=enroot
+RUN_DIR={str(run_dir)!r}
+restore_enroot_mount_targets
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", body],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert mount_target.is_symlink()
+    assert stat.S_IMODE(outside.stat().st_mode) == outside_mode
 
 
 @pytest.mark.parametrize(
