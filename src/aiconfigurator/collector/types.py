@@ -80,6 +80,25 @@ class ResourceContract:
 
 
 @dataclass(frozen=True, slots=True)
+class CollectionJob:
+    """One deduplicated measurement request ready for resource placement."""
+
+    request_digest: str
+    adapter_namespace: str
+    contract: ResourceContract
+    payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class Assignment:
+    """A collection job bound to physical GPUs and reservation tokens."""
+
+    job: CollectionJob
+    gpu_ids: tuple[int, ...]
+    reserved_domains: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class LazyOpEntry:
     """Optional adapter metadata for exact on-demand measurements."""
 

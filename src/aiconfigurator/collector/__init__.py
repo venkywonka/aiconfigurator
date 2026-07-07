@@ -5,6 +5,8 @@
 
 from aiconfigurator.collector.registry_types import OpEntry, PerfFile, VersionRoute
 from aiconfigurator.collector.types import (
+    Assignment,
+    CollectionJob,
     FabricRequirement,
     GpuDevice,
     HardwareDiscoveryEvidence,
@@ -15,6 +17,8 @@ from aiconfigurator.collector.types import (
 )
 
 __all__ = [
+    "Assignment",
+    "CollectionJob",
     "FabricRequirement",
     "GpuDevice",
     "HardwareDiscoveryEvidence",

@@ -1,5 +1,14 @@
 # Dynamo Mocker and Spica AIC Resolution Integration Plan
 
+> **V1.2 supersession note (2026-07-07):** Do not implement the
+> `ConcreteBatchDescriptor` or per-request-vector path below for V1.2. The
+> frozen release uses scheduled aggregate `ForwardPassMetrics` and the plan in
+> `2026-07-07-aic-dsv4-online-collection-v1-2.md`. Structured callback failure,
+> opt-in Replay/Spica resolution, pure-default behavior, and cold/warm lifecycle
+> controls remain valid where they do not conflict with that plan. Treat Task 1
+> and every `ConcreteBatchDescriptor`-dependent part of Tasks 2-4 below as
+> historical V1 text, not executable V1.2 instructions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let opt-in Mocker/Spica evaluations pass the exact scheduled batch to AIC, resolve all missing perf points on demand, and reject unscorable candidates cleanly while preserving the current pure-Rust AIC path by default.

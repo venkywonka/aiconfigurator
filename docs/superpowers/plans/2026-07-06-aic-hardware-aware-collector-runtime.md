@@ -1,5 +1,13 @@
 # AIC Hardware-Aware Lazy Collector Runtime Implementation Plan
 
+> **V1.2 scope note (2026-07-07):** Tasks 1-5 are the generic runtime
+> substrate for
+> `../specs/2026-07-07-aic-dsv4-online-collection-v1-2-design.md`. BF16 GEMM
+> and NCCL remain generic release gates; the frozen profile additionally needs
+> the one-GPU adapters and four-GPU CustomAllReduce milestones in
+> `2026-07-07-aic-dsv4-online-collection-v1-2.md`. No DSv4 branch belongs in
+> discovery, scheduling, adapter loading, or execution.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Resolve exact AIC perf misses through the existing collector functions while safely saturating independent GPUs and reserving whole GPU/fabric groups for collectives.
@@ -410,9 +418,11 @@ git commit -m "feat: inventory GPU and fabric resources"
 
 **Files:**
 - Create: `src/aiconfigurator/collector/scheduler.py`
+- Modify: `src/aiconfigurator/collector/types.py`
+- Modify: `src/aiconfigurator/collector/__init__.py`
 - Test: `tests/unit/collector/lazy/test_scheduler.py`
 
-- [ ] **Step 1: Write placement tests**
+- [x] **Step 1: Write placement tests**
 
 With the Task 2 inventory, assert:
 
@@ -420,16 +430,20 @@ With the Task 2 inventory, assert:
 - two two-GPU NVLink collective jobs form one wave on `(0, 1)` and `(2, 3)` because their fabric domains are disjoint;
 - a third collective forms a second wave;
 - a collective reserving `nvlink:0` can share a wave with compute on GPU 2 but not GPU 0 or 1;
+- a reserving collective excludes an ordinary occupant of the same stable domain regardless of which job sorts first;
+- ordinary one-GPU jobs on distinct GPUs in one stable domain still co-run and reserve only GPU tokens;
+- a three-GPU P2P request requires peer read and write in both directions for every selected pair;
 - a three-GPU NVLink request raises `UnschedulableRequest` with the request digest;
+- the frozen V1.2 four-GPU collective owns its whole NVLink domain and is isolated from one-GPU jobs;
 - input order changes do not change assignments because jobs sort by `(-gpu_count, request_digest)`.
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run: `pytest -m unit tests/unit/collector/lazy/test_scheduler.py -v`
 
 Expected: import failure for `aiconfigurator.collector.scheduler`.
 
-- [ ] **Step 3: Implement greedy wave packing**
+- [x] **Step 3: Implement greedy wave packing**
 
 ```python
 class UnschedulableRequest(RuntimeError):
@@ -447,17 +461,26 @@ class HardwareAwareScheduler:
         waves: list[tuple[Assignment, ...]] = []
         while pending:
             used_gpus: set[int] = set()
-            used_domains: set[str] = set()
+            occupied_fabric_domains: set[str] = set()
+            exclusive_fabric_domains: set[str] = set()
             assignments: list[Assignment] = []
             deferred: list[CollectionJob] = []
             for job in pending:
-                assignment = self._place(job, used_gpus, used_domains)
+                assignment = self._place(
+                    job,
+                    used_gpus,
+                    occupied_fabric_domains,
+                    exclusive_fabric_domains,
+                )
                 if assignment is None:
                     deferred.append(job)
                     continue
                 assignments.append(assignment)
                 used_gpus.update(assignment.gpu_ids)
-                used_domains.update(assignment.reserved_domains)
+                assigned_domains = self._fabric_domains(assignment.gpu_ids)
+                occupied_fabric_domains.update(assigned_domains)
+                if job.contract.reserve_fabric_domain and job.contract.gpu_count > 1:
+                    exclusive_fabric_domains.update(assigned_domains)
             if not assignments:
                 job = pending[0]
                 raise UnschedulableRequest(job.request_digest, "no compatible GPU group")
@@ -466,7 +489,7 @@ class HardwareAwareScheduler:
         return tuple(waves)
 ```
 
-Implement `_place()` by enumerating ascending GPU combinations of exactly `gpu_count`. Reject used GPUs; enforce every pair for `P2P` or `NVLINK`; and, when `reserve_fabric_domain` is true, require one shared domain and reserve `fabric:<domain>`. A single-GPU job reserves only `gpu:<index>`.
+Implement `_place()` by enumerating ascending GPU combinations of exactly `gpu_count`. Reject used GPUs. `P2P` requires read and write support in both directions for every selected pair. `NVLINK` additionally requires symmetric normalized `NV#` paths for every pair; a stable fabric-domain label never proves connectivity. Every assignment marks the stable domains it occupies. A multi-GPU `reserve_fabric_domain` assignment requires one shared stable domain, rejects any already occupied domain, and publishes `fabric:<domain>` in addition to its GPU tokens. Every later assignment rejects an existing exclusive domain. A single-GPU job always reserves only `gpu:<index>` so independent one-GPU work can saturate one fabric domain.
 
 - [ ] **Step 4: Run and commit the scheduler**
 
@@ -475,7 +498,7 @@ Run: `pytest -m unit tests/unit/collector/lazy/test_scheduler.py -v`
 Expected: all scheduling tests pass.
 
 ```bash
-git add src/aiconfigurator/collector/scheduler.py tests/unit/collector/lazy/test_scheduler.py
+git add docs/superpowers/plans/2026-07-06-aic-hardware-aware-collector-runtime.md src/aiconfigurator/collector/__init__.py src/aiconfigurator/collector/types.py src/aiconfigurator/collector/scheduler.py tests/unit/collector/lazy/test_scheduler.py
 git commit -m "feat: schedule lazy collection across hardware domains"
 ```
 

@@ -1,5 +1,12 @@
 # AIC Lazy Performance Resolution Core Implementation Plan
 
+> **V1.2 scope note (2026-07-07):** The completed core remains the substrate,
+> but covered operations now follow
+> `../specs/2026-07-07-aic-dsv4-online-collection-v1-2-design.md` and
+> `2026-07-07-aic-dsv4-online-collection-v1-2.md`. Their ordinary lookup,
+> literal-exact probe, and resolving request must share one normalization path.
+> Do not add `EvidenceQuery`, `dataset_id`, or `collector_ref`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add AIC's pure-Python exact-key, overlay, miss-deduplication, and one-requery resolution core without changing ordinary prediction behavior.
