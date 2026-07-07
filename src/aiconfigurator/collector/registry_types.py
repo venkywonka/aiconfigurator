@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared data types for collector registries."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+from aiconfigurator.collector.types import LazyOpEntry
+
+
+class PerfFile(str, Enum):
+    """Canonical output filenames for collector operations.
+
+    Inherits from ``str`` so values pass directly to ``open()`` / ``log_perf()``
+    without ``.value``.
+    """
+
+    def __str__(self) -> str:
+        """Return the perf filename instead of the qualified enum name."""
+        return self.value
+
+    GEMM = "gemm_perf.txt"
+    CONTEXT_ATTENTION = "context_attention_perf.txt"
+    GENERATION_ATTENTION = "generation_attention_perf.txt"
+    ENCODER_ATTENTION = "encoder_attention_perf.txt"
+    MOE = "moe_perf.txt"
+    CONTEXT_MLA = "context_mla_perf.txt"
+    GENERATION_MLA = "generation_mla_perf.txt"
+    MLA_BMM = "mla_bmm_perf.txt"
+    GDN = "gdn_perf.txt"
+    MAMBA2 = "mamba2_perf.txt"
+    COMPUTESCALE = "computescale_perf.txt"
+    WIDEEP_MOE = "wideep_moe_perf.txt"
+    WIDEEP_CONTEXT_MLA = "wideep_context_mla_perf.txt"
+    WIDEEP_GENERATION_MLA = "wideep_generation_mla_perf.txt"
+    WIDEEP_CONTEXT_MOE = "wideep_context_moe_perf.txt"
+    WIDEEP_GENERATION_MOE = "wideep_generation_moe_perf.txt"
+    MLA_CONTEXT_MODULE = "mla_context_module_perf.txt"
+    MLA_GENERATION_MODULE = "mla_generation_module_perf.txt"
+    DSA_CONTEXT_MODULE = "dsa_context_module_perf.txt"
+    DSA_GENERATION_MODULE = "dsa_generation_module_perf.txt"
+    DSA_CONTEXT_MODULE_SKIP_INDEXER = "dsa_context_module_skip_indexer_perf.txt"
+    DSA_GENERATION_MODULE_SKIP_INDEXER = "dsa_generation_module_skip_indexer_perf.txt"
+    MHC_MODULE = "mhc_module_perf.txt"
+    DSV4_CSA_CONTEXT_MODULE = "dsv4_csa_context_module_perf.txt"
+    DSV4_HCA_CONTEXT_MODULE = "dsv4_hca_context_module_perf.txt"
+    DSV4_CSA_GENERATION_MODULE = "dsv4_csa_generation_module_perf.txt"
+    DSV4_HCA_GENERATION_MODULE = "dsv4_hca_generation_module_perf.txt"
+    DSV4_PAGED_MQA_LOGITS_MODULE = "dsv4_paged_mqa_logits_module_perf.txt"
+    DSV4_HCA_ATTN_MODULE = "dsv4_hca_attn_module_perf.txt"
+    DSV4_CSA_ATTN_MODULE = "dsv4_csa_attn_module_perf.txt"
+    DSV4_CSA_TOPK_CALIB = "dsv4_csa_topk_calib_perf.txt"
+    GLM5_MQA_LOGITS_MODULE = "glm5_mqa_logits_module_perf.txt"
+    GLM5_TOPK_MODULE = "glm5_topk_module_perf.txt"
+    GLM5_DSA_ATTN_MODULE = "glm5_dsa_attn_module_perf.txt"
+    DSV4_MEGAMOE_MODULE = "dsv4_megamoe_module_perf.txt"
+    NCCL = "nccl_perf.txt"
+    CUSTOM_ALLREDUCE = "custom_allreduce_perf.txt"
+    TRTLLM_ALLTOALL = "trtllm_alltoall_perf.txt"
+
+
+@dataclass(frozen=True, slots=True)
+class VersionRoute:
+    """A minimum framework version and its collector module path."""
+
+    min_version: str
+    module: str
+
+
+@dataclass(frozen=True, slots=True)
+class OpEntry:
+    """One operation in a collector registry."""
+
+    op: str
+    get_func: str
+    run_func: str
+    perf_filename: str
+    module: str | None = None
+    versions: tuple[VersionRoute, ...] = field(default_factory=tuple)
+    lazy: LazyOpEntry | None = None
+
+    def __post_init__(self) -> None:
+        if not self.module and not self.versions:
+            raise ValueError(f"OpEntry '{self.op}': must specify 'module' or 'versions'")
+        if self.module and self.versions:
+            raise ValueError(f"OpEntry '{self.op}': cannot specify both 'module' and 'versions'")
