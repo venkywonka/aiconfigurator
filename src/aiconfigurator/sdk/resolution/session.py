@@ -119,6 +119,25 @@ class ResolutionReport:
     collection_seconds: float = 0.0
     unresolved: list[UnresolvedReason] = field(default_factory=list)
 
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe snapshot of resolution evidence and failures."""
+        return {
+            "overlay_hits": self.overlay_hits,
+            "unique_misses": self.unique_misses,
+            "consumer_misses": self.consumer_misses,
+            "accepted_records": self.accepted_records,
+            "rejected_records": self.rejected_records,
+            "collection_seconds": self.collection_seconds,
+            "unresolved": [
+                {
+                    "code": reason.code.value,
+                    "operation": reason.operation,
+                    "detail": reason.detail,
+                }
+                for reason in self.unresolved
+            ],
+        }
+
 
 class ResolutionFailed(RuntimeError):  # noqa: N818 - public contract names the failed resolution state
     def __init__(self, reasons: Sequence[UnresolvedReason]) -> None:

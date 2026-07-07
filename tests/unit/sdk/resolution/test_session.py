@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -242,6 +243,19 @@ def test_execute_callback_collects_then_requeries_exactly_once(tmp_path) -> None
     assert executor.request_batches == [(request,)]
     assert session.report.unique_misses == 1
     assert session.report.consumer_misses == 1
+    payload = session.report.to_dict()
+    assert isinstance(payload["collection_seconds"], float)
+    assert payload["collection_seconds"] >= 0.0
+    assert payload == {
+        "overlay_hits": 1,
+        "unique_misses": 1,
+        "consumer_misses": 1,
+        "accepted_records": 1,
+        "rejected_records": 0,
+        "collection_seconds": payload["collection_seconds"],
+        "unresolved": [],
+    }
+    assert json.loads(json.dumps(payload, allow_nan=False)) == payload
 
 
 def test_nested_execute_callback_joins_outer_collection_cycle(tmp_path) -> None:
@@ -789,6 +803,23 @@ def test_observe_only_reports_miss_without_executor_dispatch(tmp_path) -> None:
 
     assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.OBSERVE_ONLY]
     assert executor.request_batches == []
+    payload = session.report.to_dict()
+    assert payload == {
+        "overlay_hits": 0,
+        "unique_misses": 1,
+        "consumer_misses": 1,
+        "accepted_records": 0,
+        "rejected_records": 0,
+        "collection_seconds": 0.0,
+        "unresolved": [
+            {
+                "code": "observe_only",
+                "operation": "gemm",
+                "detail": f"observed unresolved key {request.key.digest}",
+            }
+        ],
+    }
+    assert json.loads(json.dumps(payload, allow_nan=False)) == payload
 
 
 def test_pure_policy_never_constructs_resolution_session(tmp_path) -> None:
