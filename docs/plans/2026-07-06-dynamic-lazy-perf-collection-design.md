@@ -77,7 +77,7 @@ A stable structured identity for one reusable performance point. Its authoritati
 
 ### MeasurementRequest
 
-An ephemeral reproducible work order for one absent `PerfKey`: registered collector, exact case inputs, deterministic input recipe, resource requirements, and measurement protocol. It never contains captured tensors.
+An ephemeral reproducible work order for one absent `PerfKey`: registered collector, exact case inputs, deterministic input recipe, resource requirements, measurement protocol, and any collector-owned tuning policy. It never contains captured tensors.
 
 ### MissSet
 
@@ -85,7 +85,7 @@ The temporary per-callback map from unique `PerfKey` to its `MeasurementRequest`
 
 ### MeasurementRecord
 
-An append-only observation produced by one request: key, samples, selected statistic, units, status, and hardware/software/collector provenance. Only a valid compatible record satisfies future queries.
+An append-only observation produced by one request: key, samples, selected statistic, units, status, optional winning tuned implementation/configuration, and hardware/software/collector provenance. Only a valid compatible record satisfies future queries.
 
 ### ResolutionSession
 
@@ -138,6 +138,23 @@ The lazy path must preserve these concrete callback fields through normalization
 
 V1 uses concrete shape, dtype/layout, and existing operation/configuration parameters. Value-sensitive operations may add a small, operation-defined semantic fingerprint (for example, an MoE load-distribution bucket). The collector deterministically synthesizes tensors from the key and fingerprint. Runtime tensor capture is out of scope.
 
+## Mocker and Spica bridge contract
+
+V1 uses Dynamo's direct Python-backed `AicCallback` path, because that path already carries Mocker's concrete callback descriptor into the existing Python AIC operation walk and collector registry. The aggregate native Rust FPM remains useful for forward-pass prediction and telemetry correction, but it is not treated as an exact per-operation collection request.
+
+The current Rust `AicCallback` methods return a bare `f64`. Measure-on-miss requires the bridge to propagate a structured success or failure (for example, a `Result<f64, AicResolutionError>`-equivalent contract or a Python exception envelope that Replay converts into an infeasible candidate). A collector failure must never be coerced into zero latency, a negative value, or an empirical estimate.
+
+Collection may block one latency callback for seconds or minutes. The Python/Rust bridge must not hold the PyO3 GIL or a Mocker scheduler lock while waiting on collector executors. The callback remains causally synchronous from Mocker's perspective, while the actual hardware work runs in executor processes or otherwise outside those locks.
+
+Spica may evaluate candidates in a process pool. Every cold `ResolutionSession` requires an exclusive resource lease. Therefore:
+
+- parallel evaluators are allowed when each receives a disjoint GPU/fabric lease;
+- otherwise measure-on-miss evaluation is serialized (`parallel_evals=1`) while the callback-local wave scheduler uses the full assigned lease;
+- independent evaluators must not point at the same unleased timing devices;
+- once a coverage preflight proves the relevant evidence is warm, ordinary read-only scoring may use the existing parallel path. Any evaluator that may still collect requires its own lease.
+
+V1 does not require an IPC profiling service shared by all Spica workers. Such a service is a possible later optimization, not an implicit dependency of the design.
+
 ## PerfKey and overlay identity
 
 `PerfKey` is the product of four namespaces:
@@ -156,7 +173,9 @@ Lookup order is:
 3. curated perf database;
 4. structured miss.
 
-The overlay is append-only. For multiple exact compatible records, the newest valid record wins deterministically while older observations remain auditable. Rejected and failed attempts may be retained for diagnostics but are never indexed as hits. Promotion into curated data is a separate validation/export action.
+The overlay is append-only. For multiple exact compatible records, the latest valid committed record by a monotonic append sequence wins deterministically while older observations remain auditable. Wall-clock timestamps alone do not define precedence. Rejected and failed attempts may be retained for diagnostics but are never indexed as hits. Promotion into curated data is a separate validation/export action.
+
+Measurement-protocol revision (warmup/sample/statistic rules) and collector tuning-policy/search-space revision participate in record compatibility and selection even when they are not operation-level perf dimensions. A policy may deliberately accept older compatible protocols; that decision is recorded in the session manifest.
 
 ## Measurement objects and multiplicity
 
@@ -190,11 +209,11 @@ discover -> reconcile -> resolve -> commit -> requery once
 2. Recheck the overlay to close races and reconcile each key with coordinator-local in-flight work.
 3. Join an existing future for a matching key or claim ownership of a new request.
 4. Schedule new requests in hardware-aware, non-conflicting waves.
-5. Validate results, append records atomically, and refresh the exact-key index.
+5. Validate results, append each valid record atomically, and refresh the exact-key index.
 6. Replay the AIC operation walk once.
 7. Return complete latency. A remaining miss is an invariant failure, not an implicit second collection loop.
 
-Single-flight is guaranteed within one `ResolutionSession` coordinator. Process-safe append/index operations protect the overlay. V1 does not add a distributed coordinator for independent sessions; the resource allocator must not assign overlapping timing resources to independent active sessions.
+Single-flight is guaranteed within one `ResolutionSession` coordinator. Process-safe append/index operations protect the overlay. Valid partial results survive if another request in the same wave fails, so later callbacks reuse completed work; the candidate still remains unscorable until every required key resolves. V1 does not add a distributed coordinator for independent sessions; the resource allocator must not assign overlapping timing resources to independent active sessions.
 
 ## Hardware-aware collection scheduler
 
@@ -223,6 +242,8 @@ Examples:
 
 Persistent executors amortize initialization. Compute executors may be cached per GPU/runtime; collective executors may cache communicators by compatible device group, topology, world size, and runtime. Batching means deduplicated scheduling and shared executor lifetime, not co-running conflicting timing kernels.
 
+Parallel collection is an orchestration optimization only. Timings from independent jobs running in the same wave are stored as independent records and are not interpreted as a newly measured overlap/fusion. AIC's existing `OverlapOp` or other composite remains responsible for runtime composition unless that composite has its own explicit collector adapter.
+
 A single coordinator may manage multi-process/rank workers over its assigned resource pool. What is deferred is coordination among multiple independent resolution coordinators, not multi-GPU measurement itself.
 
 ## Reusing the current collector registry
@@ -244,6 +265,8 @@ The current `OpEntry` fields remain authoritative. Lazy support is opt-in per op
 - perf-schema and adapter revision.
 
 Both sources use the same registered `get_func`/`run_func` code. A persistent executor may submit several cases together when supported or loop through them without recreating its runtime.
+
+If the existing collector internally autotunes several kernel implementations/configurations for one exact case, the lazy request invokes that same tuning path. The record stores the selected winner and enough tuning-policy/search-space provenance to decide whether it remains reusable. This is collector-level autotuning for one exact AIC point; it is distinct from Spica's deployment-candidate search.
 
 Before a search, capability preflight reports modeled operation types with no exact-point adapter or unsupported resource shape. After a measurement, the emitted case/result must normalize back to exactly the requested `PerfKey`; units, samples, statistic, topology, and provenance must validate before indexing.
 
@@ -369,13 +392,35 @@ It must also prove deterministic input generation, a valid resource contract, an
 The architecture is successful when all of the following hold:
 
 1. Pure prediction remains API/behavior compatible and performs no GPU collection.
-2. Physical measurements are bounded by unique unresolved `PerfKey`s encountered, not callback count or operation-instance count.
+2. Successful physical measurements are bounded by unique unresolved `PerfKey`s encountered, not callback count or operation-instance count; failed/retried attempts are separately accounted and policy-bounded.
 3. Repeated compatible shapes, candidates, and process restarts add no duplicate GPU work.
 4. Compute and communication records never cross incompatible hardware/topology identities.
 5. Mocker advances only after the current concrete callback has complete evidence.
 6. Non-conflicting work uses available GPU/fabric partitions without declared contention-domain overlap.
 7. No missing point is hidden behind empirical fallback in measure-on-miss mode.
 8. Every scored candidate links to evidence sources, resolution policy, assigned resources, and a collection report.
+
+## Risks and mitigations
+
+### Cross-job interference produces optimistic or noisy records
+
+Resource contracts default conservatively, declare shared contention domains, and may request node exclusivity. Multi-GPU/topology integration tests compare packed-wave measurements with isolated controls before a collector is allowed to opt into parallel packing.
+
+### Existing operation query fields are insufficient for value-sensitive kernels
+
+Such an operation must define a stable semantic fingerprint and deterministic generator parameters or remain unsupported for lazy collection. The system does not capture arbitrary runtime tensors as an escape hatch.
+
+### Spica parallelism oversubscribes timing resources
+
+Cold resolution requires explicit disjoint leases or serialized candidate evaluation. The callback-local scheduler, not competing candidate processes, is responsible for saturating one lease.
+
+### Overlay growth and stale evidence
+
+Compatibility namespaces prevent accidental reuse across incompatible runtime, collector, protocol, or topology revisions. Append-only history can be compacted into a derived index without deleting source evidence; promotion and retention remain separate operational policies.
+
+### Collector side effects leak into Mocker
+
+Collectors run outside Mocker scheduler locks and do not mutate Mocker state. The only callback-visible outcomes are complete latency or a structured unresolved result.
 
 ## Alternatives considered
 
