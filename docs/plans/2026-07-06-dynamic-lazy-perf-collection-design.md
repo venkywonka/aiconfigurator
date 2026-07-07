@@ -39,6 +39,8 @@ The local AIC checkout is 52 commits behind `upstream/main`. Core AIC operation/
 
 - Dynamo `lib/mocker/src/common/perf_model.rs:30` defines the direct `AicCallback` for prefill and decode.
 - `lib/mocker/src/common/perf_model.rs:220` passes Mocker's prefill/decode scalar shape descriptors to AIC.
+- `lib/bindings/python/rust/llm/aic_callback.rs:40` implements the default callback as a pure-Rust `RustAicCallback`; it cannot invoke Python collectors on its hot path.
+- `lib/bindings/python/src/dynamo/_internal/aic.py:112` retains a Python `AicSession` operation-walk path that can host the explicit resolving mode.
 - AIC upstream `docs/spica/overview.md` and `src/spica/evaluator.py` establish that Spica owns candidate search while Dynamo Replay/Mocker owns system scheduling and candidate scoring.
 
 ### Rhino patterns retained
@@ -140,11 +142,13 @@ V1 uses concrete shape, dtype/layout, and existing operation/configuration param
 
 ## Mocker and Spica bridge contract
 
-V1 uses Dynamo's direct Python-backed `AicCallback` path, because that path already carries Mocker's concrete callback descriptor into the existing Python AIC operation walk and collector registry. The aggregate native Rust FPM remains useful for forward-pass prediction and telemetry correction, but it is not treated as an exact per-operation collection request.
+Pure/default Mocker prediction keeps the current `RustAicCallback` and its GIL-free compiled-engine hot path. V1 adds a distinct explicit resolving callback mode backed by the existing Python `AicSession` operation walk. The resolving mode carries Mocker's concrete callback descriptor into Python AIC, where operation adapters and the collector registry are available. It does not silently replace the default Rust path.
+
+The aggregate native Rust FPM remains useful for forward-pass prediction and telemetry correction, but it is not treated as an exact per-operation collection request. Likewise, the current compiled Rust engine does not yet expose a complete `MissSet` or ingest the mutable overlay, so measure-on-miss must not claim that it can stay on that path in V1. Teaching the Rust engine structured miss discovery and overlay refresh is a later optimization after the Python resolving contract is proven.
 
 The current Rust `AicCallback` methods return a bare `f64`. Measure-on-miss requires the bridge to propagate a structured success or failure (for example, a `Result<f64, AicResolutionError>`-equivalent contract or a Python exception envelope that Replay converts into an infeasible candidate). A collector failure must never be coerced into zero latency, a negative value, or an empirical estimate.
 
-Collection may block one latency callback for seconds or minutes. The Python/Rust bridge must not hold the PyO3 GIL or a Mocker scheduler lock while waiting on collector executors. The callback remains causally synchronous from Mocker's perspective, while the actual hardware work runs in executor processes or otherwise outside those locks.
+Collection may block one latency callback for seconds or minutes. The resolving callback may acquire the GIL to enter `AicSession`, but it must never run GPU microbenchmarks in that process under the GIL or retain a Mocker scheduler lock while waiting. Python submits work to executor processes and waits through a GIL-releasing synchronization primitive. The callback remains causally synchronous from Mocker's perspective, while hardware work runs outside its scheduler locks and Python interpreter.
 
 Spica may evaluate candidates in a process pool. Every cold `ResolutionSession` requires an exclusive resource lease. Therefore:
 
