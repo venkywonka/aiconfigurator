@@ -1451,9 +1451,269 @@
     "source_rows": 34311
   },
   "predictor_oracle": {
-    "required_call_count": 17009,
-    "required_clean_only_call_count": 479,
-    "status": "pending_adapter_freeze"
+    "by_cohort_phase": {
+      "c1/context": {
+        "attempted": 6,
+        "eligible": 0,
+        "reasons": {
+          "missing_surface": 6
+        }
+      },
+      "c1/decode": {
+        "attempted": 4507,
+        "eligible": 4507,
+        "reasons": {
+          "predicted": 4507
+        }
+      },
+      "c1/mixed": {
+        "attempted": 0,
+        "eligible": 0,
+        "reasons": {}
+      },
+      "c128/context": {
+        "attempted": 1,
+        "eligible": 0,
+        "reasons": {
+          "missing_surface": 1
+        }
+      },
+      "c128/decode": {
+        "attempted": 4122,
+        "eligible": 1186,
+        "reasons": {
+          "missing_surface": 2936,
+          "predicted": 1186
+        }
+      },
+      "c128/mixed": {
+        "attempted": 76,
+        "eligible": 0,
+        "reasons": {
+          "unsupported_phase": 76
+        }
+      },
+      "c16/context": {
+        "attempted": 1,
+        "eligible": 0,
+        "reasons": {
+          "missing_surface": 1
+        }
+      },
+      "c16/decode": {
+        "attempted": 4086,
+        "eligible": 3546,
+        "reasons": {
+          "missing_surface": 540,
+          "predicted": 3546
+        }
+      },
+      "c16/mixed": {
+        "attempted": 12,
+        "eligible": 0,
+        "reasons": {
+          "unsupported_phase": 12
+        }
+      },
+      "c64/context": {
+        "attempted": 1,
+        "eligible": 0,
+        "reasons": {
+          "missing_surface": 1
+        }
+      },
+      "c64/decode": {
+        "attempted": 4158,
+        "eligible": 2037,
+        "reasons": {
+          "missing_surface": 2121,
+          "predicted": 2037
+        }
+      },
+      "c64/mixed": {
+        "attempted": 39,
+        "eligible": 0,
+        "reasons": {
+          "unsupported_phase": 39
+        }
+      }
+    },
+    "call_count": 17009,
+    "clean_only": {
+      "attempted": 479,
+      "eligible": 65,
+      "reasons": {
+        "missing_surface": 289,
+        "predicted": 65,
+        "unsupported_phase": 125
+      }
+    },
+    "evaluated_shapes": {
+      "(0, 1, 0, 0, 1)": 99,
+      "(0, 1, 0, 0, 16384)": 4489,
+      "(0, 1, 0, 0, 4096)": 100,
+      "(0, 1, 0, 0, 8192)": 3025,
+      "(0, 16, 0, 0, 8192)": 348,
+      "(0, 2, 0, 0, 16384)": 455,
+      "(0, 2, 0, 0, 8192)": 1571,
+      "(0, 32, 0, 0, 8192)": 30,
+      "(0, 4, 0, 0, 8192)": 683,
+      "(0, 64, 0, 0, 8192)": 155,
+      "(0, 8, 0, 0, 8192)": 321
+    },
+    "layerwise_sha256": "17781fac0d806c3683642c85e0f5e76f6046ab8739ad154fc1e2db01646c18f9",
+    "policy": "artifact-proxy-v1",
+    "prediction_vector_sha256": "27565b556f21dc49b3f598892c7bf1214b25643afa27444a5e974adc47e00402",
+    "production_exact_surface_eligible": 0,
+    "production_exact_surface_reason": "cached_layerwise_decode_max_num_seqs_64_vs_runtime_256",
+    "status": "frozen_artifact_proxy_v1",
+    "status_reason": {
+      "ok/predicted": 11276,
+      "unavailable/missing_surface": 5606,
+      "unavailable/unsupported_phase": 127
+    },
+    "top_absolute_relative_errors": [
+      {
+        "bin_id": "b3814eae03a39e200db0897382f29c0d9cbed982836821d2e86bbeee0111f1ec",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.7835103103671003,
+        "semantic_key": "[0,1,null,null,9725]"
+      },
+      {
+        "bin_id": "f6da7caccc6f929784e28080e65ac07bccd27f40ac9a5d8ba20632096e27a06b",
+        "concurrency": 128,
+        "phase": "decode",
+        "relative_error": -0.570282822874583,
+        "semantic_key": "[0,1,null,null,15721]"
+      },
+      {
+        "bin_id": "46716707b1030c12d16ff2a1bc57d1dd76123f308e72a65a46745ebc35282dde",
+        "concurrency": 128,
+        "phase": "decode",
+        "relative_error": 0.5202269173277834,
+        "semantic_key": "[0,16,null,null,7939]"
+      },
+      {
+        "bin_id": "05561716039d06959d7b81c9ccbfd1f22a6db4802935ba70a3001a84274e3398",
+        "concurrency": 128,
+        "phase": "decode",
+        "relative_error": 0.3441608539970193,
+        "semantic_key": "[0,1,null,null,18037]"
+      },
+      {
+        "bin_id": "597962886efd72989714cdf68d2019be881270c0ea3e6c0b2ff083323880745a",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.3226712830705033,
+        "semantic_key": "[0,1,null,null,14612]"
+      },
+      {
+        "bin_id": "5b82169ba96cd5897fe7675da004b94a9f0816c377a131e5a48538179717e1e0",
+        "concurrency": 128,
+        "phase": "decode",
+        "relative_error": 0.2880487499122849,
+        "semantic_key": "[0,1,null,null,18161]"
+      },
+      {
+        "bin_id": "bde7ce4ea884a663b2e8951c981c4b95361c6c144c8398844f12b7d9ba320a71",
+        "concurrency": 128,
+        "phase": "decode",
+        "relative_error": 0.2867386755404014,
+        "semantic_key": "[0,2,null,null,16524]"
+      },
+      {
+        "bin_id": "5a46b3fb9b69d39f14eff48a89166ecd8cf501857db94e4ca47d7df14169afaf",
+        "concurrency": 16,
+        "phase": "decode",
+        "relative_error": 0.2860113692975787,
+        "semantic_key": "[0,1,null,null,7244]"
+      },
+      {
+        "bin_id": "9aa6892fd9330bad30a103dabc77ccce75fdfdde609541fd583606e9dadda8d3",
+        "concurrency": 64,
+        "phase": "decode",
+        "relative_error": 0.2604410369632423,
+        "semantic_key": "[0,1,null,null,10031]"
+      },
+      {
+        "bin_id": "f9f5d0a0847bccea903a124b1b9334bf8661975e851eb4af379ce09015d935c4",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.25414708366438526,
+        "semantic_key": "[0,1,null,null,16735]"
+      },
+      {
+        "bin_id": "0364e8d7a6066e5c78ecb9ecdc79b50efb7938184f99d0e6277f2cd3764d1e42",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.24708380706266442,
+        "semantic_key": "[0,1,null,null,13584]"
+      },
+      {
+        "bin_id": "5648008dab28f3ead843d84d28f4f87e0d44d35288edc5e192aa4123da6d55eb",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.2427608027793505,
+        "semantic_key": "[0,1,null,null,14033]"
+      },
+      {
+        "bin_id": "50c875833a3d0a58cf8d07807ea27db3f4c8083b0f120ab3e30aa6c18f69853b",
+        "concurrency": 16,
+        "phase": "decode",
+        "relative_error": 0.23649117364108876,
+        "semantic_key": "[0,1,null,null,7395]"
+      },
+      {
+        "bin_id": "2ac44e89d7de544c3ae7f08f21a25e4c9e89b40b6b0aa81c59cae890ac9328ca",
+        "concurrency": 16,
+        "phase": "decode",
+        "relative_error": 0.23483006039354407,
+        "semantic_key": "[0,1,null,null,7314]"
+      },
+      {
+        "bin_id": "c0e0282632df791afae1b2f1dc08fe086302793ea7c92cb5924560d6484076d1",
+        "concurrency": 16,
+        "phase": "decode",
+        "relative_error": 0.2313149714741384,
+        "semantic_key": "[0,1,null,null,8174]"
+      },
+      {
+        "bin_id": "eabd11431bc47a8fef30f678ea9b9110d6dca6580a8011e492f39e7d2584bbf1",
+        "concurrency": 64,
+        "phase": "decode",
+        "relative_error": 0.22597749410529422,
+        "semantic_key": "[0,1,null,null,10101]"
+      },
+      {
+        "bin_id": "522681a8fc07d2f68c6a10cb8de9165fb4ad195a316de0a1d981f8cbff0d736f",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.22556883494059252,
+        "semantic_key": "[0,1,null,null,6527]"
+      },
+      {
+        "bin_id": "f5bd25162107682b32fb2c900b6c4bddb83386810ced6a4156689233f7ed9bb4",
+        "concurrency": 64,
+        "phase": "decode",
+        "relative_error": 0.22463267307578477,
+        "semantic_key": "[0,16,null,null,8653]"
+      },
+      {
+        "bin_id": "a8e2cb03696caff785edcc5490453594385a4007a085cb752cd5ed2bbe292b8b",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.22039956933657084,
+        "semantic_key": "[0,1,null,null,13477]"
+      },
+      {
+        "bin_id": "e886f1b6be8a671e71a8592b46404a0bb2a015158c2f5a70e8b6370fa659f58a",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.219213755989847,
+        "semantic_key": "[0,1,null,null,13905]"
+      }
+    ]
   },
   "source": {
     "aiconfigurator_commit": "1a8f4809fbb1953d51578fc1e4fcb30cb7f6c110",

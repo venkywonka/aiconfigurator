@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Regenerate the artifact-backed, pre-predictor job-354281415 oracle."""
+"""Regenerate the artifact-backed job-354281415 semantic/predictor oracle."""
 
 from __future__ import annotations
 
@@ -12,16 +12,26 @@ import json
 import re
 import sqlite3
 import sys
+from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from collector.layerwise.diagnostics.semantic_fpm_aic import (
+    RepositoryAicConfig,
+    build_repository_predictor,
+)
 from collector.layerwise.diagnostics.semantic_fpm_insights import (
     MarkerObservation,
     ProfiledFpmObservation,
     align_profiled_fpm_to_nsys,
+)
+from collector.layerwise.diagnostics.semantic_fpm_predictor import (
+    ARTIFACT_PROXY_LOOKUP_POLICY_VERSION,
+    predict_clean_bins,
 )
 from collector.layerwise.diagnostics.semantic_fpm_reduction import (
     build_semantic_population,
@@ -33,6 +43,7 @@ COHORTS = ("c1", "c16", "c64", "c128")
 MARKER_RE = re.compile(r"bench_step::N(\d+)::bs(\d+)::past(\d+)(?:::run(\d+))?")
 ARCHIVE_BYTES = 6_554_156_865
 ARCHIVE_SHA256 = "de4bd64b5f327fa2e73e131d5e7ec3346367814ece0181fe305ec05a795b22be"
+LAYERWISE_SHA256 = "17781fac0d806c3683642c85e0f5e76f6046ab8739ad154fc1e2db01646c18f9"
 INPUT_HASHES = {
     "c1": {
         "clean_fpm_phase_sha256": "4bd2cad42947fb8c52d64ec22a4e579f2fce327fa309254672a127c140d790f9",
@@ -73,12 +84,20 @@ def _input_paths(artifact_root: Path, sqlite_root: Path, cohort: str) -> dict[st
     }
 
 
-def verify_source_hashes(archive: Path, artifact_root: Path, sqlite_root: Path) -> None:
+def verify_source_hashes(
+    archive: Path,
+    artifact_root: Path,
+    sqlite_root: Path,
+    layerwise_csv: Path,
+) -> None:
     if archive.stat().st_size != ARCHIVE_BYTES:
         raise ValueError(f"archive size mismatch: expected {ARCHIVE_BYTES}, got {archive.stat().st_size}")
     archive_hash = sha256_file(archive)
     if archive_hash != ARCHIVE_SHA256:
         raise ValueError(f"archive SHA-256 mismatch: expected {ARCHIVE_SHA256}, got {archive_hash}")
+    layerwise_hash = sha256_file(layerwise_csv)
+    if layerwise_hash != LAYERWISE_SHA256:
+        raise ValueError(f"layerwise SHA-256 mismatch: expected {LAYERWISE_SHA256}, got {layerwise_hash}")
     for cohort in COHORTS:
         for hash_name, path in _input_paths(artifact_root, sqlite_root, cohort).items():
             actual = sha256_file(path)
@@ -154,7 +173,7 @@ def alignment_summary(artifact_root: Path, sqlite_root: Path, cohort: str) -> di
     }
 
 
-def population_summary(artifact_root: Path) -> dict:
+def _load_population(artifact_root: Path, *, configuration_fingerprint: str):
     all_samples = []
     for cohort in COHORTS:
         concurrency = int(cohort.removeprefix("c"))
@@ -168,10 +187,17 @@ def population_summary(artifact_root: Path) -> dict:
                 concurrency=concurrency,
             )
         )
-    population = build_semantic_population(
+    return build_semantic_population(
         all_samples,
-        configuration_fingerprint="job-354281415-placeholder",
+        configuration_fingerprint=configuration_fingerprint,
         measured_segments=frozenset({"real"}),
+    )
+
+
+def population_summary(artifact_root: Path) -> dict:
+    population = _load_population(
+        artifact_root,
+        configuration_fingerprint="job-354281415-placeholder",
     )
     clean_bins = [bin_ for bin_ in population.bins if bin_.n_clean]
     shared_bins = [bin_ for bin_ in population.bins if bin_.nsight_shared]
@@ -237,7 +263,161 @@ def population_summary(artifact_root: Path) -> dict:
     }
 
 
-def build_oracle(artifact_root: Path, sqlite_root: Path) -> dict:
+def _artifact_proxy_parity_record() -> str:
+    return json.dumps(
+        {
+            "attention_dp_size": 1,
+            "attention_quant": "bf16",
+            "backend": "vllm",
+            "backend_version": "0.20.1",
+            "chunked_prefill": True,
+            "dp_size": 1,
+            "ep_size": 1,
+            "gemm_quant": "bf16",
+            "gpu_count": 8,
+            "kv_cache_dtype": "bf16",
+            "kv_cache_quant": "bf16",
+            "max_num_batched_tokens": 40960,
+            "max_num_seqs": 256,
+            "model": "Qwen/Qwen3-32B",
+            "model_revision": "artifact-job-354281415",
+            "moe_quant": "bf16",
+            "numerical_dtype": "bf16",
+            "pp_size": 1,
+            "prefix_caching": False,
+            "runtime_flags": {"source": "cached-artifact-proxy"},
+            "schema_version": "aic-runtime-parity/v1",
+            "system": "h100_sxm",
+            "tp_size": 8,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def predictor_summary(artifact_root: Path, layerwise_csv: Path) -> dict:
+    parity_record = _artifact_proxy_parity_record()
+    configuration_fingerprint = hashlib.sha256(parity_record.encode()).hexdigest()
+    population = _load_population(
+        artifact_root,
+        configuration_fingerprint=configuration_fingerprint,
+    )
+    config = RepositoryAicConfig(
+        repo_root=REPO_ROOT,
+        repo_commit="artifact-proxy-job-354281415",
+        configuration_fingerprint=configuration_fingerprint,
+        parity_record=parity_record,
+        layerwise_csv=layerwise_csv,
+        comm_version="0.19.0",
+        context_vllm_config_hash="2862698e53019524",
+        decode_vllm_config_hash="dda11a431c370f78",
+        artifact_proxy_decode_max_num_seqs=64,
+        verify_repository=False,
+    )
+    predictions = predict_clean_bins(
+        population,
+        build_repository_predictor(config),
+        required_lookup_policy=ARTIFACT_PROXY_LOOKUP_POLICY_VERSION,
+    )
+    bin_by_id = {bin_.bin_id: bin_ for bin_ in population.bins}
+    by_cohort_phase = {}
+    for cohort in COHORTS:
+        concurrency = int(cohort.removeprefix("c"))
+        for phase in ("context", "decode", "mixed"):
+            scope = [
+                item for item in predictions if item.query.concurrency == concurrency and item.query.phase == phase
+            ]
+            by_cohort_phase[f"{cohort}/{phase}"] = {
+                "attempted": len(scope),
+                "eligible": sum(item.record.status == "ok" for item in scope),
+                "reasons": dict(sorted(Counter(item.record.reason for item in scope).items())),
+            }
+    clean_only = [item for item in predictions if bin_by_id[item.bin_id].clean_only]
+    evaluated_shapes = Counter(
+        tuple(value for _, value in item.record.evaluated_shape.items())
+        for item in predictions
+        if item.record.status == "ok" and item.record.evaluated_shape is not None
+    )
+    prediction_vector = [
+        {
+            "bin_id": item.bin_id,
+            "status": item.record.status,
+            "reason": item.record.reason,
+            "requested_shape": asdict(item.record.requested_shape),
+            "evaluated_shape": (
+                asdict(item.record.evaluated_shape) if item.record.evaluated_shape is not None else None
+            ),
+            "lookup_surface_id": item.record.lookup_surface_id,
+            "scheduler_surface_content_hash": item.record.scheduler_surface_content_hash,
+            "axis_lookups": [asdict(lookup) for lookup in item.record.axis_lookups],
+            "total_ms": item.record.total_ms,
+            "compute_ms": item.record.compute_ms,
+            "communication_ms": item.record.communication_ms,
+            "other_ms": item.record.other_ms,
+            "operation_inventory_hash": item.record.operation_inventory_hash,
+            "operation_values": item.record.operation_values,
+            "operation_lookups": [asdict(lookup) for lookup in item.record.operation_lookups],
+        }
+        for item in sorted(predictions, key=lambda prediction: prediction.bin_id)
+    ]
+    prediction_vector_sha256 = hashlib.sha256(
+        json.dumps(
+            prediction_vector,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    top_errors = []
+    for item in predictions:
+        if item.record.total_ms is None:
+            continue
+        clean_walls = sorted(sample.wall_ms for sample in bin_by_id[item.bin_id].clean_samples)
+        midpoint = len(clean_walls) // 2
+        clean_median = (
+            clean_walls[midpoint] if len(clean_walls) % 2 else (clean_walls[midpoint - 1] + clean_walls[midpoint]) / 2.0
+        )
+        relative_error = (item.record.total_ms - clean_median) / clean_median
+        top_errors.append(
+            {
+                "bin_id": item.bin_id,
+                "concurrency": item.query.concurrency,
+                "phase": item.query.phase,
+                "semantic_key": item.query.semantic_key,
+                "relative_error": relative_error,
+            }
+        )
+    top_errors.sort(
+        key=lambda row: (
+            -abs(row["relative_error"]),
+            row["concurrency"],
+            row["phase"],
+            row["semantic_key"],
+            row["bin_id"],
+        )
+    )
+    return {
+        "status": "frozen_artifact_proxy_v1",
+        "policy": ARTIFACT_PROXY_LOOKUP_POLICY_VERSION,
+        "production_exact_surface_eligible": 0,
+        "production_exact_surface_reason": "cached_layerwise_decode_max_num_seqs_64_vs_runtime_256",
+        "call_count": len(predictions),
+        "status_reason": dict(
+            sorted(Counter(f"{item.record.status}/{item.record.reason}" for item in predictions).items())
+        ),
+        "clean_only": {
+            "attempted": len(clean_only),
+            "eligible": sum(item.record.status == "ok" for item in clean_only),
+            "reasons": dict(sorted(Counter(item.record.reason for item in clean_only).items())),
+        },
+        "by_cohort_phase": by_cohort_phase,
+        "evaluated_shapes": {str(key): count for key, count in sorted(evaluated_shapes.items())},
+        "prediction_vector_sha256": prediction_vector_sha256,
+        "top_absolute_relative_errors": top_errors[:20],
+        "layerwise_sha256": LAYERWISE_SHA256,
+    }
+
+
+def build_oracle(artifact_root: Path, sqlite_root: Path, layerwise_csv: Path) -> dict:
     return {
         "oracle_schema": "job-354281415-semantic-fpm/v1",
         "source": {
@@ -296,11 +476,7 @@ def build_oracle(artifact_root: Path, sqlite_root: Path) -> dict:
                 {"cohort": "c128", "phase": "mixed", "counter_id": 1058},
             ],
         },
-        "predictor_oracle": {
-            "status": "pending_adapter_freeze",
-            "required_call_count": 17009,
-            "required_clean_only_call_count": 479,
-        },
+        "predictor_oracle": predictor_summary(artifact_root, layerwise_csv),
     }
 
 
@@ -309,11 +485,19 @@ def main() -> None:
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--sqlite-root", type=Path, required=True)
+    parser.add_argument("--layerwise-csv", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    verify_source_hashes(args.archive, args.artifact_root, args.sqlite_root)
-    rendered = json.dumps(build_oracle(args.artifact_root, args.sqlite_root), indent=2, sort_keys=True) + "\n"
+    verify_source_hashes(args.archive, args.artifact_root, args.sqlite_root, args.layerwise_csv)
+    rendered = (
+        json.dumps(
+            build_oracle(args.artifact_root, args.sqlite_root, args.layerwise_csv),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     args.output.write_text(rendered)
 
 

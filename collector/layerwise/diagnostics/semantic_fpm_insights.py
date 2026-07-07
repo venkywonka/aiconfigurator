@@ -17,7 +17,7 @@ import statistics
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import Protocol, TypeAlias
 
 SCHEMA_VERSION = "fpm-semantic-insights/v1"
 ALIGNMENT_VERSION = "profiled-monotonic-v1"
@@ -180,6 +180,107 @@ class SemanticBinQuery:
     query_ctx_new_total: int
     query_ctx_kv_total: int
     query_decode_kv: int
+
+
+@dataclass(frozen=True)
+class AicQueryShape:
+    """Canonical integer scheduler shape requested from or evaluated by AIC."""
+
+    ctx_requests: int
+    decode_requests: int
+    ctx_new_total: int
+    ctx_kv_total: int
+    decode_kv: int
+
+    @classmethod
+    def from_query(cls, query: SemanticBinQuery) -> AicQueryShape:
+        return cls(
+            ctx_requests=query.ctx_requests,
+            decode_requests=query.decode_requests,
+            ctx_new_total=query.query_ctx_new_total,
+            ctx_kv_total=query.query_ctx_kv_total,
+            decode_kv=query.query_decode_kv,
+        )
+
+    def items(self) -> tuple[tuple[str, int], ...]:
+        return (
+            ("ctx_requests", self.ctx_requests),
+            ("decode_requests", self.decode_requests),
+            ("ctx_new_total", self.ctx_new_total),
+            ("ctx_kv_total", self.ctx_kv_total),
+            ("decode_kv", self.decode_kv),
+        )
+
+
+@dataclass(frozen=True)
+class AxisLookup:
+    """Auditable lookup decision for one scheduler-shape axis."""
+
+    axis: str
+    requested: int
+    evaluated: int | None
+    lower: int | None
+    upper: int | None
+    weight: float | None
+    delta: int | None
+    mode: str
+
+
+@dataclass(frozen=True)
+class OperationLookup:
+    """One lower-level AIC operation interpolation within a fixed scheduler shape."""
+
+    operation: str
+    topology: str
+    requested: int
+    lower: int
+    upper: int
+    weight: float
+    mode: str
+    surface_content_hash: str
+    consumer_operations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AicPredictionRecord:
+    """Versioned, provenance-complete result of one semantic-bin AIC call."""
+
+    configuration_fingerprint: str
+    concurrency: int
+    phase: str
+    semantic_key: str
+    status: str
+    reason: str
+    requested_shape: AicQueryShape
+    evaluated_shape: AicQueryShape | None
+    lookup_policy: str
+    lookup_surface_id: str | None
+    scheduler_surface_content_hash: str | None
+    axis_lookups: tuple[AxisLookup, ...]
+    total_ms: float | None
+    total_basis: str | None
+    compute_ms: float | None
+    communication_ms: float | None
+    other_ms: float | None
+    component_sum_ms: float | None
+    source: str | None
+    match_type: str | None
+    predictor_version: str
+    api_version: str
+    component_classifier_version: str
+    classified_operation_count: int
+    unclassified_operation_count: int
+    operation_inventory: tuple[tuple[str, str], ...]
+    operation_inventory_hash: str
+    operation_values: tuple[tuple[str, float, str], ...]
+    operation_lookups: tuple[OperationLookup, ...]
+    configuration_provenance: str
+
+
+class SemanticBinPredictor(Protocol):
+    """Reusable reducer/predictor seam; called exactly once per clean bin."""
+
+    def predict(self, query: SemanticBinQuery) -> AicPredictionRecord: ...
 
 
 def build_semantic_query(

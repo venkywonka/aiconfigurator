@@ -67,7 +67,7 @@
 #   Capture the clean decode sweep C in {1,4,16,64,128} at TP=8, fixed past_kv=4096,
 #   under nsys windowed capture + per-rank decompose:
 #
-#     STAGES="attribute" \
+#     STAGES="fpm attribute" \
 #     ATTRIBUTE_PHASES="decode" ATTRIBUTE_REAL_WORKLOAD=0 \
 #     DECODE_BATCH_SIZES="1,4,16,64,128" DECODE_PAST_KV=4096 \
 #     ATTRIBUTE_PER_PID=1 \
@@ -106,6 +106,7 @@ SYSTEM="${SYSTEM:-h100_sxm}"            # AIC systems-data SKU dir (comm/compute
 BACKEND="${BACKEND:-vllm}"
 DATA_VERSION="${DATA_VERSION:-0.19.0}"  # systems-data version dir for align; H100 has 0.19.0, NOT 0.20.1
 VLLM_VERSION="${VLLM_VERSION:-0.20.1}"  # actual vLLM used for collection (CSV label + image gate)
+MODEL_REVISION="${MODEL_REVISION:-main}" # exact Hugging Face revision used by the FPM deployment
 
 # ----------------------------------------------------------------------------
 # Containers
@@ -214,7 +215,7 @@ LW_MAX_DECODE_BATCH_SIZE="${LW_MAX_DECODE_BATCH_SIZE:-256}"
 LW_MAX_MODEL_LEN="${LW_MAX_MODEL_LEN:-40960}"   # >= max(LW_GEN_PAST_KV)+ctx margin
 LW_GPU_MEM_UTIL="${LW_GPU_MEM_UTIL:-0.9}"
 LW_GPUS="${LW_GPUS:-0}"                          # single GPU id for the TP-mock
-LW_LATENCY_SOURCE="${LW_LATENCY_SOURCE:-schedule_to_update}"  # P-LW1: full-step wall (=FPM domain); execute_model_gpu for GPU-only sensitivity
+LW_LATENCY_SOURCE="${LW_LATENCY_SOURCE:-auto}"  # context=schedule_to_update; decode=execute_model_gpu (predictor component basis)
 
 # Align / plot.
 PLOT_PHASES="${PLOT_PHASES:-ctx,gen,mixed,allreduce}"
@@ -461,6 +462,28 @@ EOS
 # ============================================================================
 fpm_run_dir() { echo "$OUT_ROOT/fpm/$1/$2"; }   # <slug>/<pareto>
 
+# Build the single workload contract shared by the clean and profiled lanes.
+# Keeping this in one function prevents a real clean run from being paired with
+# a static-sweep Nsight run (or vice versa).
+FPM_WORKLOAD_ARGS=()
+build_fpm_workload_args() {
+  local req="$1" conc="$2"
+  if [[ "$ATTRIBUTE_REAL_WORKLOAD" == "1" ]]; then
+    FPM_WORKLOAD_ARGS=(
+      --real-workload --real-workload-requests "$req" --real-workload-concurrency "$conc"
+      --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE"
+      --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN"
+      --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN"
+    )
+  else
+    FPM_WORKLOAD_ARGS=(--no-real-workload --decode-batches "$DECODE_BATCH_SIZES")
+    if [[ -n "${DECODE_OSL:-}" ]]; then
+      FPM_WORKLOAD_ARGS+=(--decode-osl "$DECODE_OSL")
+    fi
+  fi
+  return 0
+}
+
 stage_fpm() {
   local slug hf kind moe; local m i
   for m in "${MODELS[@]}"; do
@@ -479,6 +502,8 @@ stage_fpm() {
 
       local extra=()
       [[ "$ALLOW_VERSION_MISMATCH" == "1" ]] && extra+=(--allow-version-mismatch --expected-vllm-version "$VLLM_VERSION")
+      build_fpm_workload_args "$req" "$conc"
+      local workload=("${FPM_WORKLOAD_ARGS[@]}")
 
       # Scheduler parity forced via env (FPM shell reads $MAX_NUM_SEQS / $MAX_NUM_BATCHED_TOKENS;
       # the python wrapper inherits os.environ into the subprocess).
@@ -487,13 +512,9 @@ stage_fpm() {
         python3 -m collector.layerwise.fpm.collect \
           --model "$hf" \
           --tp-sizes "$FPM_TP_LIST" --ep-sizes "$EP" \
-          --phases context,decode,mixed \
+          --phases "$ATTRIBUTE_PHASES" \
           --decode-past-kv "$DECODE_PAST_KV" \
-          --real-workload \
-          --real-workload-requests "$req" --real-workload-concurrency "$conc" \
-          --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE" \
-          --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN" \
-          --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN" \
+          "${workload[@]}" \
           --prompt-token-mode safe_ascii \
           --warmup-requests "$FPM_WARMUP_REQUESTS" \
           --image "$DYNAMO_VLLM_IMAGE" \
@@ -689,18 +710,8 @@ stage_attribute() {
       # capture. ATTRIBUTE_REAL_WORKLOAD=0 selects the static decode sweep (decode-only
       # arm): DECODE_BATCH_SIZES drives both request count and concurrency per decode
       # point, at a fixed DECODE_PAST_KV; the real-workload-shape args are dropped.
-      local workload=()
-      if [[ "$ATTRIBUTE_REAL_WORKLOAD" == "1" ]]; then
-        workload=(
-          --real-workload --real-workload-requests "$req" --real-workload-concurrency "$conc"
-          --real-workload-dataset "$FPM_DATASET" --real-workload-shape-source "$FPM_SHAPE_SOURCE"
-          --real-workload-isl-min "$ISL_MIN" --real-workload-isl-max "$ISL_MAX" --real-workload-isl-mean "$ISL_MEAN"
-          --real-workload-osl-min "$OSL_MIN" --real-workload-osl-max "$OSL_MAX" --real-workload-osl-mean "$OSL_MEAN"
-        )
-      else
-        workload=(--no-real-workload --decode-batches "$DECODE_BATCH_SIZES")
-        [[ -n "${DECODE_OSL:-}" ]] && workload+=(--decode-osl "$DECODE_OSL")
-      fi
+      build_fpm_workload_args "$req" "$conc"
+      local workload=("${FPM_WORKLOAD_ARGS[@]}")
 
       local attribute_nsys_flags=(--nsys-profile-worker)
       if [[ "$ATTRIBUTE_FULL_WORKER" == "1" ]]; then
@@ -799,6 +810,84 @@ stage_attribute() {
 
       mark_done "$unit"
     done
+
+    # Mandatory Stage-1 tail: preserve the clean and profiled populations, align
+    # every measured profiled row to its same-run Nsight marker, reduce intact
+    # per-rank kernel tuples, and invoke AIC exactly once per measured clean bin.
+    # This runs only after every requested cohort passed the per-unit attribution
+    # gate above and before report()/the outer collector packages OUT_ROOT.
+    local semantic_unit="attribute_semantic_${slug}"
+    local semantic_out="$OUT_ROOT/semantic_insights"
+    if is_done "$semantic_unit"; then
+      [[ -f "$semantic_out/manifest.json" ]] \
+        || die "$semantic_unit is marked done but $semantic_out/manifest.json is missing"
+      log "skip $semantic_unit (done; FORCE=1 to redo)"
+      continue
+    fi
+    if [[ -e "$semantic_out" ]]; then
+      if [[ "$FORCE" == "1" ]]; then
+        rm -rf "$semantic_out"
+      else
+        die "$semantic_out already exists without a done marker; inspect it or use FORCE=1"
+      fi
+    fi
+
+    local source_job_id="${SEMANTIC_JOB_ID:-${CI_JOB_ID:-}}"
+    local source_pipeline_id="${SEMANTIC_PIPELINE_ID:-${CI_PIPELINE_ID:-}}"
+    local collector_commit="${AUTO_COLLECTOR_COMMIT:-${CI_COMMIT_SHA:-}}"
+    if [[ "$DRY_RUN" != "1" ]]; then
+      [[ -n "$source_job_id" ]] \
+        || die "semantic reducer requires SEMANTIC_JOB_ID or CI_JOB_ID"
+      [[ -n "$source_pipeline_id" ]] \
+        || die "semantic reducer requires SEMANTIC_PIPELINE_ID or CI_PIPELINE_ID"
+      [[ -n "$collector_commit" ]] \
+        || die "semantic reducer requires AUTO_COLLECTOR_COMMIT or CI_COMMIT_SHA"
+    fi
+
+    local cohort_args=()
+    for i in "${!PARETO_NAMES[@]}"; do
+      local pname="${PARETO_NAMES[$i]}" conc="${PARETO_CONCURRENCY[$i]}"
+      local clean_run; clean_run="$(fpm_run_dir "$slug" "$pname")"
+      local profiled_run="$clean_run/attribute"
+      local cohort_sqlite; cohort_sqlite="$(ls -1 "$profiled_run"/nsys/*.sqlite 2>/dev/null | head -1 || true)"
+      if [[ "$DRY_RUN" != "1" ]]; then
+        [[ -f "$clean_run/fpm_metrics_phase.csv" ]] \
+          || die "semantic reducer clean CSV missing: $clean_run/fpm_metrics_phase.csv"
+        [[ -f "$profiled_run/fpm_metrics_phase.csv" ]] \
+          || die "semantic reducer profiled CSV missing: $profiled_run/fpm_metrics_phase.csv"
+        [[ -n "$cohort_sqlite" ]] \
+          || die "semantic reducer Nsight SQLite missing under $profiled_run/nsys"
+      fi
+      cohort_args+=(--cohort "${conc}:${clean_run}:${profiled_run}:${cohort_sqlite}")
+    done
+    local chunked_flag="--no-chunked-prefill"
+    [[ "$FPM_ENABLE_CHUNKED_PREFILL" == "1" ]] && chunked_flag="--chunked-prefill"
+    local measured_segment="real"
+    [[ "$ATTRIBUTE_REAL_WORKLOAD" == "0" ]] && measured_segment="sweep"
+    local lwcsv; lwcsv="$(lw_csv "$slug")"
+    run_env "PYTHONPATH=$AIC_REPO:$AIC_REPO/src${PYTHONPATH:+:$PYTHONPATH}" \
+      "$LOG_DIR/${semantic_unit}.log" \
+      python3 -m collector.layerwise.diagnostics.semantic_fpm_stage1 \
+        "${cohort_args[@]}" \
+        --output-dir "$semantic_out" \
+        --aic-repo "$AIC_REPO" \
+        --auto-collector-commit "$collector_commit" \
+        --layerwise-csv "$lwcsv" \
+        --model "$hf" \
+        --model-revision "$MODEL_REVISION" \
+        --system "$SYSTEM" \
+        --comm-version "$DATA_VERSION" \
+        "$chunked_flag" \
+        --ep-size "$EP" \
+        --gemm-quant "$GEMM_QUANT" \
+        --attention-quant "$ATTN_QUANT" \
+        --kv-cache-quant "$KV_QUANT" \
+        --moe-quant "$MOE_QUANT" \
+        --job-id "$source_job_id" \
+        --pipeline-id "$source_pipeline_id" \
+        --measured-segment "$measured_segment" \
+      || die "semantic Stage-1 reducer failed; refusing to mark $semantic_unit done"
+    mark_done "$semantic_unit"
   done
 }
 
@@ -822,4 +911,6 @@ main() {
   report
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

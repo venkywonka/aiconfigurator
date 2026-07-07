@@ -88,10 +88,35 @@ def test_job_354281415_population_oracle_pins_all_rows_and_clean_only_mass():
     assert sum(item["shared_bins"] for item in population["by_cohort"].values()) == population["shared_bins"]
 
 
-def test_job_354281415_oracle_keeps_predictor_gate_explicitly_open():
+def test_job_354281415_oracle_freezes_full_clean_population_predictor_proxy():
     predictor = _load_oracle()["predictor_oracle"]
-    assert predictor == {
-        "status": "pending_adapter_freeze",
-        "required_call_count": 17009,
-        "required_clean_only_call_count": 479,
+    assert predictor["status"] == "frozen_artifact_proxy_v1"
+    assert predictor["policy"] == "artifact-proxy-v1"
+    assert predictor["call_count"] == 17009
+    assert predictor["status_reason"] == {
+        "ok/predicted": 11276,
+        "unavailable/missing_surface": 5606,
+        "unavailable/unsupported_phase": 127,
+    }
+    assert predictor["clean_only"] == {
+        "attempted": 479,
+        "eligible": 65,
+        "reasons": {"missing_surface": 289, "predicted": 65, "unsupported_phase": 125},
+    }
+    assert predictor["by_cohort_phase"]["c1/decode"]["eligible"] == 4507
+    assert predictor["by_cohort_phase"]["c16/decode"]["eligible"] == 3546
+    assert predictor["by_cohort_phase"]["c64/decode"]["eligible"] == 2037
+    assert predictor["by_cohort_phase"]["c128/decode"]["eligible"] == 1186
+    assert predictor["production_exact_surface_eligible"] == 0
+    assert predictor["production_exact_surface_reason"] == ("cached_layerwise_decode_max_num_seqs_64_vs_runtime_256")
+    assert predictor["layerwise_sha256"] == ("17781fac0d806c3683642c85e0f5e76f6046ab8739ad154fc1e2db01646c18f9")
+    assert sum(predictor["evaluated_shapes"].values()) == 11276
+    assert predictor["prediction_vector_sha256"] == ("27565b556f21dc49b3f598892c7bf1214b25643afa27444a5e974adc47e00402")
+    assert len(predictor["top_absolute_relative_errors"]) == 20
+    assert predictor["top_absolute_relative_errors"][0] == {
+        "bin_id": "b3814eae03a39e200db0897382f29c0d9cbed982836821d2e86bbeee0111f1ec",
+        "concurrency": 1,
+        "phase": "decode",
+        "relative_error": 0.7835103103671003,
+        "semantic_key": "[0,1,null,null,9725]",
     }
