@@ -1291,7 +1291,6 @@ snapshot_effective_vllm_config() {
     local snapshot_rc=0
     local snapshot_runtime_opts=(
         --network host \
-        --gpus "${GPUS}" \
         -v "${RUN_DIR}:/work" \
         -v "${HF_HOME_HOST}:/work/hf-home" \
         "${HF_TOKEN_DOCKER_MOUNTS[@]}" \
@@ -1301,7 +1300,7 @@ snapshot_effective_vllm_config() {
         -e "TRANSFORMERS_CACHE=/work/hf-home/transformers" \
         "${MODEL_POLICY_DOCKER_ENV[@]}"
     )
-    runtime_run_oneshot "" "" snapshot_runtime_opts -- \
+    runtime_run_oneshot "" "${GPUS}" snapshot_runtime_opts -- \
         "${HF_TOKEN_CONTAINER_PREFIX[@]}" \
         python3 /work/vllm_deployment.py snapshot-effective \
             --args-json "${VLLM_DEPLOYMENT_ARGS_JSON}" \

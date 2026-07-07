@@ -450,7 +450,9 @@ def test_effective_config_snapshot_container_has_worker_gpu_visibility():
         "resolved_max_model_len()", maxsplit=1
     )[0]
 
-    assert '--gpus "${GPUS}"' in snapshot
+    options = snapshot.split("snapshot_runtime_opts=(", maxsplit=1)[1].split(")", maxsplit=1)[0]
+    assert '--gpus "${GPUS}"' not in options
+    assert 'runtime_run_oneshot "" "${GPUS}" snapshot_runtime_opts --' in snapshot
 
 
 @pytest.mark.parametrize("runtime", ("docker", "enroot"))
