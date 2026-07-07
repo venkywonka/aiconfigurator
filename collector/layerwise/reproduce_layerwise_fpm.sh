@@ -416,6 +416,8 @@ stage_layerwise() {
     log "Layerwise: $hf ($kind) tp=$LW_TP_LIST -> $rdir/layerwise.csv"
 
     # In-container collect command (modeled on the committed run_layerwise_smoke.sh).
+    # Decode rows must carry the paired FPM scheduler surface; max-decode-batch-size
+    # only bounds datapoint generation and does not set max_num_seqs.
     local incmd
     incmd=$(cat <<EOS
 set -euo pipefail
@@ -429,6 +431,7 @@ python3 -m collector.layerwise.vllm.collect \
   --phases ${LW_PHASES} --run-preset ${LW_RUN_PRESET} \
   --ctx-new-tokens ${LW_CTX_NEW_TOKENS} ${LW_CTX_PAST_KV:+--ctx-past-kv ${LW_CTX_PAST_KV}} --ctx-batch-sizes auto \
   --gen-batch-sizes ${LW_GEN_BATCH_SIZES} --gen-past-kv ${LW_GEN_PAST_KV} \
+  --gen-max-num-seqs ${FPM_MAX_NUM_SEQS} \
   --max-decode-batch-size ${LW_MAX_DECODE_BATCH_SIZE} \
   --gemm-quant ${GEMM_QUANT} --attn-quant ${ATTN_QUANT} --kv-quant ${KV_QUANT} --moe-quant ${MOE_QUANT} \
   --system ${SYSTEM} --framework-version ${VLLM_VERSION} \

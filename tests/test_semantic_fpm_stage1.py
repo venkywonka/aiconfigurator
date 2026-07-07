@@ -106,6 +106,7 @@ def test_attribute_driver_invokes_stage1_after_per_cohort_gate_and_before_tail_d
 
     assert gate < invocation < tail_done
     assert 'LW_LATENCY_SOURCE="${LW_LATENCY_SOURCE:-auto}"' in source
+    assert "--gen-max-num-seqs ${FPM_MAX_NUM_SEQS}" in source
     assert '[[ "$ATTRIBUTE_REAL_WORKLOAD" == "0" ]] && measured_segment="sweep"' in source
     assert '--measured-segment "$measured_segment"' in source
     assert 'attribute) log "== STAGE attribute =="; stage_attribute;;' in source
