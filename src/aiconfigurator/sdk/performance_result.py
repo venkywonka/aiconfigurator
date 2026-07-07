@@ -24,8 +24,9 @@ class PerformanceResult(float):
         - power: watts (W) - derived property
         - source: ``"silicon"`` (table data) | ``"empirical"`` (empirical
           formula fallback) | ``"sol"`` (explicit SOL estimate) |
-          ``"estimated"`` (modeled from measured components) | ``"mixed"``
-          (sum of values from different sources)
+          ``"estimated"`` (modeled from measured components) | ``"overlay"``
+          (validated on-demand measurement) | ``"mixed"`` (sum of values from
+          different sources)
 
     Note: 1 W·ms = 1 mJ. We use W·ms to match latency units (ms).
           To convert to Joules: divide by 1000 (J = W·s = W·ms / 1000)
@@ -71,8 +72,9 @@ class PerformanceResult(float):
             energy: The energy value in watt-milliseconds (W·ms)
             source: Where this measurement came from -- "silicon" (table data),
                 "empirical" (empirical formula fallback), "sol" (explicit SOL
-                estimate), "estimated" (modeled from measured components), or
-                "mixed" (sum of values from different sources).
+                estimate), "estimated" (modeled from measured components),
+                "overlay" (validated on-demand measurement), or "mixed" (sum
+                of values from different sources).
         """
         instance = float.__new__(cls, latency)
         return instance
