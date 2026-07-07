@@ -265,27 +265,7 @@ class HardwareInventory:
     topology_fingerprint: str
 
     def restrict(self, gpu_ids: tuple[int, ...]) -> "HardwareInventory":
-        if len(set(gpu_ids)) != len(gpu_ids):
-            raise ValueError("assigned GPU ids must be unique")
-        by_id = {device.index: device for device in self.devices}
-        try:
-            devices = tuple(by_id[gpu_id] for gpu_id in gpu_ids)
-        except KeyError as error:
-            raise ValueError(f"assigned GPU id is not present: {error.args[0]}") from error
-        allowed = set(gpu_ids)
-        links = {pair: link for pair, link in self.links.items() if set(pair) <= allowed}
-        fabric_domains = _derive_nvlink_domains(tuple(sorted(allowed)), links)
-        return HardwareInventory(
-            schema_revision=self.schema_revision,
-            devices=devices,
-            links=links,
-            fabric_domains=fabric_domains,
-            topology_fingerprint=canonical_topology_fingerprint(
-                self.schema_revision,
-                devices,
-                links,
-            ),
-        )
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,7 +292,12 @@ class WorkerLeaseKey:
     topology_fingerprint: str
 ```
 
-Export these names from `aiconfigurator.collector.__init__`. `canonical_topology_fingerprint` sorts device classes and symmetric links, excludes physical UUID/index from compatibility, and includes the parser schema revision plus normalized link tokens.
+This Task 1 sketch only reserves the shared type surface. Task 2 owns the final
+peer-capability/evidence fields and `restrict()` implementation. In particular,
+restriction must retain stable full-host contention labels as specified in Task
+2; it must not derive and renumber induced-subgraph domains.
+
+Export these names from `aiconfigurator.collector.__init__`. `canonical_topology_fingerprint` assigns local ordinals by ascending visible GPU index, binds each device class and symmetric link/capability data to those ordinals, excludes UUID, PCI bus id, and raw physical-index values, and includes the parser schema revision. Arbitrary index permutations may therefore produce a fail-safe extra miss in V1; graph-isomorphism canonicalization is deferred.
 
 - [ ] **Step 4: Move shared registry contracts under the packaged namespace**
 
@@ -338,6 +323,9 @@ git commit -m "feat: declare optional lazy collector adapters"
 ### Task 2: Discover GPUs, links, and contention domains
 
 **Files:**
+- Modify: `docs/superpowers/plans/2026-07-06-aic-hardware-aware-collector-runtime.md`
+- Modify: `src/aiconfigurator/collector/__init__.py`
+- Modify: `src/aiconfigurator/collector/types.py`
 - Create: `src/aiconfigurator/collector/hardware.py`
 - Test: `tests/unit/collector/lazy/test_hardware.py`
 
@@ -360,7 +348,7 @@ GPU2    SYS  SYS   X   NV4  32-63
 GPU3    SYS  SYS  NV4   X   32-63
 ```
 
-Assert device indices are `(0, 1, 2, 3)`, links are symmetric, fabric domains are `{0: "nvlink:0", 1: "nvlink:0", 2: "nvlink:1", 3: "nvlink:1"}`, and the topology fingerprint is stable across row/order changes. Add `inventory.restrict((2, 3))` and assert it preserves physical ids/links while excluding GPUs 0/1 and recomputes both fabric domains and the subset fingerprint; `inventory.restrict((2,))` must drop the former `nvlink:1` domain rather than retaining a singleton fabric tag. Duplicate or absent requested ids raise `ValueError`.
+Assert device indices are `(0, 1, 2, 3)`, links are symmetric, fabric domains are `{0: "nvlink:0", 1: "nvlink:0", 2: "nvlink:1", 3: "nvlink:1"}`, and the topology fingerprint is stable across row/order changes. Add `inventory.restrict((2, 3))` and assert it preserves physical ids/links, the stable full-host `nvlink:1` label, and a subset fingerprint while excluding GPUs 0/1; `inventory.restrict((2,))` must drop the former domain rather than retaining a singleton tag. Duplicate or absent requested ids raise `ValueError`.
 
 Add three more fixtures: a PCIe-only system where singleton GPUs have no `nvlink:*` domain, an NVSwitch/Blackwell-style matrix using the driver's documented bonded-link `NV#` tokens whose normalized graph produces one shared domain and a fingerprint distinct from the H100 fixture, and matrices containing `FOO` plus an unknown NV-prefixed token such as `NVX`, both of which raise `HardwareDiscoveryError`. Also add malformed-row and missing-GPU tests that fail rather than silently returning a partial inventory. Parser behavior changes require a new schema revision and therefore a new fingerprint.
 
@@ -372,108 +360,21 @@ Expected: import failure for `aiconfigurator.collector.hardware`.
 
 - [ ] **Step 3: Implement discovery with injectable command execution**
 
-Define these public functions:
+The original two-command sketch was superseded by the reviewed fail-closed capability contract. Define these public functions:
 
 ```python
-import csv
-import io
-import re
-import subprocess
-from collections.abc import Callable
+class HardwareDiscoveryError(RuntimeError): ...
 
-from .types import GpuDevice, HardwareInventory, _derive_nvlink_domains, _is_nvlink_token
-
-
-class HardwareDiscoveryError(RuntimeError):
-    pass
-
-
-_NON_NVLINK_TOKENS = frozenset({"PIX", "PXB", "PHB", "NODE", "SYS"})
-
-
-def normalize_link_token(raw_token: str) -> str:
-    token = raw_token.strip().upper()
-    if _is_nvlink_token(token) or token in _NON_NVLINK_TOKENS:
-        return token
-    raise HardwareDiscoveryError(f"unsupported topology link token {raw_token!r}")
-
-
-def parse_gpu_query(text: str) -> tuple[GpuDevice, ...]:
-    devices: list[GpuDevice] = []
-    for row in csv.reader(io.StringIO(text)):
-        fields = [field.strip() for field in row]
-        if len(fields) != 4:
-            raise HardwareDiscoveryError(f"invalid GPU query row: {row!r}")
-        try:
-            index = int(fields[0])
-        except ValueError as error:
-            raise HardwareDiscoveryError(f"invalid GPU index {fields[0]!r}") from error
-        devices.append(GpuDevice(index, fields[1], fields[2], fields[3]))
-    devices.sort(key=lambda device: device.index)
-    if not devices or [device.index for device in devices] != list(range(len(devices))):
-        raise HardwareDiscoveryError("GPU query must contain contiguous indices starting at zero")
-    return tuple(devices)
-
-
-def parse_topology(text: str, devices: tuple[GpuDevice, ...]) -> HardwareInventory:
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
-        raise HardwareDiscoveryError("empty nvidia-smi topology")
-    columns = [int(value) for value in re.findall(r"GPU(\d+)", lines[0])]
-    expected = [device.index for device in devices]
-    if columns != expected:
-        raise HardwareDiscoveryError(f"topology columns {columns} do not match GPUs {expected}")
-
-    links: dict[tuple[int, int], str] = {}
-    for line in lines[1:]:
-        fields = line.split()
-        if not fields or not fields[0].startswith("GPU"):
-            continue
-        row_gpu = int(fields[0][3:])
-        tokens = fields[1 : 1 + len(columns)]
-        if len(tokens) != len(columns):
-            raise HardwareDiscoveryError(f"short topology row for GPU{row_gpu}")
-        for column_gpu, raw_token in zip(columns, tokens, strict=True):
-            if row_gpu != column_gpu:
-                links[(row_gpu, column_gpu)] = normalize_link_token(raw_token)
-    if len(links) != len(devices) * (len(devices) - 1):
-        raise HardwareDiscoveryError("topology matrix is incomplete")
-    for (left, right), token in links.items():
-        if links.get((right, left)) != token:
-            raise HardwareDiscoveryError(f"asymmetric topology link GPU{left}/GPU{right}")
-
-    fabric_domains = _derive_nvlink_domains(tuple(expected), links)
-    schema_revision = "nvidia-smi-topology-v1"
-    return HardwareInventory(
-        schema_revision=schema_revision,
-        devices=devices,
-        links=links,
-        fabric_domains=fabric_domains,
-        topology_fingerprint=canonical_topology_fingerprint(schema_revision, devices, links),
-    )
-
-
+def normalize_link_token(raw_token: str) -> str: ...
+def parse_gpu_query(text: str) -> tuple[GpuDevice, ...]: ...
+def parse_topology(text: str, devices: tuple[GpuDevice, ...]) -> Mapping[tuple[int, int], str]: ...
+def parse_p2p_matrix(text: str, devices: tuple[GpuDevice, ...]) -> Mapping[tuple[int, int], bool]: ...
 def discover_hardware(
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> HardwareInventory:
-    query = run(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,uuid,name,pci.bus_id",
-            "--format=csv,noheader",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    topology = run(
-        ["nvidia-smi", "topo", "-m"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return parse_topology(topology.stdout, parse_gpu_query(query.stdout))
+) -> HardwareInventory: ...
 ```
+
+`topo -m` describes physical paths only. Parse read and write peer capability independently, retain directed matrices, and consider a pair usable only when both directions are `OK` in both matrices. Recognize `CNS`, `GNS`, `TNS`, `NS`, `U`, and `DR` as documented negative statuses; any other off-diagonal status is malformed rather than silently negative. A malformed or unavailable peer probe records an error and installs complete all-false matrices so single-GPU collection survives while every multi-GPU request fails closed. GPU query or physical topology failure remains fatal.
 
 Recognize only the documented normalized link classes: bonded NVLink/NVSwitch links must match `NV[1-9][0-9]*` exactly, and non-NV classes are the exact set `PIX`, `PXB`, `PHB`, `NODE`, and `SYS`. Reject every other token—including arbitrary `NV*` strings—before inserting it into `links`. Build NVLink connected components only from validated `NV#` edges and assign an `nvlink:*` domain only when a component has at least two GPUs. Preserve all normalized edges in the fingerprint even when they do not form an NVLink domain, and retain the raw `nvidia-smi topo -m` output in collection/session provenance for auditability.
 
@@ -486,9 +387,13 @@ Recognize only the documented normalized link classes: bonded NVLink/NVSwitch li
     "--format=csv,noheader",
 ]
 ["nvidia-smi", "topo", "-m"]
+["nvidia-smi", "topo", "-p2p", "r"]
+["nvidia-smi", "topo", "-p2p", "w"]
 ```
 
-Treat recognized `NV#`/NVSwitch tokens as NVLink, `PIX`/`PXB`/`PHB` as P2P-capable, and `SYS`/`NODE` as non-P2P for initial placement. Build multi-GPU NVLink connected components in ascending GPU order and name them `nvlink:0`, `nvlink:1`, and so on. Preserve normalized and raw link tokens for provenance.
+Never infer peer capability from `NV#`, `PIX`, `PXB`, `PHB`, `NODE`, or `SYS`. Build physical NVLink connected components in ascending GPU order and name them `nvlink:0`, `nvlink:1`, and so on; the scheduler separately requires explicit read/write capability. Preserve raw query/topology/read/write output plus probe errors in `HardwareDiscoveryEvidence`, exclude it from identity, and retain stable full-host domain labels in restricted views until fewer than two assigned GPUs remain.
+
+V1 orchestration must guarantee that the GPUs locally visible to NVML are exactly the coordinator's assigned pool, supplied by a whole-node allocation or equivalent device masking, and that they enumerate as contiguous local indices `0..N-1`. Non-contiguous output fails loudly. A bare partial allocation implemented only with `CUDA_VISIBLE_DEVICES` can still expose the whole host through `nvidia-smi`; Task 2 cannot distinguish that contiguous host-wide output from a whole-node lease, so ownership is an explicit caller precondition rather than an enforced discovery property. Do not invoke V1 discovery in that environment; partial-node support requires a later lease-UUID input and exact visible-set check. Worker launch resolves selected discovery devices to UUIDs before setting `CUDA_VISIBLE_DEVICES`, so child-local ordinal remapping never changes parent placement identity.
 
 - [ ] **Step 4: Run and commit hardware discovery**
 
@@ -497,7 +402,7 @@ Run: `pytest -m unit tests/unit/collector/lazy/test_hardware.py -v`
 Expected: all parser and failure tests pass without a GPU.
 
 ```bash
-git add src/aiconfigurator/collector/hardware.py src/aiconfigurator/collector/types.py tests/unit/collector/lazy/test_hardware.py
+git add docs/superpowers/plans/2026-07-06-aic-hardware-aware-collector-runtime.md src/aiconfigurator/collector/__init__.py src/aiconfigurator/collector/hardware.py src/aiconfigurator/collector/types.py tests/unit/collector/lazy/test_hardware.py
 git commit -m "feat: inventory GPU and fabric resources"
 ```
 
