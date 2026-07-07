@@ -1,0 +1,1542 @@
+{
+  "alignment": {
+    "c1": {
+      "canonical_markers_per_rank": 5652,
+      "first_mapping": {
+        "fpm_counter_id": 1053,
+        "fpm_sequence_index": 0,
+        "marker_canonical_index": 1028,
+        "marker_decode_batch": 0,
+        "marker_mean_decode_kv": 0,
+        "marker_step": 1029,
+        "measure_run": 0
+      },
+      "last_mapping": {
+        "fpm_counter_id": 5664,
+        "fpm_sequence_index": 4611,
+        "marker_canonical_index": 5649,
+        "marker_decode_batch": 1,
+        "marker_mean_decode_kv": 17116,
+        "marker_step": 5650,
+        "measure_run": 0
+      },
+      "mapped_rows": 4612,
+      "mapping_hash": "c799214e308844abcc81b3c38dcb20cf84ba2e4694adaabccde9edac579171f7",
+      "nonmonotonic": [
+        [
+          1,
+          2,
+          0,
+          0
+        ],
+        [
+          16,
+          2,
+          15,
+          0
+        ],
+        [
+          32,
+          2,
+          31,
+          0
+        ],
+        [
+          64,
+          2,
+          63,
+          0
+        ],
+        [
+          128,
+          1,
+          127,
+          0
+        ],
+        [
+          256,
+          1,
+          255,
+          0
+        ],
+        [
+          512,
+          1,
+          511,
+          0
+        ],
+        [
+          1024,
+          1,
+          1023,
+          0
+        ],
+        [
+          2048,
+          1,
+          2047,
+          0
+        ],
+        [
+          4096,
+          1,
+          4095,
+          0
+        ]
+      ],
+      "prefix_markers": 1028,
+      "profiled_fpm_rows": 4612,
+      "rank_keys": [
+        "281512171800745",
+        "281512188577962",
+        "281512205355179",
+        "281512222132396",
+        "281512238909613",
+        "281512255686830",
+        "281512272464047",
+        "281512289241264"
+      ],
+      "raw_markers_per_rank": 5662,
+      "segments": [
+        {
+          "end_marker_canonical_index": 1143,
+          "end_marker_step": 1144,
+          "mapped_rows": 116,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1028,
+          "start_marker_step": 1029
+        },
+        {
+          "end_marker_canonical_index": 1245,
+          "end_marker_step": 1246,
+          "mapped_rows": 100,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1146,
+          "start_marker_step": 1147
+        },
+        {
+          "end_marker_canonical_index": 1347,
+          "end_marker_step": 1348,
+          "mapped_rows": 100,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1248,
+          "start_marker_step": 1249
+        },
+        {
+          "end_marker_canonical_index": 1449,
+          "end_marker_step": 1450,
+          "mapped_rows": 100,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1350,
+          "start_marker_step": 1351
+        },
+        {
+          "end_marker_canonical_index": 1551,
+          "end_marker_step": 1552,
+          "mapped_rows": 100,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1452,
+          "start_marker_step": 1453
+        },
+        {
+          "end_marker_canonical_index": 5649,
+          "end_marker_step": 5650,
+          "mapped_rows": 4096,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1554,
+          "start_marker_step": 1555
+        }
+      ],
+      "skipped_markers": [
+        1145,
+        1146,
+        1247,
+        1248,
+        1349,
+        1350,
+        1451,
+        1452,
+        1553,
+        1554
+      ],
+      "suffix_markers": 2
+    },
+    "c128": {
+      "canonical_markers_per_rank": 5272,
+      "first_mapping": {
+        "fpm_counter_id": 1058,
+        "fpm_sequence_index": 0,
+        "marker_canonical_index": 1028,
+        "marker_decode_batch": 0,
+        "marker_mean_decode_kv": 0,
+        "marker_step": 1029,
+        "measure_run": 0
+      },
+      "last_mapping": {
+        "fpm_counter_id": 5299,
+        "fpm_sequence_index": 4241,
+        "marker_canonical_index": 5269,
+        "marker_decode_batch": 1,
+        "marker_mean_decode_kv": 18429,
+        "marker_step": 5270,
+        "measure_run": 0
+      },
+      "mapped_rows": 4242,
+      "mapping_hash": "ed596b1dfdb35462ea5cec883bdf136b7f54e720d659de6339e2a30d7b4e5748",
+      "nonmonotonic": [
+        [
+          1,
+          2,
+          0,
+          0
+        ],
+        [
+          16,
+          2,
+          15,
+          0
+        ],
+        [
+          32,
+          2,
+          31,
+          0
+        ],
+        [
+          64,
+          2,
+          63,
+          0
+        ],
+        [
+          128,
+          1,
+          127,
+          0
+        ],
+        [
+          256,
+          1,
+          255,
+          0
+        ],
+        [
+          512,
+          1,
+          511,
+          0
+        ],
+        [
+          1024,
+          1,
+          1023,
+          0
+        ],
+        [
+          1,
+          5,
+          0,
+          0
+        ],
+        [
+          1,
+          9,
+          0,
+          0
+        ],
+        [
+          1,
+          13,
+          0,
+          0
+        ],
+        [
+          1,
+          18,
+          0,
+          0
+        ],
+        [
+          1,
+          21,
+          0,
+          0
+        ],
+        [
+          1,
+          25,
+          0,
+          0
+        ],
+        [
+          1,
+          28,
+          0,
+          0
+        ],
+        [
+          1,
+          32,
+          0,
+          0
+        ],
+        [
+          1,
+          37,
+          0,
+          0
+        ],
+        [
+          1,
+          42,
+          0,
+          0
+        ],
+        [
+          1,
+          45,
+          0,
+          0
+        ],
+        [
+          1,
+          50,
+          0,
+          0
+        ],
+        [
+          1,
+          53,
+          0,
+          0
+        ],
+        [
+          1,
+          57,
+          0,
+          0
+        ],
+        [
+          1,
+          61,
+          0,
+          0
+        ],
+        [
+          1,
+          67,
+          0,
+          0
+        ],
+        [
+          1,
+          71,
+          0,
+          0
+        ],
+        [
+          1,
+          76,
+          0,
+          0
+        ],
+        [
+          1,
+          82,
+          0,
+          0
+        ],
+        [
+          1,
+          90,
+          0,
+          0
+        ],
+        [
+          1,
+          96,
+          0,
+          0
+        ],
+        [
+          1,
+          99,
+          0,
+          0
+        ],
+        [
+          1,
+          104,
+          0,
+          0
+        ],
+        [
+          1,
+          107,
+          0,
+          0
+        ],
+        [
+          1,
+          112,
+          0,
+          0
+        ],
+        [
+          1,
+          118,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          124,
+          0,
+          0
+        ],
+        [
+          1,
+          128,
+          0,
+          0
+        ],
+        [
+          16,
+          128,
+          15,
+          0
+        ],
+        [
+          32,
+          128,
+          31,
+          0
+        ],
+        [
+          64,
+          128,
+          63,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          118,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          120,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          120,
+          0,
+          0
+        ],
+        [
+          1,
+          117,
+          0,
+          0
+        ],
+        [
+          1,
+          117,
+          0,
+          0
+        ],
+        [
+          1,
+          119,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          122,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          120,
+          0,
+          0
+        ],
+        [
+          1,
+          120,
+          0,
+          0
+        ],
+        [
+          1,
+          124,
+          0,
+          0
+        ],
+        [
+          1,
+          126,
+          0,
+          0
+        ],
+        [
+          1,
+          128,
+          0,
+          0
+        ],
+        [
+          16,
+          128,
+          15,
+          0
+        ],
+        [
+          32,
+          128,
+          31,
+          0
+        ],
+        [
+          64,
+          127,
+          63,
+          0
+        ],
+        [
+          1,
+          124,
+          0,
+          0
+        ],
+        [
+          1,
+          125,
+          0,
+          0
+        ],
+        [
+          1,
+          121,
+          0,
+          0
+        ],
+        [
+          1,
+          123,
+          0,
+          0
+        ],
+        [
+          1,
+          126,
+          0,
+          0
+        ],
+        [
+          16,
+          84,
+          15,
+          0
+        ],
+        [
+          32,
+          62,
+          31,
+          0
+        ],
+        [
+          64,
+          58,
+          63,
+          0
+        ],
+        [
+          128,
+          32,
+          127,
+          0
+        ],
+        [
+          256,
+          26,
+          255,
+          0
+        ],
+        [
+          512,
+          19,
+          511,
+          0
+        ],
+        [
+          1024,
+          13,
+          1023,
+          0
+        ],
+        [
+          2048,
+          7,
+          2047,
+          0
+        ]
+      ],
+      "prefix_markers": 1028,
+      "profiled_fpm_rows": 4242,
+      "rank_keys": [
+        "281512171800745",
+        "281512188577962",
+        "281512205355179",
+        "281512222132396",
+        "281512238909613",
+        "281512255686830",
+        "281512272464047",
+        "281512289241264"
+      ],
+      "raw_markers_per_rank": 5358,
+      "segments": [
+        {
+          "end_marker_canonical_index": 5269,
+          "end_marker_step": 5270,
+          "mapped_rows": 4242,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1028,
+          "start_marker_step": 1029
+        }
+      ],
+      "skipped_markers": [],
+      "suffix_markers": 2
+    },
+    "c16": {
+      "canonical_markers_per_rank": 5129,
+      "first_mapping": {
+        "fpm_counter_id": 1052,
+        "fpm_sequence_index": 0,
+        "marker_canonical_index": 1028,
+        "marker_decode_batch": 0,
+        "marker_mean_decode_kv": 0,
+        "marker_step": 1029,
+        "measure_run": 0
+      },
+      "last_mapping": {
+        "fpm_counter_id": 5150,
+        "fpm_sequence_index": 4098,
+        "marker_canonical_index": 5126,
+        "marker_decode_batch": 1,
+        "marker_mean_decode_kv": 9354,
+        "marker_step": 5127,
+        "measure_run": 0
+      },
+      "mapped_rows": 4099,
+      "mapping_hash": "4a0b14e5f9d5e86c1714df866dedce7ceb5c3d915b31a0621f3c370ba518dcab",
+      "nonmonotonic": [
+        [
+          1,
+          3,
+          0,
+          0
+        ],
+        [
+          16,
+          2,
+          15,
+          0
+        ],
+        [
+          32,
+          2,
+          31,
+          0
+        ],
+        [
+          64,
+          2,
+          63,
+          0
+        ],
+        [
+          128,
+          1,
+          127,
+          0
+        ],
+        [
+          256,
+          1,
+          255,
+          0
+        ],
+        [
+          512,
+          1,
+          511,
+          0
+        ],
+        [
+          1024,
+          1,
+          1023,
+          0
+        ],
+        [
+          1,
+          7,
+          0,
+          0
+        ],
+        [
+          1,
+          14,
+          0,
+          0
+        ],
+        [
+          1,
+          16,
+          0,
+          0
+        ],
+        [
+          16,
+          16,
+          15,
+          0
+        ],
+        [
+          32,
+          16,
+          31,
+          0
+        ],
+        [
+          64,
+          16,
+          63,
+          0
+        ],
+        [
+          1,
+          13,
+          0,
+          0
+        ],
+        [
+          1,
+          16,
+          0,
+          0
+        ],
+        [
+          16,
+          16,
+          15,
+          0
+        ],
+        [
+          32,
+          16,
+          31,
+          0
+        ],
+        [
+          64,
+          16,
+          63,
+          0
+        ],
+        [
+          1,
+          11,
+          0,
+          0
+        ],
+        [
+          16,
+          10,
+          15,
+          0
+        ],
+        [
+          32,
+          9,
+          31,
+          0
+        ],
+        [
+          64,
+          8,
+          63,
+          0
+        ],
+        [
+          128,
+          5,
+          127,
+          0
+        ],
+        [
+          256,
+          3,
+          255,
+          0
+        ],
+        [
+          512,
+          3,
+          511,
+          0
+        ],
+        [
+          1024,
+          2,
+          1023,
+          0
+        ],
+        [
+          2048,
+          1,
+          2047,
+          0
+        ]
+      ],
+      "prefix_markers": 1028,
+      "profiled_fpm_rows": 4099,
+      "rank_keys": [
+        "281512222132396",
+        "281512238909613",
+        "281512255686830",
+        "281512272464047",
+        "281512289241264",
+        "281512306018481",
+        "281512322795698",
+        "281512339572915"
+      ],
+      "raw_markers_per_rank": 5157,
+      "segments": [
+        {
+          "end_marker_canonical_index": 5126,
+          "end_marker_step": 5127,
+          "mapped_rows": 4099,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1028,
+          "start_marker_step": 1029
+        }
+      ],
+      "skipped_markers": [],
+      "suffix_markers": 2
+    },
+    "c64": {
+      "canonical_markers_per_rank": 5229,
+      "first_mapping": {
+        "fpm_counter_id": 1054,
+        "fpm_sequence_index": 0,
+        "marker_canonical_index": 1027,
+        "marker_decode_batch": 0,
+        "marker_mean_decode_kv": 0,
+        "marker_step": 1028,
+        "measure_run": 0
+      },
+      "last_mapping": {
+        "fpm_counter_id": 5253,
+        "fpm_sequence_index": 4199,
+        "marker_canonical_index": 5226,
+        "marker_decode_batch": 1,
+        "marker_mean_decode_kv": 10729,
+        "marker_step": 5227,
+        "measure_run": 0
+      },
+      "mapped_rows": 4200,
+      "mapping_hash": "9ee7980935f2c0e92e30f86e67ae23a8902987b7cbb4a1f439886b5b11a2e7a6",
+      "nonmonotonic": [
+        [
+          1,
+          2,
+          0,
+          0
+        ],
+        [
+          1,
+          3,
+          0,
+          0
+        ],
+        [
+          16,
+          2,
+          15,
+          0
+        ],
+        [
+          32,
+          2,
+          31,
+          0
+        ],
+        [
+          64,
+          2,
+          63,
+          0
+        ],
+        [
+          128,
+          1,
+          127,
+          0
+        ],
+        [
+          256,
+          1,
+          255,
+          0
+        ],
+        [
+          512,
+          1,
+          511,
+          0
+        ],
+        [
+          1024,
+          1,
+          1023,
+          0
+        ],
+        [
+          1,
+          3,
+          0,
+          0
+        ],
+        [
+          1,
+          11,
+          0,
+          0
+        ],
+        [
+          1,
+          15,
+          0,
+          0
+        ],
+        [
+          1,
+          19,
+          0,
+          0
+        ],
+        [
+          1,
+          24,
+          0,
+          0
+        ],
+        [
+          1,
+          28,
+          0,
+          0
+        ],
+        [
+          1,
+          36,
+          0,
+          0
+        ],
+        [
+          1,
+          42,
+          0,
+          0
+        ],
+        [
+          1,
+          47,
+          0,
+          0
+        ],
+        [
+          1,
+          52,
+          0,
+          0
+        ],
+        [
+          1,
+          57,
+          0,
+          0
+        ],
+        [
+          1,
+          60,
+          0,
+          0
+        ],
+        [
+          1,
+          63,
+          0,
+          0
+        ],
+        [
+          16,
+          64,
+          15,
+          0
+        ],
+        [
+          32,
+          64,
+          31,
+          0
+        ],
+        [
+          64,
+          64,
+          63,
+          0
+        ],
+        [
+          1,
+          58,
+          0,
+          0
+        ],
+        [
+          1,
+          57,
+          0,
+          0
+        ],
+        [
+          1,
+          56,
+          0,
+          0
+        ],
+        [
+          1,
+          56,
+          0,
+          0
+        ],
+        [
+          1,
+          54,
+          0,
+          0
+        ],
+        [
+          1,
+          52,
+          0,
+          0
+        ],
+        [
+          1,
+          49,
+          0,
+          0
+        ],
+        [
+          1,
+          49,
+          0,
+          0
+        ],
+        [
+          1,
+          50,
+          0,
+          0
+        ],
+        [
+          1,
+          52,
+          0,
+          0
+        ],
+        [
+          1,
+          54,
+          0,
+          0
+        ],
+        [
+          1,
+          57,
+          0,
+          0
+        ],
+        [
+          1,
+          60,
+          0,
+          0
+        ],
+        [
+          1,
+          64,
+          0,
+          0
+        ],
+        [
+          16,
+          64,
+          15,
+          0
+        ],
+        [
+          32,
+          64,
+          31,
+          0
+        ],
+        [
+          64,
+          64,
+          63,
+          0
+        ],
+        [
+          1,
+          60,
+          0,
+          0
+        ],
+        [
+          1,
+          59,
+          0,
+          0
+        ],
+        [
+          1,
+          56,
+          0,
+          0
+        ],
+        [
+          16,
+          35,
+          15,
+          0
+        ],
+        [
+          32,
+          32,
+          31,
+          0
+        ],
+        [
+          64,
+          30,
+          63,
+          0
+        ],
+        [
+          128,
+          15,
+          127,
+          0
+        ],
+        [
+          256,
+          13,
+          255,
+          0
+        ],
+        [
+          512,
+          10,
+          511,
+          0
+        ],
+        [
+          1024,
+          7,
+          1023,
+          0
+        ],
+        [
+          2048,
+          4,
+          2047,
+          0
+        ]
+      ],
+      "prefix_markers": 1027,
+      "profiled_fpm_rows": 4200,
+      "rank_keys": [
+        "281512121469094",
+        "281512138246311",
+        "281512155023528",
+        "281512171800745",
+        "281512188577962",
+        "281512205355179",
+        "281512222132396",
+        "281512238909613"
+      ],
+      "raw_markers_per_rank": 5282,
+      "segments": [
+        {
+          "end_marker_canonical_index": 5226,
+          "end_marker_step": 5227,
+          "mapped_rows": 4200,
+          "measure_run": 0,
+          "start_marker_canonical_index": 1027,
+          "start_marker_step": 1028
+        }
+      ],
+      "skipped_markers": [],
+      "suffix_markers": 2
+    }
+  },
+  "input_hashes": {
+    "c1": {
+      "clean_fpm_phase_sha256": "4bd2cad42947fb8c52d64ec22a4e579f2fce327fa309254672a127c140d790f9",
+      "nsys_sqlite_sha256": "314b5d88c0504170b76f70bb996cbb29016c0715d6ed98c51af4e2200e121c0d",
+      "profiled_fpm_phase_sha256": "49a5ee2ca87f7c5b0f944cea86a01256c52c58973d72f861771e479ef436c644"
+    },
+    "c128": {
+      "clean_fpm_phase_sha256": "4054e1203ffdad1fcbfd8becfd9ea89799fe14d4ad6a7bd198c0f558bdcd49d5",
+      "nsys_sqlite_sha256": "fefa00b10b44a4c3071da118aac0ebf012e7f026b9e8313fe0534cf058c7bf0a",
+      "profiled_fpm_phase_sha256": "9eff5bcd827601477fc35b73c298089f7a54c3865bc391c96c30e17c14e73368"
+    },
+    "c16": {
+      "clean_fpm_phase_sha256": "f9defa6e90a8be0b78d5fc6a597ad68f5dfd349d1e9879b56e4af120c0c404b9",
+      "nsys_sqlite_sha256": "26603e2aeffec5c1f41a3e90ba2d3c775def28ec93a5daf89e1f226814c5e57b",
+      "profiled_fpm_phase_sha256": "a87b56149255b21dc91ca13be2879edc0ba5d8877d8819931c285a32eaa43761"
+    },
+    "c64": {
+      "clean_fpm_phase_sha256": "8b16f0655b93a78ca35444b54ca7ffbe4c4ea9208ba44014a8328c15a217d7ef",
+      "nsys_sqlite_sha256": "36e8d31f8ca574300f98e46c347f79b5db73bbf8ed9e9caf1b4c2fbef60ce3dc",
+      "profiled_fpm_phase_sha256": "daab99031476e1d2b5989f7355759c52c35c6a344e290c73a1e843514fda886c"
+    }
+  },
+  "oracle_schema": "job-354281415-semantic-fpm/v1",
+  "policies": {
+    "alignment_version": "profiled-monotonic-v1",
+    "mapping_hash_serialization": "sha256(canonical-json[{counter_id,fpm_sequence_index,marker_canonical_index,marker_step,measure_run}])",
+    "marker_encoder_version": "python-round-half-even-v1",
+    "schema_version": "fpm-semantic-insights/v1",
+    "semantic_key_version": "one-token-half-up-v1"
+  },
+  "population": {
+    "by_cohort": {
+      "c1": {
+        "clean_bins": 4513,
+        "clean_collision_bins": 0,
+        "clean_only_bins": 0,
+        "clean_rows": 4612,
+        "profiled_bins": 4513,
+        "profiled_rows": 4612,
+        "shared_bins": 4513,
+        "shared_clean_rows": 4612,
+        "shared_profiled_rows": 4612
+      },
+      "c128": {
+        "clean_bins": 4199,
+        "clean_collision_bins": 39,
+        "clean_only_bins": 305,
+        "clean_rows": 4247,
+        "profiled_bins": 4218,
+        "profiled_rows": 4242,
+        "shared_bins": 3894,
+        "shared_clean_rows": 3942,
+        "shared_profiled_rows": 3910
+      },
+      "c16": {
+        "clean_bins": 4099,
+        "clean_collision_bins": 0,
+        "clean_only_bins": 27,
+        "clean_rows": 4099,
+        "profiled_bins": 4099,
+        "profiled_rows": 4099,
+        "shared_bins": 4072,
+        "shared_clean_rows": 4072,
+        "shared_profiled_rows": 4072
+      },
+      "c64": {
+        "clean_bins": 4198,
+        "clean_collision_bins": 2,
+        "clean_only_bins": 147,
+        "clean_rows": 4200,
+        "profiled_bins": 4197,
+        "profiled_rows": 4200,
+        "shared_bins": 4051,
+        "shared_clean_rows": 4053,
+        "shared_profiled_rows": 4052
+      }
+    },
+    "clean_bins": 17009,
+    "clean_only_bins": 479,
+    "clean_only_by_cohort_phase": {
+      "c1": {
+        "context": 0,
+        "decode": 0,
+        "mixed": 0
+      },
+      "c128": {
+        "context": 1,
+        "decode": 228,
+        "mixed": 76
+      },
+      "c16": {
+        "context": 1,
+        "decode": 16,
+        "mixed": 10
+      },
+      "c64": {
+        "context": 1,
+        "decode": 107,
+        "mixed": 39
+      }
+    },
+    "clean_only_rows": 479,
+    "clean_rows": 17158,
+    "clean_support": {
+      "repeated": 0,
+      "singleton": 16869,
+      "sparse": 140
+    },
+    "max_clean_count": 4,
+    "phase_row_coverage": {
+      "context": {
+        "clean_shared": 6,
+        "clean_total": 9,
+        "profiled_shared": 6,
+        "profiled_total": 9
+      },
+      "decode": {
+        "clean_shared": 16671,
+        "clean_total": 17022,
+        "profiled_shared": 16638,
+        "profiled_total": 17016
+      },
+      "mixed": {
+        "clean_shared": 2,
+        "clean_total": 127,
+        "profiled_shared": 2,
+        "profiled_total": 128
+      }
+    },
+    "profiled_bins": 17027,
+    "profiled_rows": 17153,
+    "shared_bins": 16530,
+    "shared_clean_rows": 16679,
+    "shared_profiled_rows": 16646,
+    "source_rows": 34311
+  },
+  "predictor_oracle": {
+    "required_call_count": 17009,
+    "required_clean_only_call_count": 479,
+    "status": "pending_adapter_freeze"
+  },
+  "source": {
+    "aiconfigurator_commit": "1a8f4809fbb1953d51578fc1e4fcb30cb7f6c110",
+    "archive_basename": "result.tar.gz",
+    "archive_bytes": 6554156865,
+    "archive_sha256": "de4bd64b5f327fa2e73e131d5e7ec3346367814ece0181fe305ec05a795b22be",
+    "auto_collector_commit": "4f27f96f2b9e63b6f96b79b9a21faf585f36ec0c",
+    "collection_pipeline_id": 56729332,
+    "job_id": 354281415,
+    "measured_segments": [
+      "real"
+    ],
+    "model": "Qwen/Qwen3-32B",
+    "system": "h100_sxm",
+    "tensor_parallel": 8
+  },
+  "witnesses": {
+    "clean_only": [
+      {
+        "cohort": "c16",
+        "counter_id": 1050,
+        "phase": "context"
+      },
+      {
+        "cohort": "c64",
+        "counter_id": 1052,
+        "phase": "decode"
+      },
+      {
+        "cohort": "c128",
+        "counter_id": 1058,
+        "phase": "mixed"
+      }
+    ],
+    "half_up_cross_run_wiggle": {
+      "clean_counter_id": 1390,
+      "clean_decode_kv_tokens": 33802,
+      "clean_marker_anchor": 8450,
+      "cohort": "c16",
+      "decode_requests": 4,
+      "profiled_counter_id": 1392,
+      "profiled_decode_kv_tokens": 33803,
+      "semantic_key": [
+        0,
+        4,
+        null,
+        null,
+        8451
+      ]
+    },
+    "max_clean_multiplicity": {
+      "clean_counter_ids": [
+        1116,
+        1200,
+        1207,
+        1242
+      ],
+      "cohort": "c128",
+      "exact_shape_cardinality": 4,
+      "n_clean": 4,
+      "semantic_key": [
+        0,
+        128,
+        null,
+        null,
+        8077
+      ]
+    },
+    "sparse_collision": {
+      "clean_counter_ids": [
+        1173,
+        1226
+      ],
+      "cohort": "c64",
+      "exact_shape_cardinality": 2,
+      "n_clean": 2,
+      "semantic_key": [
+        0,
+        64,
+        null,
+        null,
+        9253
+      ]
+    }
+  }
+}
