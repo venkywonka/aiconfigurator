@@ -98,6 +98,17 @@ class TestAddPerformanceResult:
         result = pr(2.0, source="silicon") + pr(0.0, energy=0.0, source="empirical")
         assert result.source == "silicon"
 
+    @pytest.mark.parametrize("unresolved_first", [True, False])
+    def test_unresolved_source_dominates_zero_identity(self, unresolved_first):
+        measured = pr(2.0, energy=3.0, source="overlay")
+        unresolved = pr(0.0, energy=0.0, source="unresolved")
+
+        result = unresolved + measured if unresolved_first else measured + unresolved
+
+        assert float(result) == pytest.approx(2.0)
+        assert result.energy == pytest.approx(3.0)
+        assert result.source == "unresolved"
+
     def test_different_sources_become_mixed(self):
         result = pr(1.0, source="silicon") + pr(2.0, source="empirical")
         assert result.source == "mixed"

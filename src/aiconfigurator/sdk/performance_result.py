@@ -13,8 +13,9 @@ class PerformanceResult(float):
     Behaves exactly like a float for backward compatibility, but stores energy
     instead of power internally. Power is derived as energy / latency. A
     ``source`` tag records whether the value came from silicon table data, an
-    empirical fallback, or an explicit SOL estimate, and is propagated through
-    arithmetic.
+    empirical fallback, an explicit SOL estimate, curated exact data, or the
+    on-demand overlay. The ``unresolved`` tag is an explicit sentinel and
+    dominates addition so composite results cannot hide a descendant miss.
 
     Supports all arithmetic and comparison operations for full float compatibility.
 
@@ -24,15 +25,19 @@ class PerformanceResult(float):
         - power: watts (W) - derived property
         - source: ``"silicon"`` (table data) | ``"empirical"`` (empirical
           formula fallback) | ``"sol"`` (explicit SOL estimate) |
-          ``"estimated"`` (modeled from measured components) | ``"overlay"``
-          (validated on-demand measurement) | ``"mixed"`` (sum of values from
+          ``"estimated"`` (modeled from measured components) |
+          ``"curated_exact"`` (literal curated row) | ``"overlay"``
+          (validated on-demand measurement) | ``"unresolved"`` (an exact
+          point is missing) | ``"mixed"`` (sum of resolved values from
           different sources)
 
     Note: 1 W·ms = 1 mJ. We use W·ms to match latency units (ms).
           To convert to Joules: divide by 1000 (J = W·s = W·ms / 1000)
 
     Source propagation:
-        - ``__add__``: sources merged (same -> same; mismatch -> ``"mixed"``)
+        - ``__add__``: ``"unresolved"`` dominates; otherwise sources merge
+          (same -> same; mismatch -> ``"mixed"``), with a zero latency/energy
+          value acting as the source identity.
         - ``__mul__`` / ``__rmul__`` / ``__truediv__``: scalar operand has no
           provenance, so the left operand's source is preserved unchanged.
         - ``__abs__``: source preserved.
@@ -73,8 +78,9 @@ class PerformanceResult(float):
             source: Where this measurement came from -- "silicon" (table data),
                 "empirical" (empirical formula fallback), "sol" (explicit SOL
                 estimate), "estimated" (modeled from measured components),
-                "overlay" (validated on-demand measurement), or "mixed" (sum
-                of values from different sources).
+                "curated_exact" (literal curated row), "overlay" (validated
+                on-demand measurement), "unresolved" (an exact point is
+                missing), or "mixed" (sum of values from different sources).
         """
         instance = float.__new__(cls, latency)
         return instance
@@ -122,7 +128,9 @@ class PerformanceResult(float):
         """Add two PerformanceResults or a PerformanceResult and a number."""
         if isinstance(other, PerformanceResult):
             # Add latencies and energies (both are additive!) and merge sources.
-            if float(self) == 0.0 and self.energy == 0.0:
+            if self.source == "unresolved" or other.source == "unresolved":
+                source = "unresolved"
+            elif float(self) == 0.0 and self.energy == 0.0:
                 source = other.source
             elif float(other) == 0.0 and other.energy == 0.0:
                 source = self.source

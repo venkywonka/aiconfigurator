@@ -37,6 +37,8 @@ from aiconfigurator.sdk.performance_result import PerformanceResult
 
 if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
+    from aiconfigurator.sdk.resolution.session import ResolutionSession
+    from aiconfigurator.sdk.resolution.types import MeasurementProtocol, MeasurementRecord, MeasurementRequest
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,11 @@ class Operation:
     # divide their per-rank token count ``x`` by ``self._seq_split`` in query().
     _CP_AWARE: ClassVar[bool] = False
 
+    # Composite operations opt in when their query_with_resolution() method
+    # owns a complete descendant walk. Merely overriding that method (for
+    # instrumentation or leaf-specific behavior) does not imply ownership.
+    _OWNS_RESOLUTION_WALK: ClassVar[bool] = False
+
     def __init__(self, name: str, scale_factor: float, *, seq_split: int = 1) -> None:
         if seq_split > 1 and not self._CP_AWARE:
             raise NotImplementedError(
@@ -151,6 +158,61 @@ class Operation:
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Return latency (scaled by ``scale_factor``) plus energy/source data."""
         raise NotImplementedError
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        """Build one exact lazy-measurement request, or report no adapter."""
+        return None
+
+    def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
+        """Return one final, already-scaled literal curated row, or ``None``; never interpolate."""
+        return None
+
+    def performance_from_record(self, record: MeasurementRecord, **kwargs) -> PerformanceResult:
+        """Convert validated overlay evidence using this operation's scaling."""
+        return record.performance_result(scale_factor=self._scale_factor)
+
+    def query_with_resolution(
+        self,
+        database: PerfDatabase,
+        *,
+        session: ResolutionSession | None = None,
+        **kwargs,
+    ) -> PerformanceResult:
+        """Query exact evidence and record a lazy miss when a session is supplied."""
+        if session is None:
+            return self.query(database, **kwargs)
+
+        from aiconfigurator.sdk import common
+        from aiconfigurator.sdk.perf_database import _get_configured_database_view
+
+        exact_database = _get_configured_database_view(
+            database,
+            common.DatabaseMode.SILICON,
+            getattr(database, "transfer_policy", None),
+        )
+        request = self.measurement_request(exact_database, session.protocol, **kwargs)
+        if request is not None:
+            record = session.lookup(request.key)
+            if record is not None:
+                return self.performance_from_record(record, **kwargs)
+
+        curated = self.curated_exact_result(exact_database, **kwargs)
+        if curated is not None:
+            return curated
+
+        if request is None:
+            session.record_missing_adapter(
+                self._name,
+                RuntimeError("operation has no literal exact row or lazy adapter for this query"),
+            )
+        else:
+            session.record_miss(request, self._name)
+        return PerformanceResult(0.0, energy=0.0, source="unresolved")
 
     def get_weights(self, **kwargs):
         raise NotImplementedError

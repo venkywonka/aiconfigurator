@@ -31,6 +31,7 @@ from aiconfigurator.sdk.performance_result import PerformanceResult
 
 if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
+    from aiconfigurator.sdk.resolution.session import ResolutionSession
 
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ class FallbackOp(Operation):
     """
 
     _CP_AWARE: ClassVar[bool] = True  # wrapper: inner ops carry their own seq_split
+    _OWNS_RESOLUTION_WALK: ClassVar[bool] = True
 
     def __init__(self, name: str, primary: Operation, fallback: list[Operation], *, seq_split: int = 1) -> None:
         """
@@ -104,6 +106,59 @@ class FallbackOp(Operation):
             total += op.query(database, **kwargs)
         return total
 
+    def query_with_resolution(
+        self,
+        database: PerfDatabase,
+        *,
+        session: ResolutionSession | None = None,
+        **kwargs,
+    ) -> PerformanceResult:
+        if session is None:
+            return self.query(database, **kwargs)
+
+        if self._primary._OWNS_RESOLUTION_WALK:
+            # A resolution-aware composite is itself an adapter-capable primary:
+            # let it discover every descendant instead of mistaking its lack of
+            # one leaf request for permission to enter this wrapper's fallback.
+            # Descendant failures belong to that selected implementation and
+            # fail closed; the session has no transactional discovery rollback.
+            return self._primary.query_with_resolution(database, session=session, **kwargs)
+
+        from aiconfigurator.sdk.perf_database import _get_configured_database_view
+
+        primary_database = _get_configured_database_view(
+            database,
+            common.DatabaseMode.SILICON,
+            getattr(database, "transfer_policy", None),
+        )
+        primary_request = self._primary.measurement_request(
+            primary_database,
+            session.protocol,
+            **kwargs,
+        )
+        if primary_request is not None:
+            record = session.lookup(primary_request.key)
+            if record is not None:
+                return self._primary.performance_from_record(record, **kwargs)
+
+        primary_curated = self._primary.curated_exact_result(primary_database, **kwargs)
+        if primary_curated is not None:
+            return primary_curated
+
+        if primary_request is not None:
+            session.record_miss(primary_request, self._primary._name)
+            return PerformanceResult(0.0, energy=0.0, source="unresolved")
+
+        logger.debug(
+            "FallbackOp '%s': primary op '%s' has no literal row or lazy adapter, using fallback ops",
+            self._name,
+            self._primary._name,
+        )
+        total = PerformanceResult(0.0, energy=0.0, source="empirical")
+        for op in self._fallback:
+            total += op.query_with_resolution(database, session=session, **kwargs)
+        return total
+
     def get_weights(self, **kwargs):
         # Use primary weights if available, otherwise sum fallback weights.
         # In practice both should be equivalent since they model the same block.
@@ -127,6 +182,7 @@ class OverlapOp(Operation):
     """
 
     _CP_AWARE: ClassVar[bool] = True  # wrapper: inner ops carry their own seq_split
+    _OWNS_RESOLUTION_WALK: ClassVar[bool] = True
 
     def __init__(self, name: str, group_a: list, group_b: list, *, seq_split: int = 1) -> None:
         """
@@ -157,6 +213,31 @@ class OverlapOp(Operation):
         total_b = PerformanceResult(0.0, energy=0.0, source="empirical")
         for op in self._group_b:
             total_b += op.query(database, **kwargs)
+
+        merged = total_a + total_b
+        return PerformanceResult(
+            latency=max(float(total_a), float(total_b)),
+            energy=total_a.energy + total_b.energy,
+            source=merged.source,
+        )
+
+    def query_with_resolution(
+        self,
+        database: PerfDatabase,
+        *,
+        session: ResolutionSession | None = None,
+        **kwargs,
+    ) -> PerformanceResult:
+        if session is None:
+            return self.query(database, **kwargs)
+
+        total_a = PerformanceResult(0.0, energy=0.0, source="empirical")
+        for op in self._group_a:
+            total_a += op.query_with_resolution(database, session=session, **kwargs)
+
+        total_b = PerformanceResult(0.0, energy=0.0, source="empirical")
+        for op in self._group_b:
+            total_b += op.query_with_resolution(database, session=session, **kwargs)
 
         merged = total_a + total_b
         return PerformanceResult(
