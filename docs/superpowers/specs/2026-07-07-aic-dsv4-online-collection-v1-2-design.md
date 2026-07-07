@@ -42,8 +42,8 @@ flowchart LR
     REPLAY --> NORM
     REPLAY --> FINAL["Return only fully exact callback latency"]
 
-    CORE["Global resolver core\nNo DSv4 branches"] -.-> MISS
-    PROFILE["V1.2 profile adapters\nGEMM, mHC, DSv4 modules, MoE, CustomAllReduce"] -.-> ROUTE
+    CORE["Global resolver core<br/>No DSv4 branches"] -.-> MISS
+    PROFILE["V1.2 profile adapters<br/>GEMM, mHC, DSv4 modules, MoE, CustomAllReduce"] -.-> ROUTE
 ```
 
 The operation walk, resolver, evidence store, registry protocol, and scheduler are global. Only the set of adapters required to make the frozen deployment profile complete is V1.2-specific.
@@ -370,6 +370,8 @@ Each V1.2 lazy entry provides:
 The resolver never infers a collector from raw operation kwargs. The adapter never changes the PerfKey.
 
 Offline sweep collectors may delegate to the same exact runner, but a lazy request must not invoke a grid sweep, append directly to a curated perf file, or call an offline logging path. The ResolutionSession coordinator remains the only overlay writer.
+
+Lazy adapters do not enumerate or snap to a finite list of FPM shapes. They validate the frozen profile invariants and the underlying collector's supported domain, then time the exact canonical shape encountered by the operation walk. An unseen in-domain shape is therefore a normal cold miss, not an unsupported case.
 
 Heavy framework imports occur only in worker processes. Lightweight registry and adapter imports must not import Torch, SGLang, or CUDA.
 
