@@ -18,7 +18,39 @@ Read these first:
 - AIC `docs/superpowers/plans/2026-07-06-aic-lazy-perf-core.md`
 - AIC `docs/superpowers/plans/2026-07-06-aic-hardware-aware-collector-runtime.md`
 
-Complete both AIC plans first. Spica currently exists on AIC `upstream/main`; perform this integration on an AIC branch containing that upstream Spica tree plus the two completed AIC feature series. Dynamo changes belong in the sibling Dynamo repository. Keep commits repository-local and run each repository's checks before the cross-repository test.
+Complete both AIC plans first. Perform the AIC integration on a branch containing `0828d6b7e4a7880079443b1c6f9c148d85bdbf54`, the upstream Spica tree, and the two completed AIC feature series. Perform Dynamo changes on a branch containing `1fe16eb6b2e5318d78f5ece7733e054bab7ef938`; the older local Dynamo checkout used during initial brainstorming is 185 commits behind and is not an implementation base. Keep commits repository-local and run each repository's checks before the cross-repository test.
+
+### Task 0: Materialize and verify both reviewed source baselines
+
+**Files:** no changes
+
+- [ ] **Step 1: Create implementation branches containing the reviewed commits**
+
+In AIC and Dynamo respectively, verify:
+
+```bash
+git merge-base --is-ancestor 0828d6b7e4a7880079443b1c6f9c148d85bdbf54 HEAD
+test -f src/spica/evaluator.py
+git -C ../dynamo merge-base --is-ancestor 1fe16eb6b2e5318d78f5ece7733e054bab7ef938 HEAD
+test -f ../dynamo/lib/mocker/src/common/perf_model.rs
+test -f ../dynamo/lib/bindings/python/src/dynamo/_internal/aic.py
+```
+
+If the repository layout differs, resolve the sibling path explicitly and record both absolute roots. If either ancestor check fails, rebase/cherry-pick onto the reviewed mainline before editing. A newer mainline is allowed only after updating every symbol anchor below and rerunning this baseline gate.
+
+- [ ] **Step 2: Verify current symbols rather than stale line numbers**
+
+Run focused `rg` checks for `AicCallback`, `predict_prefill_time`, `predict_decode_time`, `aic_per_rank_batch`, `MockEngineArgs`, Replay entrypoints, `AicSession`, `ReplayEvaluator`, `_evaluate_one`, and `ProcessPoolExecutor`. Record the resolved file:line map in the implementation PR. Stop and revise the plan if any symbol or error boundary has materially changed.
+
+- [ ] **Step 3: Run pre-change behavior and packaging baselines**
+
+Run the existing AIC Spica unit suite and the Dynamo Mocker/Replay/AIC callback suites. Install the completed AIC wheel into a clean environment and assert these imports succeed without a source checkout:
+
+```bash
+python -c "import aiconfigurator.collector, aiconfigurator.collector.trtllm.gemm_adapter, aiconfigurator.collector.network.nccl_adapter"
+```
+
+Also assert the wheel does not provide a generic top-level `collector` module. This wheel/import check is repeated in Task 7 after the cross-repository wiring; resolving integration does not proceed against an editable-only collector runtime.
 
 ## File map
 
@@ -55,11 +87,11 @@ Complete both AIC plans first. Spica currently exists on AIC `upstream/main`; pe
 ### Task 1: Preserve exact scheduled batch shapes in Mocker
 
 **Files:**
-- Modify: `lib/mocker/src/common/perf_model.rs:25-45,211-280`
-- Modify: `lib/mocker/src/scheduler/sglang/core.rs:363-378,527-548`
-- Modify: `lib/mocker/src/scheduler/sglang/decode.rs:226-237`
-- Modify: `lib/mocker/src/scheduler/vllm/core.rs:1003-1167,1290-1455,1499-1514,1672-1689,1817-1835`
-- Modify: `lib/mocker/src/common/protocols.rs:256-265`
+- Modify: `lib/mocker/src/common/perf_model.rs` (`PerfModel`, descriptors, and attention-DP projection)
+- Modify: `lib/mocker/src/scheduler/sglang/core.rs` (finalized prefill batch)
+- Modify: `lib/mocker/src/scheduler/sglang/decode.rs` (running decode batch)
+- Modify: `lib/mocker/src/scheduler/vllm/core.rs` (scheduled prefill/decode batches)
+- Modify: `lib/mocker/src/common/protocols.rs` (serializable descriptors/config)
 
 - [ ] **Step 1: Add descriptor and legacy-parity tests**
 
@@ -68,11 +100,11 @@ In `perf_model.rs`, construct heterogeneous batches and assert:
 ```rust
 let prefill = ConcreteBatchDescriptor::Prefill(PrefillBatch {
     requests: vec![
-        PrefillRequestShape { prompt_tokens: 101, cached_tokens: 1, scheduled_tokens: 100 },
-        PrefillRequestShape { prompt_tokens: 203, cached_tokens: 3, scheduled_tokens: 200 },
+        PrefillRequestShape { prompt_tokens: 101, context_tokens: 65, prefix_tokens: 1, scheduled_tokens: 64 },
+        PrefillRequestShape { prompt_tokens: 203, context_tokens: 103, prefix_tokens: 3, scheduled_tokens: 100 },
     ],
 });
-assert_eq!(prefill.legacy_prefill_args(), Some((2, 150, 2)));
+assert_eq!(prefill.legacy_prefill_args(), Some((2, 84, 2)));
 
 let decode = ConcreteBatchDescriptor::Decode(DecodeBatch {
     requests: vec![
@@ -82,12 +114,14 @@ let decode = ConcreteBatchDescriptor::Decode(DecodeBatch {
     active_kv_tokens: 383,
     total_kv_tokens: 4096,
 });
-assert_eq!(decode.legacy_decode_args(), Some((2, 191, 383, 4096)));
+assert_eq!(decode.legacy_decode_args(), Some((2, 383, 191, 4096)));
 ```
 
-The prefill result intentionally reproduces current integer truncation: `mean_isl=(101+203)/2=152`, `mean_prefix=(1+3)/2=2`, and `effective_isl=150`. This catches an accidental switch to averaging each request's uncached length independently.
+These tuples use the exact positional contracts of current mainline: prefill is `(batch_size, mean_isl, mean_prefix)` and decode is `(batch_size, active_kv_tokens, average_context, total_kv_tokens)`. Thus prefill has `mean_isl=(65+103)/2=84`, `mean_prefix=(1+3)/2=2`, and the existing formula derives `effective_isl=84-2=82`; decode keeps `383` in the active-KV slot and `191` in the average-context slot. Full prompt lengths and actual scheduled chunks remain lossless descriptor metadata but do not inflate the pure/default chunked-prefill timing path.
 
-Add empty-batch validation and serde round-trip tests. `scheduled_tokens` must not exceed `prompt_tokens - cached_tokens` for prefill and must be positive for decode.
+Add empty-batch validation and serde round-trip tests. For prefill, require `prefix_tokens <= context_tokens <= prompt_tokens` and `scheduled_tokens <= context_tokens - prefix_tokens`; decode scheduled tokens must be positive.
+
+Implement `legacy_prefill_args()` from `context_tokens` and `prefix_tokens`, returning the current `predict_prefill_time(batch_size, isl, prefix)` signature values; never substitute full prompt length, return the already-subtracted effective ISL, or assume `context_tokens == prefix_tokens + scheduled_tokens`. Implement `legacy_decode_args()` in the current `predict_decode_time(batch_size, active_kv_tokens, context_length, total_kv_tokens)` order. Add parity tests with `attention_dp_size=2` and heterogeneous/chunked shapes. Pure/default AIC must still use the current ceil-divided batch size plus legacy scheduled-chunk means exactly. Do not invent a per-rank exact descriptor from the global vector; Task 5 rejects resolution mode for attention-DP greater than one.
 
 - [ ] **Step 2: Define lossless descriptors and callback errors**
 
@@ -95,7 +129,8 @@ Add empty-batch validation and serde round-trip tests. `scheduled_tokens` must n
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrefillRequestShape {
     pub prompt_tokens: usize,
-    pub cached_tokens: usize,
+    pub context_tokens: usize,
+    pub prefix_tokens: usize,
     pub scheduled_tokens: usize,
 }
 
@@ -142,15 +177,15 @@ Implement validated constructors plus `legacy_prefill_args()` and `legacy_decode
 
 - [ ] **Step 3: Build descriptors at the scheduler-owned source of truth**
 
-For SGLang prefill, build `PrefillRequestShape` from each `prefill_fpm` item using `prompt_len`, `prefix_tokens`, and `tokens_computed`; pass the descriptor to `simulate_prefill_duration`. For SGLang decode, map `running` to each `current_sequence_len()` before the step mutates requests.
+For SGLang prefill, build `PrefillRequestShape` at the scheduler-owned point where `chunk_end`, `alloc.prefix_len`, `chunk_tokens`, and full `prompt_len` are simultaneously available; extend `PrefillFpmItem` if necessary rather than reconstructing `chunk_end` later. Pass the descriptor to `simulate_prefill_duration`. For SGLang decode, after memory preflight/retraction has finalized `running` but before timing or token mutation, map each request to `current_sequence_len()` and set `scheduled_tokens=min(max_burst, remaining_output_tokens)`. This is the forward-pass work reserved/planned at the timing boundary; stochastic speculative acceptance is sampled afterward and must not be retroactively substituted into the descriptor.
 
-For vLLM prefill, build the vector from the finalized `scheduled: FxHashMap<Uuid, ScheduledWork>` after preemption has removed undone work; include only entries with `prompt_tokens > 0` and sort by UUID bytes for deterministic keys. For both vLLM decode sites, build request shapes from the exact `ready` UUIDs and their current sequence lengths before sampling/mutation.
+For vLLM prefill, build the vector from the finalized `scheduled: FxHashMap<Uuid, ScheduledWork>` after preemption has removed undone work: `context_tokens=prefix_tokens+prompt_tokens`, `scheduled_tokens=prompt_tokens`, retain full `prompt_len`, include only entries with `prompt_tokens > 0`, and sort by UUID bytes for deterministic keys. Do not substitute `total_tokens`, which may include non-prompt work. For both vLLM decode sites, build request shapes from the exact post-preemption `ready` UUIDs and their current sequence lengths; set `scheduled_tokens=1` for ordinary decode and `min(max_burst, remaining_generation_tokens)` for speculative decode after reservation succeeds but before acceptance sampling/mutation.
 
 Change `PrefillCost::predict_prefill_compute()` to construct a one-request descriptor so router/admission estimates use the same API without inventing a mean.
 
 - [ ] **Step 4: Keep non-AIC timing behavior identical**
 
-Change `PerfModel::predict_prefill_time` and `predict_decode_time` to accept `&ConcreteBatchDescriptor`. Polynomial and interpolated variants call the descriptor's legacy aggregate methods and execute the existing formulas unchanged. Add recording callbacks in SGLang and vLLM tests to assert the exact per-request vectors received for heterogeneous, cached-prefix, chunked-prefill, preempted, and speculative-decode cases.
+Change `PerfModel::predict_prefill_time` and `predict_decode_time` to accept `&ConcreteBatchDescriptor`. Polynomial and interpolated variants unpack the descriptor's signature-ordered legacy aggregate methods and execute the existing formulas unchanged: prefill subtracts `mean_prefix` from `mean_isl` exactly once, and decode retains `(active_kv_tokens, average_context)` in that order. In this first task, keep the existing split `AicCallback::predict_prefill/predict_decode -> f64` interface: the AIC arm derives its current callback scalars from the same raw tuple, separately computes `projected_batch_size = aic_per_rank_batch(global_batch_size, attention_dp_size)`, and invokes those methods exactly as before. The immutable global descriptor is now available at the `PerfModel` boundary but does not cross the callback trait until Task 2. This preserves today's ceil-divided pure/default AIC behavior without pretending the global request vector can be partitioned exactly. Add before/after golden tests for all three existing variants, plus scheduler-boundary tests asserting the exact per-request vectors for heterogeneous, cached-prefix, chunked-prefill, preempted, and speculative-decode cases.
 
 - [ ] **Step 5: Run and commit descriptor propagation**
 
@@ -171,11 +206,12 @@ git commit -m "feat: preserve concrete mocker batch shapes"
 ### Task 2: Replace the bare callback `f64` with a structured failure path
 
 **Files:**
-- Modify: `lib/mocker/src/common/perf_model.rs:30-39`
-- Modify: `lib/mocker/src/scheduler/mod.rs:150-245`
+- Modify: `lib/mocker/src/common/perf_model.rs` (`AicCallback` result)
+- Modify: `lib/mocker/src/scheduler/mod.rs` (`EnginePassResult`)
 - Modify: `lib/mocker/src/scheduler/sglang/core.rs`
 - Modify: `lib/mocker/src/scheduler/sglang/decode.rs`
 - Modify: `lib/mocker/src/scheduler/vllm/core.rs`
+- Modify: `lib/mocker/src/scheduler/live_boundary.rs` (preserve the live hard-failure boundary)
 - Modify: replay loops under `lib/mocker/src/replay/`
 
 - [ ] **Step 1: Write failing-callback tests**
@@ -191,17 +227,21 @@ Err(AicCallbackError::Resolution {
 })
 ```
 
-Assert `PerfModel` preserves all three fields, the current engine pass reports a perf-model error, and offline replay returns an error containing `candidate_unscorable` without emitting a trace report. Add a sibling test proving a valid callback still gets the decode minimum-latency clamp after success.
+Assert `PerfModel` preserves all three fields, the current engine pass reports a perf-model error, and offline replay returns an error containing `candidate_unscorable` without emitting a trace report. Add a sibling test proving a valid callback still gets the decode minimum-latency clamp after success. Add a live-boundary test proving an unexpected `perf_model_error` aborts the live scheduler task before admissions, KV effects, timing waits, or outputs are published; resolution callbacks are forbidden live, so silently converting this field into a zero-progress pass would be a regression from today's hard failure.
 
 - [ ] **Step 2: Change the callback contract**
 
 ```rust
 pub trait AicCallback: Send + Sync {
-    fn predict(&self, batch: &ConcreteBatchDescriptor) -> Result<f64, AicCallbackError>;
+    fn predict(
+        &self,
+        batch: &ConcreteBatchDescriptor,
+        projected_batch_size: usize,
+    ) -> Result<f64, AicCallbackError>;
 }
 ```
 
-Return `Result<f64, AicCallbackError>` from both `PerfModel` prediction methods. Validate finiteness and non-negativity after the callback succeeds; turn NaN/infinity into `AicCallbackError::Runtime`.
+`projected_batch_size` is the existing AIC-only attention-DP ceil division; it does not alter the descriptor and is not used by Polynomial or Interpolated. In the `PerfModel::Aiconfigurator` arm, replace the temporary Task-1 scalar callback dispatch with `callback.predict(batch, projected_batch_size)`. Return `Result<f64, AicCallbackError>` from both `PerfModel` prediction methods. Validate finiteness and non-negativity after the callback succeeds; turn NaN/infinity into `AicCallbackError::Runtime`.
 
 - [ ] **Step 3: Carry one failure through an engine pass**
 
@@ -213,7 +253,7 @@ pub(crate) perf_model_error: Option<AicCallbackError>,
 
 At each scheduler prediction boundary, match the result. On error, stop that pass before token emission, preserve the scheduler's already finalized admission state, set `end_ms=now_ms`, and return the error. Do not substitute zero, a polynomial estimate, or a curated-only retry.
 
-Add a public `CandidateUnscorable(AicCallbackError)` error wrapper in Mocker. Update every replay loop that consumes `EnginePassResult` to check this field before advancing virtual time and return that typed error through `anyhow` without flattening it to text. V1 resolution is enabled only through Replay/Spica; live scheduler construction rejects `aic_resolution` in Task 5, avoiding an error channel that current `SchedulerHandle` does not expose.
+Add a public `CandidateUnscorable(AicCallbackError)` error wrapper in Mocker. Update every replay loop that consumes `EnginePassResult` to check this field before advancing virtual time and return that typed error through `anyhow` without flattening it to text. V1 resolution is enabled only through Replay/Spica. Because current `SchedulerHandle` has no terminal-error channel, `LiveEffectsPublisher.capture_pass()` must check `perf_model_error` before draining or publishing any effects and preserve the existing hard-failure behavior (panic/terminate the live scheduler task with the structured error). Task 5 rejects `aic_resolution` on the live path, so a recoverable candidate-level resolution error can never reach this boundary; the guard prevents a pure callback error from becoming an endless zero-progress loop.
 
 - [ ] **Step 4: Compile all callers and run replay tests**
 
@@ -221,31 +261,28 @@ Run:
 
 ```bash
 cargo check -p dynamo-mocker --all-features
-cargo nextest run -p dynamo-mocker replay scheduler
+cargo nextest run -p dynamo-mocker replay scheduler live_boundary
 ```
 
 Use compiler errors to update all direct test callbacks and prediction call sites; no call site may use `unwrap_or`, `unwrap_or_default`, or a latency fallback for `AicCallbackError`.
 
-- [ ] **Step 5: Commit structured failure propagation**
+- [ ] **Step 5: Continue directly to the cross-crate callback update**
 
-```bash
-git add lib/mocker/src
-git commit -m "feat: propagate unscorable AIC predictions"
-```
+Do not commit the trait change yet: `dynamo-py3` implements `AicCallback` in another crate, so a mocker-only commit here would leave the workspace uncompilable. Keep the changes in the working tree and complete Task 3 as the same atomic cross-crate checkpoint.
 
 ### Task 3: Preserve the pure-Rust callback as the default
 
 **Files:**
-- Modify: `lib/bindings/python/rust/llm/aic_callback.rs:35-61,181-250`
+- Modify: `lib/bindings/python/rust/llm/aic_callback.rs` (callback implementations/factory)
 - Modify: inline `#[cfg(test)]` module in `lib/bindings/python/rust/llm/aic_callback.rs`
 
 - [ ] **Step 1: Add parity tests around heterogeneous descriptors**
 
-Create a fake compiled engine and descriptors matching Task 1. Assert `RustAicCallback.predict()` calls `prefill_latency_ms(batch_size, effective_isl + prefix, prefix)` and `decode_latency_ms(batch_size, average_context, 2)` with exactly the old aggregate values. Assert an engine error becomes `AicCallbackError::Runtime`; remove both current `panic!` branches.
+Create a fake compiled engine and descriptors matching Task 1. For prefill, unpack `(global_batch_size, mean_isl, mean_prefix)`, derive `effective_isl = mean_isl.saturating_sub(mean_prefix)` exactly once, and assert `RustAicCallback.predict()` calls `prefill_latency_ms(projected_batch_size, effective_isl + mean_prefix, mean_prefix)` — `(2, 84, 2)` for the fixture when attention DP is one. For decode, unpack `(global_batch_size, active_kv_tokens, average_context, total_kv_tokens)` and assert it calls `decode_latency_ms(projected_batch_size, average_context, 2)` without swapping the active-KV and context fields. Add an attention-DP=2 assertion that only the projected callback batch changes from two to one; the descriptor and all means remain unchanged. Assert an engine error becomes `AicCallbackError::Runtime`; remove both current `panic!` branches.
 
 - [ ] **Step 2: Implement descriptor dispatch**
 
-Match `ConcreteBatchDescriptor` in `RustAicCallback`. Use only the `legacy_*_args()` methods so this path's numerical behavior does not change. Keep `create_aic_callback()` returning `RustAicCallback` whenever no resolution config is supplied, and keep the predict hot path GIL-free.
+Match `ConcreteBatchDescriptor` in `RustAicCallback`. Use only the signature-ordered `legacy_*_args()` methods plus the `projected_batch_size` supplied by `PerfModel`; never infer a second effective-ISL subtraction or swap decode tuple positions. Keep `create_aic_callback()` returning `RustAicCallback` whenever no resolution config is supplied, and keep the predict hot path GIL-free.
 
 - [ ] **Step 3: Run and commit default-path parity**
 
@@ -257,14 +294,14 @@ cargo check -p dynamo-py3 --features aic-forward-pass
 ```
 
 ```bash
-git add lib/bindings/python/rust/llm/aic_callback.rs lib/bindings/python/tests
-git commit -m "refactor: make Rust AIC callback descriptor aware"
+git add lib/mocker/src lib/bindings/python/rust/llm/aic_callback.rs lib/bindings/python/tests
+git commit -m "feat: propagate structured descriptor-aware AIC callbacks"
 ```
 
 ### Task 4: Add the opt-in Python resolving callback and concrete AIC op walk
 
 **Files:**
-- Modify: `lib/bindings/python/src/dynamo/_internal/aic.py:112-291`
+- Modify: `lib/bindings/python/src/dynamo/_internal/aic.py` (`AicSession`)
 - Modify: `lib/bindings/python/rust/llm/aic_callback.rs`
 - Create: `lib/bindings/python/tests/test_aic_resolution.py`
 
@@ -274,18 +311,19 @@ Use one heterogeneous prefill descriptor with two requests. Assert:
 
 - non-logits ops receive `x=sum(scheduled_tokens)`, not `batch_size * floor(mean)`;
 - logits GEMM receives `x=batch_size`;
-- every op receives immutable `scheduled_tokens`, `prompt_tokens`, and `cached_tokens` tuples;
+- every op receives immutable `scheduled_tokens`, `prompt_tokens`, `context_tokens`, and `prefix_tokens` tuples;
 - the whole op list is invoked twice on a cold miss and once on a warm overlay hit;
 - two ops sharing one key produce one executor request but both latencies in the second walk;
 - a decode descriptor forwards exact context tuples and the speculative effective batch;
 - setting resolution policy to pure still permits the compiled engine.
+- the Rust-owned Python callback thread can create a spawn-context fake collector worker, wait without holding the GIL, receive its correlated reply, and close it cleanly; this catches embedded-Python/multiprocessing bootstrap failures before GPU testing.
 
 - [ ] **Step 2: Construct the AIC resolution stack only when requested**
 
 Extend `AicSession.__init__` with `resolution: dict | None = None`. When it is absent, preserve `_build_compiled_engine()`. When present:
 
 1. require an absolute overlay path;
-2. build `OverlayStore`, `MeasurementProtocol`, `ResolutionBudget`, hardware inventory restricted to configured physical GPU ids, backend plus network `LazyAdapterRegistry`, and `ResourceAwareMeasurementExecutor`;
+2. build `OverlayStore`, the complete `MeasurementProtocol`, `ResolutionBudget`, hardware inventory restricted to configured physical GPU ids, namespaced backend plus network `LazyAdapterRegistry`, and `ResourceAwareMeasurementExecutor`;
 3. create one `ResolutionSession` owned by this `AicSession`;
 4. set `_engine=None` deliberately, because the compiled Rust engine cannot emit a full `MissSet` yet;
 5. register `close()` and context-manager cleanup for workers and SQLite.
@@ -316,7 +354,7 @@ Success returns `{"ok": True, "latency_ms": total}`. This avoids parsing Python 
 
 - [ ] **Step 4: Add a dedicated bridge thread in Rust**
 
-Implement `PyResolvingAicCallback` with a bounded Rust channel and one named OS thread. The thread owns the Python `AicSession`, acquires the GIL only to call `predict_concrete`, converts the returned dict to `Result<f64, AicCallbackError>`, and replies over a one-shot channel. `predict()` sends the cloned descriptor and blocks on the Rust receiver without holding the GIL. `Drop` sends shutdown and joins the thread.
+Implement `PyResolvingAicCallback` with a bounded Rust channel and one named OS thread. Its `predict()` first requires `projected_batch_size == batch.request_count()`; resolution mode is attention-DP-one only, so inequality is an explicit `AicCallbackError::Runtime` rather than a fabricated per-rank descriptor. The thread owns the Python `AicSession`, acquires the GIL only to call `predict_concrete`, converts the returned dict to `Result<f64, AicCallbackError>`, and replies over a one-shot channel. `predict()` sends the cloned descriptor and blocks on the Rust receiver without holding the GIL. `Drop` sends shutdown and joins the thread.
 
 Serialize concurrent callers through this owner thread because one `ResolutionSession` has callback-local mutable state. Map each structured Python reason directly to `AicCallbackError::Resolution`; if multiple reasons exist, retain the first in typed fields and store the complete JSON-safe resolution report in `report_json`.
 
@@ -338,17 +376,17 @@ git commit -m "feat: resolve AIC misses through a Python callback"
 ### Task 5: Expose an explicit replay resolution configuration and keep live Mocker pure
 
 **Files:**
-- Modify: `lib/mocker/src/common/protocols.rs:489-740,925-1138`
-- Modify: `lib/bindings/python/rust/llm/entrypoint.rs:80-151,740-800`
-- Modify: `lib/bindings/python/rust/llm/replay.rs:156-332,1300-1360`
-- Modify: `lib/bindings/python/rust/llm/aic_callback.rs:181-250`
+- Modify: `lib/mocker/src/common/protocols.rs` (`MockEngineArgs` and compatibility serde)
+- Modify: `lib/bindings/python/rust/llm/entrypoint.rs` (live-path validation)
+- Modify: `lib/bindings/python/rust/llm/replay.rs` (Replay config forwarding/error mapping)
+- Modify: `lib/bindings/python/rust/llm/aic_callback.rs` (factory selection)
 - Modify: `lib/bindings/python/rust/errors.rs`
 - Modify: inline tests in `lib/mocker/src/common/protocols.rs`
 - Create: `lib/bindings/python/tests/replay/test_replay_aic_resolution.py`
 
 - [ ] **Step 1: Add strict serialization and validation tests**
 
-Assert omitted config selects the pure Rust callback. Test JSON/Python construction for `observe_only` and `measure_on_miss`. Reject relative overlay paths, zero/negative budgets, duplicate GPU ids, and resolution settings without `aic_backend`. Verify ordinary `MockEngineArgs` JSON remains byte-for-field compatible apart from the newly optional field.
+Assert omitted config selects the pure Rust callback. Test JSON/Python construction for `observe_only` and `measure_on_miss`. Reject relative overlay paths, zero/negative budgets, duplicate GPU ids, resolution settings without `aic_backend`, and any resolution setting with `aic_attention_dp_size > 1`. Verify ordinary `MockEngineArgs` JSON remains byte-for-field compatible apart from the newly optional field and that pure prediction with attention DP remains numerically unchanged.
 
 - [ ] **Step 2: Define one serializable Rust config**
 
@@ -374,6 +412,8 @@ pub enum AicResolutionPolicy {
 ```
 
 Add `pub aic_resolution: Option<AicResolutionArgs>` to `MockEngineArgs`, its serde compatibility struct, builder defaults, `TryFrom` normalization, and validation. Do not add `pure` as a serialized mode: absence is the pure/default contract.
+
+In cross-field validation, reject `aic_resolution.is_some()` when `aic_attention_dp_size.unwrap_or(1) > 1` with a message explaining that V1 requires scheduler-owned per-rank concrete descriptors. This restriction applies to observe-only as well as measure-on-miss; the pure/default path retains current attention-DP support.
 
 - [ ] **Step 3: Wire Replay and reject the setting on the live path**
 
@@ -401,10 +441,10 @@ git commit -m "feat: configure opt-in AIC miss resolution"
 ### Task 6: Add Spica policy, overlay, and safe parallel-evaluation controls
 
 **Files:**
-- Modify: AIC `src/spica/config.py:603-681`
+- Modify: AIC `src/spica/config.py` (`SmartSearchConfig`)
 - Modify: AIC `src/spica/deploy.py`
-- Modify: AIC `src/spica/evaluator.py:130-260`
-- Modify: AIC `src/spica/search.py:86-178,180-360`
+- Modify: AIC `src/spica/evaluator.py` (`ReplayEvaluator`)
+- Modify: AIC `src/spica/search.py` (`_evaluate_one` and process pools)
 - Modify: AIC `tests/spica/test_config.py`
 - Modify: AIC `tests/spica/test_deploy.py`
 - Modify: AIC `tests/spica/test_search.py`
@@ -445,11 +485,13 @@ Add `lazy_collection: LazyCollectionConfig | None = None` to `SmartSearchConfig`
 Add `aic_resolution: dict | None = None` to `build_deployment()` and `_engine_args_payload()`. In `_evaluate_one`, build one payload from `config.lazy_collection` and that worker's assigned GPU group:
 
 ```python
+lazy = config.lazy_collection
+assert lazy is not None
 resolution = {
-    "policy": config.policy.value,
-    "overlay_path": str(config.overlay_path),
-    "max_new_keys": config.max_new_keys,
-    "max_wall_seconds": config.max_wall_seconds,
+    "policy": lazy.policy.value,
+    "overlay_path": str(lazy.overlay_path),
+    "max_new_keys": lazy.max_new_keys,
+    "max_wall_seconds": lazy.max_wall_seconds,
     "gpu_ids": assigned_group,
 }
 ```
@@ -501,7 +543,7 @@ Run the identical replay again against the reopened overlay and assert zero exec
 
 - [ ] **Step 2: Add strict failure tests**
 
-Test missing adapter, rejected measurement, collector crash, key budget, wall budget, and a second-walk miss. Every case must yield an unscorable Spica trial with a structured reason. A sibling valid candidate must still complete. When all candidates fail, assert the sweep raises rather than ranking a synthetic score.
+Test missing adapter, rejected measurement, collector crash, key budget, wall budget, transient retry exhaustion, and a second-walk miss. Every case must yield an unscorable Spica trial with a structured reason. A sibling valid candidate must still complete. Assert resolving config with attention DP greater than one fails validation while the identical pure config still scores with legacy behavior. When all candidates fail, assert the sweep raises rather than ranking a synthetic score.
 
 - [ ] **Step 3: Add process-pool lease and duplicate-evidence tests**
 
@@ -509,7 +551,7 @@ Start two Spica worker processes with the same cold key and two declared disjoin
 
 - [ ] **Step 4: Add one real-GPU pilot**
 
-On a compatible multi-GPU TensorRT-LLM host, search a tiny two-candidate space whose workload reaches one missing BF16 GEMM and one missing NCCL all-reduce point. Assert both records include real hardware/fabric provenance, the cold run reports collection wall time separately from simulated serving latency, and the warm run starts no collector worker commands. Do not assert a search-score improvement; this test validates causality and cache reuse.
+On a compatible multi-GPU TensorRT-LLM host, search a tiny two-candidate fixture whose AIC operation list is deliberately limited to the two V1-supported pilots (or whose other operations all have literal curated exact rows): one missing BF16 GEMM and one missing NCCL all-reduce point. Run capability preflight first and assert exactly those two keys are collectable and no unsupported operation is hidden. Assert both records include real hardware/fabric provenance, the cold run reports collection wall time separately from simulated serving latency, and the warm run starts no collector worker commands. Do not assert a search-score improvement; this test validates causality and cache reuse.
 
 - [ ] **Step 5: Run complete validation**
 
@@ -529,6 +571,8 @@ pytest -q tests/spica
 pytest -m gpu tests/integration/collector tests/spica/test_replay_integration.py -v -s
 git diff --check
 ```
+
+Build the final non-editable AIC wheel, install it into a clean environment used by the Dynamo Python tests, rerun `test_import_surface.py`, and import `aiconfigurator.collector` plus both lightweight adapters. Assert the wheel contains the namespaced runtime and pilot worker modules, does not provide top-level `collector`, and the cold fake-executor Replay test passes without the AIC source checkout on `PYTHONPATH`. This repeats the packaging gate after all cross-repository wiring.
 
 Expected: pure/default tests show no GPU discovery or Python callback; cold resolving tests collect once and requery once; warm tests hit the overlay; unresolvable candidates never receive scores; hardware tests keep compute and collectives within declared leases.
 

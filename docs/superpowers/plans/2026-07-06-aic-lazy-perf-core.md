@@ -12,7 +12,37 @@
 
 ## Source prerequisite
 
-Read `docs/plans/2026-07-06-dynamic-lazy-perf-collection-design.md` first. Execute this plan in the AIC repository. Do not touch Dynamo or real GPU collectors in this plan; use a fake executor so this subsystem is independently testable.
+Read `docs/plans/2026-07-06-dynamic-lazy-perf-collection-design.md` first. Execute this plan in the AIC repository on a branch containing `upstream/main` commit `0828d6b7e4a7880079443b1c6f9c148d85bdbf54` or a newer commit that passes Task 0. Do not touch Dynamo or real GPU collectors in this plan; use a fake executor so this subsystem is independently testable.
+
+### Task 0: Verify the implementation baseline
+
+**Files:** no changes
+
+- [ ] **Step 1: Confirm the branch contains the reviewed source baseline**
+
+Run:
+
+```bash
+git merge-base --is-ancestor 0828d6b7e4a7880079443b1c6f9c148d85bdbf54 HEAD
+test -f src/spica/evaluator.py
+rg -n "def _get_configured_database_view|should_use_rust_engine_step|class FallbackOp|_CP_AWARE" \
+  src/aiconfigurator/sdk/perf_database.py \
+  src/aiconfigurator/sdk/backends/base_backend.py \
+  src/aiconfigurator/sdk/operations/overlap.py \
+  src/aiconfigurator/sdk/operations/base.py
+```
+
+Expected: the ancestor check and file check succeed; the source anchors show immutable configured database views, the Rust engine-step gate, the non-sticky current `FallbackOp`, and context-parallel operation contracts. If a newer source moved any anchor, update this plan before implementation rather than copying stale pseudocode.
+
+- [ ] **Step 2: Establish a clean behavioral baseline**
+
+Run:
+
+```bash
+pytest -m unit tests/unit/sdk/operations tests/unit/sdk/backends/test_base_backend.py tests/unit/sdk/test_inference_session.py -v
+```
+
+Expected: the selected upstream tests pass before feature changes. Record the exact AIC commit and command result in the implementation PR.
 
 ## File map
 
@@ -43,7 +73,7 @@ Read `docs/plans/2026-07-06-dynamic-lazy-perf-collection-design.md` first. Execu
 ```python
 import pytest
 
-from aiconfigurator.sdk.resolution.types import MeasurementRecord, PerfKey
+from aiconfigurator.sdk.resolution.types import MeasurementProtocol, MeasurementRecord, PerfKey
 
 pytestmark = pytest.mark.unit
 
@@ -65,14 +95,20 @@ def test_perf_key_is_order_independent() -> None:
 
 def test_record_converts_to_overlay_performance_result() -> None:
     key = PerfKey.build("trtllm/gemm/v1", {"m": 8}, {"system": "h100_sxm"})
+    protocol = MeasurementProtocol(
+        revision="microbench-v1",
+        warmups=3,
+        samples=3,
+        statistic="median",
+        timer="cuda_event",
+        tuning_revision="trtllm-linear-v1",
+    )
     record = MeasurementRecord.valid(
         key=key,
         latency_ms=0.125,
         energy_wms=0.5,
         samples_ms=(0.126, 0.124, 0.125),
-        statistic="median",
-        protocol_revision="microbench-v1",
-        tuning_revision="trtllm-linear-v1",
+        protocol=protocol,
         perf_row={"m": 8, "latency": 0.125},
         provenance={"collector_revision": "abc123"},
     )
@@ -96,6 +132,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Mapping
@@ -146,7 +183,50 @@ class MeasurementProtocol:
     warmups: int
     samples: int
     statistic: str = "median"
+    timer: str = "cuda_event"
     tuning_revision: str = "none"
+
+    @property
+    def canonical(self) -> str:
+        return canonical_json(
+            {
+                "revision": self.revision,
+                "warmups": self.warmups,
+                "samples": self.samples,
+                "statistic": self.statistic,
+                "timer": self.timer,
+                "tuning_revision": self.tuning_revision,
+            }
+        )
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self.canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementEnvironment:
+    system: str
+    backend: str
+    backend_version: str
+    gpu_class: str
+    runtime_versions: Mapping[str, str]
+    topology_schema: str | None = None
+    topology_fingerprint: str | None = None
+
+    @property
+    def canonical(self) -> str:
+        return canonical_json(
+            {
+                "system": self.system,
+                "backend": self.backend,
+                "backend_version": self.backend_version,
+                "gpu_class": self.gpu_class,
+                "runtime_versions": self.runtime_versions,
+                "topology_schema": self.topology_schema,
+                "topology_fingerprint": self.topology_fingerprint,
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,8 +234,17 @@ class MeasurementRequest:
     op_id: str
     key: PerfKey
     query: Mapping[str, Any]
+    environment: MeasurementEnvironment
     semantic_descriptor: Mapping[str, Any]
     protocol: MeasurementProtocol
+
+    def __post_init__(self) -> None:
+        if self.key.query_json != canonical_json(self.query):
+            raise ValueError("request query does not match PerfKey query")
+        if self.key.environment_json != self.environment.canonical:
+            raise ValueError("request environment does not match PerfKey environment")
+        if self.key.semantic_json != canonical_json(self.semantic_descriptor):
+            raise ValueError("request semantic descriptor does not match PerfKey semantic identity")
 
 
 class RecordStatus(StrEnum):
@@ -177,9 +266,7 @@ class MeasurementRecord:
     latency_ms: float | None
     energy_wms: float
     samples_ms: tuple[float, ...]
-    statistic: str
-    protocol_revision: str
-    tuning_revision: str
+    protocol: MeasurementProtocol
     perf_row: Mapping[str, Any]
     provenance: Mapping[str, Any]
     failure_code: UnresolvedCode | None = None
@@ -189,6 +276,19 @@ class MeasurementRecord:
     @classmethod
     def valid(cls, **kwargs: Any) -> "MeasurementRecord":
         return cls(status=RecordStatus.VALID, failure_code=None, failure_reason=None, **kwargs)
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.energy_wms) or self.energy_wms < 0:
+            raise ValueError("energy_wms must be finite and non-negative")
+        if self.status is RecordStatus.VALID:
+            if self.latency_ms is None or not math.isfinite(self.latency_ms) or self.latency_ms < 0:
+                raise ValueError("valid records require finite non-negative latency_ms")
+            if len(self.samples_ms) != self.protocol.samples:
+                raise ValueError("sample count must match the measurement protocol")
+            if any(not math.isfinite(sample) or sample < 0 for sample in self.samples_ms):
+                raise ValueError("measurement samples must be finite and non-negative")
+        elif self.latency_ms is not None:
+            raise ValueError("non-valid records cannot provide latency_ms")
 
     def performance_result(self, scale_factor: float = 1.0) -> PerformanceResult:
         if self.status is not RecordStatus.VALID or self.latency_ms is None:
@@ -211,6 +311,7 @@ class UnresolvedCode(StrEnum):
     IDENTITY_MISMATCH = "identity_mismatch"
     INVALID_MEASUREMENT = "invalid_measurement"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    RETRY_EXHAUSTED = "retry_exhausted"
     REQUERY_STILL_MISSING = "requery_still_missing"
     OBSERVE_ONLY = "observe_only"
 
@@ -222,13 +323,13 @@ class UnresolvedReason:
     detail: str
 ```
 
-Export these names from `resolution/__init__.py`.
+Import `math` for record validation and export these names from `resolution/__init__.py`. Extend the tests with protocol canonicalization, environment/key round-trip and mismatch, a warmup/sample/statistic/timer mismatch, NaN/infinite/negative latency, a sample-count mismatch, and invalid status/latency combinations. `MeasurementEnvironment.runtime_versions`, `MeasurementRequest.query`, semantic descriptors, perf rows, and provenance must be copied into JSON-safe immutable mappings at construction; a caller mutating its original dict after construction must not change a request, record, environment, or digest.
 
 - [ ] **Step 4: Run the type tests**
 
 Run: `pytest -m unit tests/unit/sdk/resolution/test_types.py -v`
 
-Expected: `2 passed`.
+Expected: all canonical type, environment, protocol, and record-validation tests pass.
 
 - [ ] **Step 5: Commit the types**
 
@@ -255,15 +356,14 @@ pytestmark = pytest.mark.unit
 
 
 def _record(key: PerfKey, latency: float, status: RecordStatus = RecordStatus.VALID) -> MeasurementRecord:
+    protocol = MeasurementProtocol("microbench-v1", warmups=3, samples=1)
     return MeasurementRecord(
         key=key,
         status=status,
         latency_ms=latency if status is RecordStatus.VALID else None,
         energy_wms=0.0,
         samples_ms=(latency,),
-        statistic="median",
-        protocol_revision="microbench-v1",
-        tuning_revision="none",
+        protocol=protocol,
         perf_row={"latency": latency},
         provenance={"collector_revision": "r1"},
         failure_reason=None if status is RecordStatus.VALID else "boom",
@@ -276,7 +376,14 @@ def test_latest_valid_commit_wins(tmp_path) -> None:
     first = store.append(_record(key, 0.2))
     store.append(_record(key, 9.9, RecordStatus.REJECTED))
     last = store.append(_record(key, 0.1))
-    protocol = MeasurementProtocol("microbench-v1", warmups=3, samples=6)
+    protocol = MeasurementProtocol(
+        "microbench-v1",
+        warmups=3,
+        samples=1,
+        statistic="median",
+        timer="cuda_event",
+        tuning_revision="none",
+    )
     hit = store.lookup(key, protocol)
     assert first < last
     assert hit is not None
@@ -304,8 +411,8 @@ CREATE TABLE IF NOT EXISTS measurement_records (
     energy_wms REAL NOT NULL,
     samples_json TEXT NOT NULL,
     statistic TEXT NOT NULL,
-    protocol_revision TEXT NOT NULL,
-    tuning_revision TEXT NOT NULL,
+    protocol_digest TEXT NOT NULL,
+    protocol_json TEXT NOT NULL,
     perf_row_json TEXT NOT NULL,
     provenance_json TEXT NOT NULL,
     failure_code TEXT,
@@ -315,7 +422,9 @@ CREATE INDEX IF NOT EXISTS measurement_key_sequence
 ON measurement_records(key_digest, sequence DESC);
 ```
 
-Implement `OverlayStore.append(record) -> int`, `lookup(key, protocol) -> MeasurementRecord | None`, and `close()`. Maintain an in-memory map keyed by `(key.digest, protocol.revision, protocol.tuning_revision)`. Before using it, compare `PRAGMA data_version` with the value seen on the previous lookup; clear the map when another process/connection committed. Lookup then checks the map, queries SQLite on a miss, and populates the map. SQLite lookup must filter `status='valid'`, `protocol_revision=protocol.revision`, and `tuning_revision=protocol.tuning_revision`; compare stored `key_json` to `key.canonical` after the digest match; and order by `sequence DESC`. Append updates the local map only when the appended record is valid and has a greater sequence. Update the test to pass `MeasurementProtocol("microbench-v1", warmups=3, samples=6)`, monkeypatch the SQLite query method to prove the second unchanged lookup is in-memory, add a different tuning revision that is not reused, and use two `OverlayStore` instances to prove an externally appended later sequence invalidates the first store's cache.
+Open SQLite with `isolation_level=None`, WAL mode, and `PRAGMA busy_timeout=30000`. Reads and `PRAGMA data_version` must be statement-scoped autocommit operations so another connection's commit becomes visible immediately. `append()` uses an explicit short `BEGIN IMMEDIATE` / `COMMIT` transaction and rolls back on every exception; no connection or cursor crosses a process boundary.
+
+Implement `OverlayStore.append(record) -> int`, `lookup(key, protocol) -> MeasurementRecord | None`, and `close()`. Maintain an in-memory map keyed by `(key.digest, protocol.digest)`. Before using it, compare `PRAGMA data_version` with the value seen on the previous lookup; clear the map when another process/connection committed. Lookup then checks the map, queries SQLite on a miss, and populates the map. SQLite lookup must filter `status='valid'` and `protocol_digest=protocol.digest`; compare both stored `key_json` to `key.canonical` and stored `protocol_json` to `protocol.canonical` after digest matches; and order by `sequence DESC`. Append updates the local map only when the appended record is valid and has a greater sequence. Update the test to pass a matching full `MeasurementProtocol`, monkeypatch the SQLite query method to prove the second unchanged lookup is in-memory, add individual warmup/sample/statistic/timer/tuning changes that are not reused, hold two stores open while one appends to prove autocommit plus `data_version` invalidates the first store's cache, and verify an append exception leaves no partial row or open transaction.
 
 - [ ] **Step 4: Run overlay tests including process reopen**
 
@@ -457,6 +566,7 @@ class MissSet:
 class ResolutionBudget:
     max_new_keys: int
     max_wall_seconds: float
+    max_transient_attempts_per_key: int = 2
 
 
 @dataclass(slots=True)
@@ -498,11 +608,12 @@ class ResolutionSession:
         self.report = ResolutionReport()
         self._clock = clock
         self._cancellation = cancellation or _NeverCancelled()
-        self._new_keys = 0
+        self._charged_keys: set[PerfKey] = set()
         self._callback_lock = threading.RLock()
         self._misses = MissSet()
         self._unresolved: list[UnresolvedReason] = []
         self._negative: dict[PerfKey, UnresolvedReason] = {}
+        self._transient_attempts: dict[PerfKey, int] = {}
 
     def lookup(self, key: PerfKey) -> MeasurementRecord | None:
         record = self.overlay.lookup(key, self.protocol)
@@ -524,6 +635,15 @@ class ResolutionSession:
         if previous_failure is not None:
             self.record_unresolved(previous_failure)
             return
+        if self._transient_attempts.get(request.key, 0) >= self.budget.max_transient_attempts_per_key:
+            self.record_unresolved(
+                UnresolvedReason(
+                    UnresolvedCode.RETRY_EXHAUSTED,
+                    consumer,
+                    f"transient retry budget exhausted for {request.key.digest}",
+                )
+            )
+            return
         self._misses.record(request, consumer)
         self.report.consumer_misses += 1
 
@@ -544,6 +664,19 @@ class ResolutionSession:
     def _fail(self, reasons: Sequence[UnresolvedReason]) -> NoReturn:
         self.report.unresolved.extend(reasons)
         raise ResolutionFailed(reasons)
+
+    def _remember_failure(self, key: PerfKey, reason: UnresolvedReason) -> None:
+        deterministic = {
+            UnresolvedCode.MISSING_ADAPTER,
+            UnresolvedCode.UNSUPPORTED_SHAPE,
+            UnresolvedCode.TOPOLOGY_MISMATCH,
+            UnresolvedCode.IDENTITY_MISMATCH,
+            UnresolvedCode.INVALID_MEASUREMENT,
+        }
+        if reason.code in deterministic:
+            self._negative[key] = reason
+        elif reason.code not in {UnresolvedCode.CANCELLED, UnresolvedCode.BUDGET_EXHAUSTED}:
+            self._transient_attempts[key] = self._transient_attempts.get(key, 0) + 1
 
     def resolve_pending(self) -> None:
         if self._unresolved:
@@ -576,20 +709,23 @@ class ResolutionSession:
                 ]
             )
 
-        remaining_keys = self.budget.max_new_keys - self._new_keys
+        newly_charged = tuple(request for request in requests if request.key not in self._charged_keys)
+        remaining_keys = self.budget.max_new_keys - len(self._charged_keys)
         remaining_seconds = self.budget.max_wall_seconds - self.report.collection_seconds
-        if len(requests) > remaining_keys or remaining_seconds <= 0:
+        if len(newly_charged) > remaining_keys or remaining_seconds <= 0:
             self._fail(
                 [
                     UnresolvedReason(
                         UnresolvedCode.BUDGET_EXHAUSTED,
                         request.op_id,
-                        f"need {len(requests)} keys/{remaining_seconds:.3f}s remaining; "
+                        f"need {len(newly_charged)} new keys/{remaining_seconds:.3f}s remaining; "
                         f"budget has {remaining_keys} keys",
                     )
                     for request in requests
                 ]
             )
+
+        self._charged_keys.update(request.key for request in newly_charged)
 
         started = self._clock()
         try:
@@ -606,10 +742,10 @@ class ResolutionSession:
                 UnresolvedReason(UnresolvedCode.COLLECTOR_FAILED, request.op_id, str(error))
                 for request in requests
             ]
-            self._negative.update((request.key, reason) for request, reason in zip(requests, reasons, strict=True))
+            for request, reason in zip(requests, reasons, strict=True):
+                self._remember_failure(request.key, reason)
             self._fail(reasons)
         self.report.collection_seconds += self._clock() - started
-        self._new_keys += len(requests)
 
         requested = {request.key: request for request in requests}
         records_by_key: dict[PerfKey, list[MeasurementRecord]] = {}
@@ -626,17 +762,14 @@ class ResolutionSession:
                     )
                 )
                 continue
-            if (
-                record.protocol_revision != request.protocol.revision
-                or record.tuning_revision != request.protocol.tuning_revision
-            ):
+            if record.protocol != request.protocol:
                 reason = UnresolvedReason(
                     UnresolvedCode.IDENTITY_MISMATCH,
                     request.op_id,
-                    "record protocol/tuning revision does not match request",
+                    "record protocol does not exactly match request",
                 )
                 failures.append(reason)
-                self._negative[record.key] = reason
+                self._remember_failure(record.key, reason)
                 invalid_keys.add(record.key)
                 self.report.rejected_records += 1
                 continue
@@ -656,7 +789,7 @@ class ResolutionSession:
                     f"expected one record for {request.key.digest}, got {len(matches)}",
                 )
                 failures.append(reason)
-                self._negative[request.key] = reason
+                self._remember_failure(request.key, reason)
                 continue
             record = matches[0]
             if record.status is RecordStatus.FAILED:
@@ -666,7 +799,7 @@ class ResolutionSession:
                     record.failure_reason or "collector failed",
                 )
                 failures.append(reason)
-                self._negative[request.key] = reason
+                self._remember_failure(request.key, reason)
             elif record.status is not RecordStatus.VALID or record.latency_ms is None:
                 reason = UnresolvedReason(
                     record.failure_code or UnresolvedCode.INVALID_MEASUREMENT,
@@ -674,7 +807,7 @@ class ResolutionSession:
                     record.failure_reason or "measurement rejected",
                 )
                 failures.append(reason)
-                self._negative[request.key] = reason
+                self._remember_failure(request.key, reason)
         if self._cancellation.cancelled():
             failures.append(
                 UnresolvedReason(UnresolvedCode.CANCELLED, "resolution_session", "session cancelled during collection")
@@ -710,7 +843,7 @@ class ResolutionSession:
         return result
 ```
 
-Define `_NeverCancelled.cancelled()` to return `False`. Add tests for two threads calling the same cold session (one executor batch, second callback warms after the callback lock), session-local negative caching after a failed/rejected record, pre-dispatch cancellation, cancellation while the fake executor is active, cumulative key budget exhaustion, wall-budget exhaustion with an injected clock, executor exceptions, a missing returned key, duplicate returned records, rejected/failed records being appended for provenance, and a second walk that still misses. Assert every failure exposes the exact `UnresolvedCode` above and that partial valid records remain queryable after another request in the same executor batch fails.
+Define `_NeverCancelled.cancelled()` to return `False`. Add tests for two threads calling the same cold session (one executor batch, second callback warms after the callback lock), deterministic negative caching, transient timeout/worker-loss retry followed by `RETRY_EXHAUSTED`, cancellation that does not poison later work, pre-dispatch cancellation, cancellation while the fake executor is active, cumulative unique-key budget exhaustion, wall-budget exhaustion with an injected clock, executor exceptions, a missing returned key, duplicate returned records, full protocol mismatch, rejected/failed records being appended for provenance, and a second walk that still misses. Include the exact regression: `max_new_keys=1`, one key times out, the same key is allowed a second dispatch without another key charge, and the next attempt returns `RETRY_EXHAUSTED`; a different key is rejected by `BUDGET_EXHAUSTED`. Assert every failure exposes the exact `UnresolvedCode` above and that partial valid records remain queryable after another request in the same executor batch fails.
 
 - [ ] **Step 4: Run session tests**
 
@@ -728,20 +861,22 @@ git commit -m "feat: add callback-local resolution session"
 ### Task 4: Resolution-aware operations and composites
 
 **Files:**
-- Modify: `src/aiconfigurator/sdk/operations/base.py:114-139`
-- Modify: `src/aiconfigurator/sdk/operations/overlap.py:40-171`
+- Modify: `src/aiconfigurator/sdk/operations/base.py` (`Operation` contract)
+- Modify: `src/aiconfigurator/sdk/operations/overlap.py` (`FallbackOp` and `OverlapOp`)
 - Test: `tests/unit/sdk/resolution/test_operations.py`
 
-- [ ] **Step 1: Write tests for overlay precedence, unsupported misses, and recursive composite discovery**
+- [ ] **Step 1: Write tests for overlay precedence, literal curated hits, exact misses, and recursive composite discovery**
 
-Use a fake operation whose pure `query` raises `PerfDataNotAvailableError`, whose `measurement_request` returns a fixed request, and whose `performance_from_record` applies its scale. Assert:
+Use a fake table-backed operation whose ordinary `query` deliberately returns an interpolated SILICON value for an off-grid shape, whose `measurement_request` returns a fixed request, whose `curated_exact_result` returns a result only for a literal row, and whose `performance_from_record` applies its scale. Assert:
 
 ```python
 assert float(op.query_with_resolution(db, session=session, x=8)) == pytest.approx(0.25)
 assert executor.calls == 0  # overlay hit bypasses curated lookup
 ```
 
-For `OverlapOp`, put one missing fake op in each group and assert that both keys enter the same `MissSet`. For `FallbackOp`, assert measure-on-miss records the primary miss without setting `_primary_unavailable` or executing fallback ops.
+Also assert a literal curated row returns without collection, the populated-table off-grid shape records a miss despite ordinary `query()` succeeding through interpolation, and an operation with neither a literal row nor a request records `MISSING_ADAPTER`. The resolution path must never call ordinary interpolating `query()` as its exact-evidence predicate.
+
+For `OverlapOp`, put one missing fake op in each group and assert that both keys enter the same `MissSet`. For current-upstream `FallbackOp`, cover both branches: an adapter-capable primary records its exact miss and does not execute fallback ops; a primary with no adapter checks `curated_exact_result()` and, when no literal row exists, executes the fallback operations without adding `missing_adapter` to the session. Assert no code references the removed sticky `_primary_unavailable` state.
 
 - [ ] **Step 2: Run and verify missing-method failures**
 
@@ -755,6 +890,10 @@ Expected: `AttributeError` for `query_with_resolution`.
 def measurement_request(self, database, protocol, **kwargs):
     return None
 
+def curated_exact_result(self, database, **kwargs):
+    """Return a literal compatible row, or None. Never interpolate or fall back."""
+    return None
+
 def performance_from_record(self, record, **kwargs):
     return record.performance_result(scale_factor=self._scale_factor)
 
@@ -762,28 +901,32 @@ def query_with_resolution(self, database, *, session=None, **kwargs):
     if session is None:
         return self.query(database, **kwargs)
     from aiconfigurator.sdk import common
-    from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
+    from aiconfigurator.sdk.perf_database import _get_configured_database_view
 
-    request = self.measurement_request(database, session.protocol, **kwargs)
+    exact_database = _get_configured_database_view(
+        database,
+        common.DatabaseMode.SILICON,
+        getattr(database, "transfer_policy", None),
+    )
+    request = self.measurement_request(exact_database, session.protocol, **kwargs)
     if request is not None:
         record = session.lookup(request.key)
         if record is not None:
             return self.performance_from_record(record, **kwargs)
-    previous_mode = database._default_database_mode
-    try:
-        database._default_database_mode = common.DatabaseMode.SILICON
-        return self.query(database, **kwargs)
-    except PerfDataNotAvailableError as exc:
-        if request is None:
-            session.record_missing_adapter(self._name, exc)
-        else:
-            session.record_miss(request, self._name)
-        return PerformanceResult(0.0, energy=0.0, source="unresolved")
-    finally:
-        database._default_database_mode = previous_mode
+    curated = self.curated_exact_result(exact_database, **kwargs)
+    if curated is not None:
+        return curated
+    if request is None:
+        session.record_missing_adapter(
+            self._name,
+            RuntimeError("operation has no literal exact row or lazy adapter for this query"),
+        )
+    else:
+        session.record_miss(request, self._name)
+    return PerformanceResult(0.0, energy=0.0, source="unresolved")
 ```
 
-Import resolution types only under `TYPE_CHECKING` where possible; keep `query()` unchanged. Add a HYBRID-mode test whose empirical fallback would otherwise succeed and assert measure-on-miss forces an exact silicon miss into the `MissSet`. This is the guard against mixing measured overlay values with empirical fallback values in one candidate score.
+Import resolution types only under `TYPE_CHECKING` where possible; keep `query()` unchanged. Never assign `_default_database_mode` directly and never call `set_default_database_mode()` on the caller's object. Add a HYBRID-mode test whose empirical/interpolated fallback would otherwise succeed and assert measure-on-miss uses a SILICON configured view plus `curated_exact_result`, forces an off-grid exact miss into the `MissSet`, leaves the caller's database/view and caches unchanged, and is race-safe across two sessions sharing the same root template. This is the guard against mixed evidence, interpolation masquerading as a hit, and mode/cache corruption.
 
 - [ ] **Step 4: Override composites to recurse**
 
@@ -795,22 +938,30 @@ Implement `FallbackOp.query_with_resolution` as follows:
 def query_with_resolution(self, database, *, session=None, **kwargs):
     if session is None:
         return self.query(database, **kwargs)
-    checkpoint = session.checkpoint()
-    if not self._primary_unavailable:
-        previous_mode = database._default_database_mode
-        force_silicon = previous_mode == common.DatabaseMode.HYBRID
-        try:
-            if force_silicon:
-                database._default_database_mode = common.DatabaseMode.SILICON
-            primary = self._primary.query_with_resolution(database, session=session, **kwargs)
-            if session.changed_since(checkpoint):
-                return PerformanceResult(0.0, energy=0.0, source="unresolved")
-            return primary
-        except (KeyError, AssertionError):
-            pass
-        finally:
-            if force_silicon:
-                database._default_database_mode = previous_mode
+    from aiconfigurator.sdk.perf_database import _get_configured_database_view
+
+    primary_database = _get_configured_database_view(
+        database,
+        common.DatabaseMode.SILICON,
+        getattr(database, "transfer_policy", None),
+    )
+    primary_request = self._primary.measurement_request(
+        primary_database,
+        session.protocol,
+        **kwargs,
+    )
+    if primary_request is not None:
+        record = session.lookup(primary_request.key)
+        if record is not None:
+            return self._primary.performance_from_record(record, **kwargs)
+
+    primary_curated = self._primary.curated_exact_result(primary_database, **kwargs)
+    if primary_curated is not None:
+        return primary_curated
+
+    if primary_request is not None:
+        session.record_miss(primary_request, self._primary._name)
+        return PerformanceResult(0.0, energy=0.0, source="unresolved")
 
     total = PerformanceResult(0.0, energy=0.0, source="empirical")
     for op in self._fallback:
@@ -818,7 +969,7 @@ def query_with_resolution(self, database, *, session=None, **kwargs):
     return total
 ```
 
-The resolving path never sets `_primary_unavailable`: a primary table miss may become an overlay hit after collection. Preserve the current logger suppression around the primary attempt, and preserve `query()` byte-for-behavior when no session is supplied.
+This mirrors current-upstream fallback intent while replacing its ordinary interpolating probe with literal exact evidence. A primary with neither a literal exact row nor an adapter proceeds directly to fallback children without recording `missing_adapter`. An adapter-capable primary remains preferred and may become an overlay hit after collection. Preserve current logging around the primary attempt and preserve `query()` byte-for-behavior when no session is supplied.
 
 - [ ] **Step 5: Run operation tests**
 
@@ -836,8 +987,8 @@ git commit -m "feat: discover lazy misses across operation composites"
 ### Task 5: BaseBackend and InferenceSession one-requery integration
 
 **Files:**
-- Modify: `src/aiconfigurator/sdk/backends/base_backend.py:248-333`
-- Modify: `src/aiconfigurator/sdk/inference_session.py:55-104`
+- Modify: `src/aiconfigurator/sdk/backends/base_backend.py` (static phase walks and Rust-engine gate)
+- Modify: `src/aiconfigurator/sdk/inference_session.py` (`run_static*` SDK boundary)
 - Modify: `tests/unit/sdk/backends/test_base_backend.py`
 - Modify: `tests/unit/sdk/test_inference_session.py`
 
@@ -850,6 +1001,8 @@ Add a model with two fake missing operations sharing one key. Call `inference_se
 - the returned summary contains the overlay value twice, once per consumer;
 - calling without `resolution_session` preserves the existing exception/fallback behavior;
 - `run_static_latency_only` follows the same lifecycle.
+- with a `RuntimeConfig` for which `should_use_rust_engine_step` is true, no-session calls still invoke the existing Rust estimator exactly once and never touch `query_with_resolution`;
+- the same config with a session bypasses the Rust estimator, performs the Python discovery/requery walk, and leaves subsequent no-session fast-path calls unchanged.
 
 - [ ] **Step 2: Run the focused tests**
 
@@ -859,7 +1012,7 @@ Expected: failures reporting the unexpected `resolution_session` keyword.
 
 - [ ] **Step 3: Thread the optional session through the operation walks**
 
-Add keyword-only `resolution_session: ResolutionSession | None = None` to `run_static` and `run_static_latency_only`, and thread it through `_run_static_breakdown`, `_run_encoder_phase`, `_run_context_phase`, and `_run_generation_phase`. When a session is present, bypass `should_use_rust_engine_step(runtime_config)`: the compiled engine cannot discover a complete `MissSet` or read the mutable overlay in V1. Replace each direct query with its phase-equivalent resolving call. Encoder:
+Add keyword-only `resolution_session: ResolutionSession | None = None` to `run_static` and `run_static_latency_only`, and thread it through `_run_static_breakdown`, `_run_encoder_phase`, `_run_context_phase`, and `_run_generation_phase`. Gate the existing Rust branch as `resolution_session is None and should_use_rust_engine_step(runtime_config)`: the compiled engine cannot discover a complete `MissSet` or read the mutable overlay in V1, while the ordinary path must remain byte-for-behavior fast. Replace each direct query with its phase-equivalent resolving call. Encoder:
 
 ```python
 result = op.query_with_resolution(

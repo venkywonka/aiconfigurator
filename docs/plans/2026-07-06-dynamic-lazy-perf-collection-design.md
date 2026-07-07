@@ -10,38 +10,38 @@
 
 AIC will gain an explicit, opt-in **measure-on-miss resolution session**. When Dynamo Mocker asks AIC for the latency of one concrete prefill or decode shape, AIC walks the same existing operations it already uses for prediction. If every exact performance key is present, it returns normally. If keys are missing, AIC collects all unique misses visible in that operation walk, schedules their microbenchmarks across the available GPU and fabric topology, appends validated results to a persistent overlay, reruns only the AIC operation walk, and returns a complete latency.
 
-The cost is paid once per unique unresolved performance key, not once per Mocker iteration. Repeated shapes, repeated layers, later candidates, and compatible later runs reuse the same evidence.
+The cost is paid once per unique unresolved performance key per coordinator, not once per Mocker iteration. Repeated shapes, repeated layers, sequential later candidates, and compatible later runs reuse the same evidence. Disjoint concurrently cold coordinators may append duplicate observations in V1 because distributed single-flight is explicitly deferred.
 
 This imports Rhino's most useful pattern—runtime-shaped, cache-backed, on-demand profiling—without importing Rhino's graph runtime or adding a new AIC graph IR. V1 reuses AIC's existing operations, composites, perf schemas, and collector implementations.
 
 ## Source baseline and provenance
 
-This design was developed against the following local revisions:
+This design originated from the following local revisions:
 
 - AIC local checkout: `ffbab15797d3a3f14c382e937c0ab0c1c5cbc530`
 - AIC fetched `upstream/main`: `0828d6b7e4a7880079443b1c6f9c148d85bdbf54`
 - Dynamo local checkout: `5d3bb78df771246cf6909cb2a3d1852920afb9b6`
+- Dynamo fetched `origin/main`: `1fe16eb6b2e5318d78f5ece7733e054bab7ef938`
 - Rhino local checkout: `c63f24b99e4ad1e9eb72820bee59bac7e8544b83`
 
-The local AIC checkout is 52 commits behind `upstream/main`. Core AIC operation/database/collector seams cited below exist in the local checkout; Spica is cited from the fetched upstream tree (`docs/spica/`, `src/spica/`). Implementation should start from a branch containing the upstream Spica code or explicitly port the integration; it must not assume this local checkout already contains `src/spica`.
+The implementation baselines are the fetched AIC and Dynamo mainline commits above, not the older local checkout tips. AIC implementation must start from a branch containing `0828d6b7` (including the immutable configured-database views, Rust engine-step gates, context-parallel operation semantics, and `src/spica/`). Dynamo implementation must start from a branch containing `1fe16eb6` (including attention-DP callback projection and the current replay layout). A newer base is acceptable only after rerunning the source-anchor and baseline test gate in the implementation plans. The feature commits must be rebased or cherry-picked onto those bases; an executor must not implement the pseudocode against the stale local trees.
 
 ### Existing AIC seams
 
-- `src/aiconfigurator/sdk/backends/base_backend.py:248` and `:289` walk `model.context_ops` and `model.generation_ops`, passing concrete scalar runtime fields to `Operation.query`.
-- `src/aiconfigurator/sdk/operations/base.py:114` defines the operation contract.
-- `src/aiconfigurator/sdk/operations/overlap.py:124` and its fallback implementation show that AIC already supports nested composites without a general DAG.
-- `src/aiconfigurator/sdk/operations/communication.py:60`, `:242`, and `:437` model custom all-reduce, NCCL, and point-to-point communication as operations.
-- `src/aiconfigurator/sdk/perf_database.py:119` exposes `PerfDataNotAvailableError`; `:1135` defines `PerfDatabase`; `:1553` already treats missing data as a structured caller-visible signal.
-- `collector/registry_types.py:82` defines `OpEntry` with `get_func`, `run_func`, `perf_filename`, and module/version routing.
-- `collector/collect.py:972` resolves collection entries; `:1033` imports registered functions; `:1056` invokes the current case generator and runner path.
+- `src/aiconfigurator/sdk/backends/base_backend.py` walks `model.context_ops` and `model.generation_ops`, passes concrete scalar runtime fields to `Operation.query`, and may select `should_use_rust_engine_step` for ordinary prediction.
+- `src/aiconfigurator/sdk/operations/base.py` defines the operation contract, including context-parallel `seq_split` semantics on opted-in operations.
+- `src/aiconfigurator/sdk/operations/overlap.py` shows that AIC already supports nested composites without a general DAG. Its current `FallbackOp` uses `_get_configured_database_view` rather than mutating database mode and does not retain a sticky `_primary_unavailable` flag.
+- `src/aiconfigurator/sdk/operations/communication.py` models custom all-reduce, NCCL, and point-to-point communication as operations.
+- `src/aiconfigurator/sdk/perf_database.py` exposes `PerfDataNotAvailableError`, defines immutable cached query views, and treats missing data as a structured caller-visible signal.
+- `collector/registry_types.py` defines the offline `OpEntry` with `get_func`, `run_func`, `perf_filename`, and module/version routing.
+- `collector/collect.py` resolves collection entries, imports registered functions, and invokes the current case generator and runner path.
 
 ### Existing Mocker and Spica seams
 
-- Dynamo `lib/mocker/src/common/perf_model.rs:30` defines the direct `AicCallback` for prefill and decode.
-- `lib/mocker/src/common/perf_model.rs:220` passes Mocker's prefill/decode scalar shape descriptors to AIC.
-- Scheduler call sites such as `lib/mocker/src/scheduler/sglang/core.rs:540` and `lib/mocker/src/scheduler/vllm/core.rs:1830` currently reduce heterogeneous batches to mean lengths; this is insufficient for shape-faithful lazy collection.
-- `lib/bindings/python/rust/llm/aic_callback.rs:40` implements the default callback as a pure-Rust `RustAicCallback`; it cannot invoke Python collectors on its hot path.
-- `lib/bindings/python/src/dynamo/_internal/aic.py:112` retains a Python `AicSession` operation-walk path that can host the explicit resolving mode.
+- Dynamo `lib/mocker/src/common/perf_model.rs` defines the direct `AicCallback` for prefill and decode and projects aggregate offline-replay batches to a per-rank batch with `attention_dp_size`.
+- Scheduler call sites in `lib/mocker/src/scheduler/sglang/` and `lib/mocker/src/scheduler/vllm/` currently reduce heterogeneous batches to mean lengths; this is insufficient for shape-faithful lazy collection.
+- `lib/bindings/python/rust/llm/aic_callback.rs` implements the default callback as a pure-Rust `RustAicCallback`; it cannot invoke Python collectors on its hot path.
+- `lib/bindings/python/src/dynamo/_internal/aic.py` retains a Python `AicSession` operation-walk path that can host the explicit resolving mode.
 - AIC upstream `docs/spica/overview.md` and `src/spica/evaluator.py` establish that Spica owns candidate search while Dynamo Replay/Mocker owns system scheduling and candidate scoring.
 
 ### Rhino patterns retained
@@ -132,12 +132,12 @@ Mocker advances simulated time only after the current callback receives complete
 
 ## Concrete shape propagation
 
-The existing Python backend already passes fields such as `batch_size`, `x`, sequence length, and prefix into the operation walk. The direct Mocker callback currently carries reduced scalar descriptors, and some scheduler call sites compute those scalars from batch means:
+The existing Python backend already passes fields such as `batch_size`, `x`, sequence length, and prefix into the operation walk. Current Mocker has two adjacent scalar contracts that must not be conflated during descriptor propagation. Scheduler call sites invoke `PerfModel` with prefill `(batch_size, mean_isl, mean_prefix)` and decode `(batch_size, active_kv_tokens, average_context, total_kv_tokens)`. Only the AIC branch then projects the batch for attention DP and reduces those values to callback inputs:
 
-- prefill: `(batch_size, effective_isl, prefix)`
-- decode: `(batch_size, isl, osl)`
+- prefill AIC callback: `(projected_batch_size, effective_isl=mean_isl-mean_prefix, mean_prefix)`
+- decode AIC callback: `(projected_batch_size, average_context, osl=2)`
 
-Those reduced scalars are adequate for the existing predictor but are not always an exact collection identity. The resolving bridge therefore adds a transient `ConcreteBatchDescriptor` containing the real scheduled metadata needed by collectors: per-request uncached/prefix lengths for prefill and per-request context lengths for decode (or an equivalent lossless normalized representation). It is metadata, not a tensor payload.
+Those reduced scalars are adequate for the existing predictor but are not always an exact collection identity. The resolving bridge therefore adds a transient `ConcreteBatchDescriptor` containing the real scheduled metadata needed by collectors: full prompt length, scheduler-owned context/chunk end, reused prefix, and actually scheduled tokens per prefill request; and context plus scheduled tokens per decode request. It is metadata, not a tensor payload. The separate prefill fields matter because a continued chunk need not satisfy `context_tokens == prefix_tokens + scheduled_tokens`.
 
 AIC derives its existing scalar operation fields from that descriptor (for example, batch size and exact token sums) and supplies an operation-defined normalized length-distribution descriptor/fingerprint only where values beyond the existing columns affect timing. The descriptor must survive until the deterministic input recipe is built; merely hashing a mean is insufficient.
 
@@ -145,13 +145,15 @@ The lazy path must not reconstruct exact request shape from AIC's aggregate Rust
 
 V1 uses concrete scheduled metadata, dtype/layout, and existing operation/configuration parameters. Value-sensitive operations may add a small, operation-defined semantic descriptor/fingerprint (for example, a normalized sequence-length histogram or MoE load-distribution bucket). The collector deterministically synthesizes tensors from the key and descriptor. Runtime tensor capture is out of scope.
 
+The aggregated offline Mocker path currently has no lossless mapping from a global heterogeneous batch to individual attention-DP ranks; it only applies a ceil-divided batch-size projection. Calling that projection "exact" would be misleading. V1 therefore rejects resolving mode when `aic_attention_dp_size > 1`. Pure prediction keeps the existing projection unchanged. Supporting resolving attention-DP requires Mocker to emit one concrete descriptor per rank (or an equivalent scheduler-owned assignment) and AIC to score the slowest rank; synthesizing a partition from means is not allowed.
+
 ## Mocker and Spica bridge contract
 
-Pure/default Mocker prediction keeps the current `RustAicCallback` and its GIL-free compiled-engine hot path. V1 adds a distinct explicit resolving callback mode backed by the existing Python `AicSession` operation walk. The resolving mode accepts `ConcreteBatchDescriptor` rather than only the legacy mean scalars and carries it into Python AIC, where operation adapters and the collector registry are available. It does not silently replace the default Rust path.
+Pure/default Mocker prediction keeps the current `RustAicCallback` and its GIL-free compiled-engine hot path. V1 adds a distinct explicit resolving callback mode backed by the existing Python `AicSession` operation walk. The callback boundary receives the immutable global `ConcreteBatchDescriptor` plus the existing AIC-only projected batch-size scalar. `RustAicCallback` uses the projected scalar and signature-ordered legacy aggregates to reproduce current behavior. Resolving mode requires attention DP one, where projected and global batch sizes match, and carries the lossless descriptor into Python AIC, where operation adapters and the collector registry are available. It does not silently replace the default Rust path or fabricate a per-rank request vector.
 
 The aggregate native Rust FPM remains useful for forward-pass prediction and telemetry correction, but it is not treated as an exact per-operation collection request. Likewise, the current compiled Rust engine does not yet expose a complete `MissSet` or ingest the mutable overlay, so measure-on-miss must not claim that it can stay on that path in V1. Teaching the Rust engine structured miss discovery and overlay refresh is a later optimization after the Python resolving contract is proven.
 
-The current Rust `AicCallback` methods return a bare `f64`. Measure-on-miss requires the bridge to propagate a structured success or failure (for example, a `Result<f64, AicResolutionError>`-equivalent contract or a Python exception envelope that Replay converts into an infeasible candidate). A collector failure must never be coerced into zero latency, a negative value, or an empirical estimate.
+The current Rust `AicCallback` methods return a bare `f64`. Measure-on-miss requires the bridge to propagate a structured success or failure (for example, a `Result<f64, AicResolutionError>`-equivalent contract or a Python exception envelope that Replay converts into an infeasible candidate). A collector failure must never be coerced into zero latency, a negative value, or an empirical estimate. Replay consumes the structured candidate error before advancing virtual time. V1 forbids the resolving callback on the live scheduler; because its current handle has no terminal-error channel, an unexpected pure-callback error at that boundary retains today's hard-failure behavior before any pass effects are published rather than becoming a zero-progress loop.
 
 Collection may block one latency callback for seconds or minutes. The resolving callback may acquire the GIL to enter `AicSession`, but it must never run GPU microbenchmarks in that process under the GIL or retain a Mocker scheduler lock while waiting. Python submits work to executor processes and waits through a GIL-releasing synchronization primitive. The callback remains causally synchronous from Mocker's perspective, while hardware work runs outside its scheduler locks and Python interpreter.
 
@@ -179,12 +181,35 @@ Lookup order is:
 
 1. in-memory exact-key index;
 2. persistent on-demand overlay;
-3. curated perf database;
+3. literal compatible row in the curated perf database through the operation's exact probe;
 4. structured miss.
 
 The overlay is append-only. For multiple exact compatible records, the latest valid committed record by a monotonic append sequence wins deterministically while older observations remain auditable. Wall-clock timestamps alone do not define precedence. Rejected and failed attempts may be retained for diagnostics but are never indexed as hits. Promotion into curated data is a separate validation/export action.
 
-Measurement-protocol revision (warmup/sample/statistic rules) and collector tuning-policy/search-space revision participate in record compatibility and selection even when they are not operation-level perf dimensions. A policy may deliberately accept older compatible protocols; that decision is recorded in the session manifest.
+The complete canonical measurement protocol—revision, warmup count, sample count, statistic, timer method, and collector tuning-policy/search-space revision—participates in compatibility and selection among on-demand overlay records even when those fields are not operation-level perf dimensions. A revision string alone is insufficient: two overlay requests with different sample or statistic rules must not alias. Released curated rows are a separately governed, trusted evidence tier whose compatibility is established by the curated dataset/backend version already present in `PerfKey`; they need not contain the session's overlay protocol. A stricter future policy may disable curated reuse, but it must do so explicitly. A policy may deliberately accept an older overlay protocol only through an explicit compatibility rule recorded in the session manifest.
+
+## Exact-evidence predicate versus interpolation
+
+AIC's ordinary SILICON queries are not discrete point lookups. For a populated table they may clamp, interpolate, or extrapolate an off-grid shape and still return `source="silicon"`; `PerfDataNotAvailableError` commonly means a table or quantization bucket is absent, not that one exact row is absent. Therefore the lazy path must not define a miss as "ordinary SILICON query raised."
+
+Every resolution-aware operation instead exposes a small exact-evidence probe over its existing normalized query fields:
+
+```text
+overlay exact record
+    -> curated exact row (no interpolation, clamp, extrapolation, or empirical fallback)
+    -> exact miss with MeasurementRequest
+    -> unsupported/unscorable
+```
+
+The operation owns normalization because only it knows transformations such as `_scale_num_tokens`, context-parallel `seq_split`, dtype overrides, or composite table semantics. The same normalization helper feeds ordinary `query()`, `PerfKey`, the curated exact-row probe, and collector case construction. Exact-row membership is captured from loaded source rows before any correction pass that synthesizes extrapolated grid points; mere presence in a post-processed in-memory table is not proof of measurement. Compatible inherited source rows retain their source-version provenance. A probe result is one of:
+
+- `exact_hit`: a compatible overlay or literal curated row, converted with the operation's normal scale/energy semantics and tagged `overlay` or `curated_exact` for auditability;
+- `exact_miss`: the operation can construct a request and the collector may acquire the point;
+- `unsupported`: the operation cannot establish exact evidence for this query under the active policy.
+
+Authoritative deterministic operations with no measured table may opt into `exact_hit` only through an explicit operation contract and provenance tag; an ordinary interpolated, extrapolated, clamped, or empirical result is never implicitly exact. `FallbackOp` may try a no-adapter primary's literal exact probe and then recurse into its fallback operations without poisoning the session. An adapter-capable primary exact miss remains preferred and is collected rather than silently switching implementations.
+
+V1 implements real exact-row probes for the BF16 GEMM and NCCL pilots. Other operations remain unsupported until they add a probe/adapter or an explicitly reviewed deterministic-evidence contract. Capability preflight is therefore a release gate, not a best-effort warning.
 
 ## Measurement objects and multiplicity
 
@@ -240,7 +265,7 @@ memory estimate
 optional communicator identity
 ```
 
-At session startup, AIC inventories the assigned resource pool: GPU class and memory, peer links, NVLink/NVSwitch domains, PCIe roots, and NIC locality. A greedy wave planner builds a conflict graph and packs a large non-conflicting set of requests per wave.
+At session startup, AIC inventories the assigned resource pool: GPU class and memory, peer links, NVLink/NVSwitch domains, PCIe roots, and NIC locality. Discovery has a versioned parser/schema and produces a canonical topology fingerprint from sorted device classes and links; unknown link tokens fail closed rather than being silently reclassified. Singleton GPUs do not become fake NVLink domains. A greedy wave planner builds a conflict graph and packs a large non-conflicting set of requests per wave.
 
 Examples:
 
@@ -250,6 +275,10 @@ Examples:
 - A collector may conservatively request node exclusivity when interference behavior is unknown.
 
 Persistent executors amortize initialization. Compute executors may be cached per GPU/runtime; collective executors may cache communicators by compatible device group, topology, world size, and runtime. Batching means deduplicated scheduling and shared executor lifetime, not co-running conflicting timing kernels.
+
+Every parent/worker message carries a unique invocation id as well as the `PerfKey` digest, and every reply must echo both. A timeout, cancellation, worker exception, or mismatched reply terminates and evicts the affected persistent worker before its channel can be reused. The coordinator still drains or terminates every other outstanding assignment in that wave, preserving completed independent records while making stale queued replies impossible.
+
+Collective rank groups have two shutdown paths. A healthy explicit close may attempt bounded cooperative process-group cleanup. After any rank failure, timeout, or cancellation, cleanup never enters another collective or barrier: the parent terminates the whole rank group, closes its rendezvous resources, joins with a deadline, and evicts the communicator lease.
 
 Parallel collection is an orchestration optimization only. Timings from independent jobs running in the same wave are stored as independent records and are not interpreted as a newly measured overlap/fusion. AIC's existing `OverlapOp` or other composite remains responsible for runtime composition unless that composite has its own explicit collector adapter.
 
@@ -266,7 +295,7 @@ lazy: MeasurementRequest -> case_from_query -> exact collector cases
 
 `CollectorCase` is conceptual and may remain the dict/tuple form an existing collector consumes.
 
-The current `OpEntry` fields remain authoritative. Lazy support is opt-in per operation through small additions equivalent to:
+The current `OpEntry` fields remain authoritative for offline discovery. Lazy support is opt-in per operation through small additions equivalent to:
 
 - `case_from_query(normalized_kwargs)`;
 - `resource_contract(case)` or a static resource contract;
@@ -274,6 +303,8 @@ The current `OpEntry` fields remain authoritative. Lazy support is opt-in per op
 - perf-schema and adapter revision.
 
 Both sources use the same registered `get_func`/`run_func` code. A persistent executor may submit several cases together when supported or loop through them without recreating its runtime.
+
+Installable runtime code lives under the non-generic `aiconfigurator.collector` namespace. The repository's top-level `collector/` tree remains a source-checkout CLI/offline compatibility surface whose pilot entry points delegate to the namespaced implementations. The wheel does not publish a generic top-level `collector` package. Shared adapter specifications are defined once in the namespaced package and referenced from the legacy `OpEntry` registrations, so offline and lazy paths cannot silently diverge.
 
 If the existing collector internally autotunes several kernel implementations/configurations for one exact case, the lazy request invokes that same tuning path. The record stores the selected winner and enough tuning-policy/search-space provenance to decide whether it remains reusable. This is collector-level autotuning for one exact AIC point; it is distinct from Spica's deployment-candidate search.
 
@@ -321,7 +352,7 @@ Structured unresolved reasons include:
 - `budget_exhausted`;
 - `requery_still_missing`.
 
-An unresolved callback makes that candidate unscorable. Spica may continue with other candidates; the search fails if none can be scored. Failed attempts are negatively cached within the session as needed to avoid repeated immediate retries, but they do not become durable positive hits.
+An unresolved callback makes that candidate unscorable. Spica may continue with other candidates; the search fails if none can be scored. Deterministic failures such as a missing adapter, unsupported shape, or identity mismatch may be negatively cached within the session. Transient failures such as timeout, cancellation, resource unavailability, or worker loss consume a bounded retry budget and are not cached as permanent search-wide facts. Failed attempts never become durable positive hits.
 
 ## Observability
 
@@ -347,6 +378,8 @@ Two clocks are kept separate:
 ### Unit tests
 
 - canonical key construction, ordering, hashing, and compatibility;
+- complete protocol identity, including warmup/sample/statistic mismatches;
+- real-operation exact-row membership: literal curated row hits, populated-table off-grid shapes miss even when ordinary SILICON would interpolate, and entirely absent tables miss;
 - optional semantic fingerprints;
 - `MissSet` deduplication with retained consumers;
 - overlay precedence and deterministic duplicate selection;
@@ -358,7 +391,7 @@ Two clocks are kept separate:
 Every lazy-enabled registry entry must prove:
 
 ```text
-operation query -> PerfKey -> collector case -> emitted row -> identical PerfKey
+operation normalized query -> exact-row probe / PerfKey -> collector case -> emitted row -> identical PerfKey
 ```
 
 It must also prove deterministic input generation, a valid resource contract, and explicit rejection of unsupported cases.
@@ -368,11 +401,13 @@ It must also prove deterministic input generation, a valid resource contract, an
 - pure-mode behavioral parity and no side effects;
 - cold resolution, atomic overlay/index refresh, and one requery;
 - coordinator-local single-flight;
-- cancellation, timeouts, negative attempts, and recovery from partial writes.
+- SQLite autocommit visibility across independent overlay connections;
+- cancellation, timeouts, correlated worker replies, transient retry limits, and recovery from partial writes.
 
 ### GPU integration
 
 - first occurrence measures each unique missing key once;
+- a populated-table off-grid GEMM goes through collection instead of interpolation;
 - repeated shape performs zero new collection;
 - compatible process restart reuses the overlay;
 - independent compute fills non-conflicting GPUs;
@@ -383,6 +418,7 @@ It must also prove deterministic input generation, a valid resource contract, an
 ### Mocker/Spica end to end
 
 - exact callback descriptors reach AIC;
+- resolving mode rejects attention-DP greater than one until rank-exact descriptors exist;
 - a cold callback resolves causally without replaying the whole candidate;
 - later callbacks and candidates reuse records;
 - incompatible provenance forces a miss;
@@ -401,12 +437,13 @@ It must also prove deterministic input generation, a valid resource contract, an
 The architecture is successful when all of the following hold:
 
 1. Pure prediction remains API/behavior compatible and performs no GPU collection.
-2. Successful physical measurements are bounded by unique unresolved `PerfKey`s encountered, not callback count or operation-instance count; failed/retried attempts are separately accounted and policy-bounded.
-3. Repeated compatible shapes, candidates, and process restarts add no duplicate GPU work.
+2. Within one resolution coordinator/resource lease, successful physical measurements are bounded by unique unresolved `PerfKey`s encountered, not callback count or operation-instance count; failed/retried attempts are separately accounted and policy-bounded. Concurrent independent coordinators may produce explicitly recorded duplicate observations because distributed single-flight is deferred.
+3. Repeated compatible shapes, sequential candidates, and process restarts add no duplicate GPU work once a compatible overlay commit is visible.
 4. Compute and communication records never cross incompatible hardware/topology identities.
 5. Mocker advances only after the current concrete callback has complete evidence.
 6. Non-conflicting work uses available GPU/fabric partitions without declared contention-domain overlap.
 7. No missing point is hidden behind empirical fallback in measure-on-miss mode.
+   Interpolated, extrapolated, and clamped SILICON estimates are also excluded unless an operation explicitly declares them compatible, which neither V1 pilot does.
 8. Every scored candidate links to evidence sources, resolution policy, assigned resources, and a collection report.
 
 ## Risks and mitigations
@@ -419,6 +456,10 @@ Resource contracts default conservatively, declare shared contention domains, an
 
 Such an operation must define a stable semantic fingerprint and deterministic generator parameters or remain unsupported for lazy collection. The system does not capture arbitrary runtime tensors as an escape hatch.
 
+### One callback produces too many exact keys
+
+Generation walks may vary sequence length at every configured stride, so one callback can expose `ceil((osl - 1) / stride)` distinct keys per shape-sensitive operation before layer deduplication. Capability preflight reports this bound from the concrete callback before dispatch. Default budgets are deliberately finite (256 new keys and 600 seconds per resolution session in the first Spica integration); exceeding either makes the candidate unscorable with the discovered counts, rather than silently truncating collection or substituting interpolation.
+
 ### Spica parallelism oversubscribes timing resources
 
 Cold resolution requires explicit disjoint leases or serialized candidate evaluation. The callback-local scheduler, not competing candidate processes, is responsible for saturating one lease.
@@ -426,6 +467,8 @@ Cold resolution requires explicit disjoint leases or serialized candidate evalua
 ### Overlay growth and stale evidence
 
 Compatibility namespaces prevent accidental reuse across incompatible runtime, collector, protocol, or topology revisions. Append-only history can be compacted into a derived index without deleting source evidence; promotion and retention remain separate operational policies.
+
+SQLite overlay readers use autocommit, statement-scoped reads so `PRAGMA data_version` observes commits from other connections. Appends use an explicit short transaction and `busy_timeout`; connections are process-local and never inherited by workers.
 
 ### Collector side effects leak into Mocker
 
