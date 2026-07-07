@@ -244,6 +244,66 @@ def test_execute_callback_collects_then_requeries_exactly_once(tmp_path) -> None
     assert session.report.consumer_misses == 1
 
 
+def test_nested_execute_callback_joins_outer_collection_cycle(tmp_path) -> None:
+    outer_request = _request(op_id="outer", m=8)
+    nested_request = _request(op_id="nested", m=16)
+    executor = _Executor(
+        lambda requests: [
+            _valid_record(request, 1.0 if request.key == outer_request.key else 2.0) for request in requests
+        ]
+    )
+    session = _session(tmp_path, executor)
+    outer_calls = 0
+    nested_calls = 0
+
+    def nested_query() -> float:
+        nonlocal nested_calls
+        nested_calls += 1
+        record = session.lookup(nested_request.key)
+        if record is not None:
+            assert record.latency_ms is not None
+            return record.latency_ms
+        session.record_miss(nested_request, "nested")
+        return 0.0
+
+    def outer_query() -> float:
+        nonlocal outer_calls
+        outer_calls += 1
+        record = session.lookup(outer_request.key)
+        if record is None:
+            session.record_miss(outer_request, "outer")
+            outer_latency = 0.0
+        else:
+            assert record.latency_ms is not None
+            outer_latency = record.latency_ms
+        return outer_latency + session.execute_callback(nested_query)
+
+    assert session.execute_callback(outer_query) == pytest.approx(3.0)
+    assert outer_calls == 2
+    assert nested_calls == 2
+    assert executor.request_batches == [(outer_request, nested_request)]
+    assert session.report.unique_misses == 2
+    assert session.report.consumer_misses == 2
+
+
+def test_execute_callback_restores_outermost_lifecycle_after_query_error(tmp_path) -> None:
+    request = _request()
+    executor = _Executor(lambda requests: [_valid_record(requests[0], 1.25)])
+    session = _session(tmp_path, executor)
+
+    def fail_after_recording_miss() -> float:
+        session.record_miss(request, "gemm")
+        raise RuntimeError("injected query failure")
+
+    with pytest.raises(RuntimeError, match="injected query failure"):
+        session.execute_callback(fail_after_recording_miss)
+
+    session.resolve_pending()
+    assert executor.request_batches == []
+    assert _execute_request(session, request) == pytest.approx(1.25)
+    assert executor.request_batches == [(request,)]
+
+
 def test_duplicate_valid_executor_records_fail_without_becoming_overlay_hits(tmp_path) -> None:
     request = _request()
     executor = _Executor(

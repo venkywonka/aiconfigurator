@@ -17,10 +17,86 @@ import pytest
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
-from aiconfigurator.sdk.inference_session import DisaggInferenceSession
+from aiconfigurator.sdk.inference_session import DisaggInferenceSession, InferenceSession
 from aiconfigurator.sdk.inference_summary import InferenceSummary
 
 pytestmark = pytest.mark.unit
+
+
+def test_inference_session_forwards_optional_resolution_session() -> None:
+    model = object()
+    database = object()
+    backend = MagicMock()
+    summary = object()
+    backend.run_static.return_value = summary
+    backend.run_static_latency_only.return_value = 3.5
+    inference = InferenceSession(model, database, backend)
+    runtime_config = RuntimeConfig(batch_size=2, beam_width=1, isl=8, osl=5, prefix=2)
+    resolution_session = object()
+
+    assert (
+        inference.run_static(
+            runtime_config,
+            "static",
+            stride=7,
+            latency_correction_scale=1.25,
+            resolution_session=resolution_session,
+        )
+        is summary
+    )
+    assert (
+        inference.run_static_latency_only(
+            runtime_config,
+            "static_ctx",
+            stride=3,
+            latency_correction_scale=1.5,
+            resolution_session=resolution_session,
+        )
+        == 3.5
+    )
+    backend.run_static.assert_called_once_with(
+        model,
+        database,
+        runtime_config,
+        "static",
+        7,
+        1.25,
+        resolution_session=resolution_session,
+    )
+    backend.run_static_latency_only.assert_called_once_with(
+        model,
+        database,
+        runtime_config,
+        "static_ctx",
+        3,
+        1.5,
+        resolution_session=resolution_session,
+    )
+
+
+def test_inference_session_omits_resolution_keyword_for_legacy_backend() -> None:
+    calls = []
+
+    class LegacyBackend:
+        def run_static(self, model, database, runtime_config, mode, stride, latency_correction_scale):
+            calls.append(("summary", model, database, runtime_config, mode, stride, latency_correction_scale))
+            return "summary"
+
+        def run_static_latency_only(self, model, database, runtime_config, mode, stride, latency_correction_scale):
+            calls.append(("latency", model, database, runtime_config, mode, stride, latency_correction_scale))
+            return 1.5
+
+    model = object()
+    database = object()
+    runtime_config = RuntimeConfig(batch_size=2, beam_width=1, isl=8, osl=5, prefix=2)
+    inference = InferenceSession(model, database, LegacyBackend())
+
+    assert inference.run_static(runtime_config, "static", 7, 1.25) == "summary"
+    assert inference.run_static_latency_only(runtime_config, "static_ctx", 3, 1.5) == 1.5
+    assert calls == [
+        ("summary", model, database, runtime_config, "static", 7, 1.25),
+        ("latency", model, database, runtime_config, "static_ctx", 3, 1.5),
+    ]
 
 
 def _static_row(

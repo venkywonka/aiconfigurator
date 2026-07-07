@@ -15,6 +15,7 @@ from aiconfigurator.sdk.config import RuntimeConfig
 from aiconfigurator.sdk.inference_summary import InferenceSummary
 from aiconfigurator.sdk.models import BaseModel
 from aiconfigurator.sdk.perf_database import PerfDatabase
+from aiconfigurator.sdk.resolution.session import ResolutionSession
 from aiconfigurator.sdk.rust_engine_step import (
     estimate_decode_step_latency_with_rust,
     estimate_mixed_step_latency_with_rust,
@@ -254,6 +255,8 @@ class BaseBackend:
         database: PerfDatabase,
         runtime_config: RuntimeConfig,
         batch_size: int,
+        *,
+        resolution_session: ResolutionSession | None = None,
     ) -> tuple[dict[str, float], dict[str, float], dict[str, str], int]:
         # Run the encoder phase (Currently VL models only).
         encoder_latency_dict = defaultdict(float)
@@ -285,15 +288,27 @@ class BaseBackend:
             eff_batch = batch_size * num_images if use_varlen else batch_size
             eff_s = pre_merge_per_image if use_varlen else n_img
             x = eff_batch * eff_s
-            result = op.query(
-                database,
-                x=x,
-                batch_size=eff_batch,
-                beam_width=1,
-                s=eff_s,
-                prefix=0,
-                model_name=getattr(model, "model_name", ""),
-            )
+            if resolution_session is None:
+                result = op.query(
+                    database,
+                    x=x,
+                    batch_size=eff_batch,
+                    beam_width=1,
+                    s=eff_s,
+                    prefix=0,
+                    model_name=getattr(model, "model_name", ""),
+                )
+            else:
+                result = op.query_with_resolution(
+                    database,
+                    session=resolution_session,
+                    x=x,
+                    batch_size=eff_batch,
+                    beam_width=1,
+                    s=eff_s,
+                    prefix=0,
+                    model_name=getattr(model, "model_name", ""),
+                )
             encoder_latency_dict[op._name] += float(result)
             encoder_energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
             encoder_source_dict[op._name] = getattr(result, "source", "silicon")
@@ -308,6 +323,8 @@ class BaseBackend:
         batch_size: int,
         isl: int,
         prefix: int,
+        *,
+        resolution_session: ResolutionSession | None = None,
     ) -> tuple[dict[str, float], dict[str, float], dict[str, str]]:
         context_latency_dict = defaultdict(float)
         context_energy_wms_dict = defaultdict(float)
@@ -321,15 +338,27 @@ class BaseBackend:
 
         for op in model.context_ops:
             x = batch_size * effective_isl if "logits_gemm" not in op._name else batch_size
-            result = op.query(
-                database,
-                x=x,
-                batch_size=batch_size,
-                beam_width=1,
-                s=effective_isl,
-                prefix=prefix,
-                seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
-            )
+            if resolution_session is None:
+                result = op.query(
+                    database,
+                    x=x,
+                    batch_size=batch_size,
+                    beam_width=1,
+                    s=effective_isl,
+                    prefix=prefix,
+                    seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
+                )
+            else:
+                result = op.query_with_resolution(
+                    database,
+                    session=resolution_session,
+                    x=x,
+                    batch_size=batch_size,
+                    beam_width=1,
+                    s=effective_isl,
+                    prefix=prefix,
+                    seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
+                )
             context_latency_dict[op._name] += float(result)
             context_energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
             new_src = getattr(result, "source", "silicon")
@@ -351,6 +380,8 @@ class BaseBackend:
         isl: int,
         osl: int,
         stride: int,
+        *,
+        resolution_session: ResolutionSession | None = None,
     ) -> tuple[dict[str, float], dict[str, float], dict[str, str]]:
         generation_latency_dict = defaultdict(float)
         generation_energy_wms_dict = defaultdict(float)
@@ -363,14 +394,25 @@ class BaseBackend:
             energy_wms_dict = defaultdict(float)
 
             for op in model.generation_ops:
-                result = op.query(
-                    database,
-                    x=batch_size * beam_width,
-                    batch_size=batch_size,
-                    beam_width=beam_width,
-                    s=isl + i + 1,
-                    gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
-                )
+                if resolution_session is None:
+                    result = op.query(
+                        database,
+                        x=batch_size * beam_width,
+                        batch_size=batch_size,
+                        beam_width=beam_width,
+                        s=isl + i + 1,
+                        gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+                    )
+                else:
+                    result = op.query_with_resolution(
+                        database,
+                        session=resolution_session,
+                        x=batch_size * beam_width,
+                        batch_size=batch_size,
+                        beam_width=beam_width,
+                        s=isl + i + 1,
+                        gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+                    )
                 latency_dict[op._name] += float(result)
                 energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
                 new_src = getattr(result, "source", "silicon")
@@ -399,6 +441,8 @@ class BaseBackend:
         stride: int = 32,
         latency_correction_scale: float = 1.0,
         img_ctx_tokens: int = 0,
+        *,
+        resolution_session: ResolutionSession | None = None,
     ) -> tuple[
         dict[str, float],
         dict[str, float],
@@ -419,7 +463,7 @@ class BaseBackend:
         context_latency_dict, context_energy_wms_dict, context_source_dict = {}, {}, {}
         generation_latency_dict, generation_energy_wms_dict, generation_source_dict = {}, {}, {}
 
-        if should_use_rust_engine_step(runtime_config):
+        if resolution_session is None and should_use_rust_engine_step(runtime_config):
             rust_runtime_config = runtime_config
             if img_ctx_tokens:
                 rust_runtime_config = copy.copy(runtime_config)
@@ -450,18 +494,46 @@ class BaseBackend:
 
         if mode == "static_ctx":
             context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
-                model, database, runtime_config, batch_size, isl_eff, prefix
+                model,
+                database,
+                runtime_config,
+                batch_size,
+                isl_eff,
+                prefix,
+                resolution_session=resolution_session,
             )
         elif mode == "static_gen":
             generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
-                model, database, runtime_config, batch_size, beam_width, isl_eff, osl, stride
+                model,
+                database,
+                runtime_config,
+                batch_size,
+                beam_width,
+                isl_eff,
+                osl,
+                stride,
+                resolution_session=resolution_session,
             )
         else:
             context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
-                model, database, runtime_config, batch_size, isl_eff, prefix
+                model,
+                database,
+                runtime_config,
+                batch_size,
+                isl_eff,
+                prefix,
+                resolution_session=resolution_session,
             )
             generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
-                model, database, runtime_config, batch_size, beam_width, isl_eff, osl, stride
+                model,
+                database,
+                runtime_config,
+                batch_size,
+                beam_width,
+                isl_eff,
+                osl,
+                stride,
+                resolution_session=resolution_session,
             )
 
         if latency_correction_scale != 1.0:
@@ -490,9 +562,45 @@ class BaseBackend:
         mode: str,
         stride: int = 32,
         latency_correction_scale: float = 1.0,
+        *,
+        resolution_session: ResolutionSession | None = None,
+    ) -> float:
+        """Run static inference and optionally resolve one callback-local miss batch."""
+        if resolution_session is None:
+            return self._run_static_latency_only_once(
+                model,
+                database,
+                runtime_config,
+                mode,
+                stride,
+                latency_correction_scale,
+                resolution_session=None,
+            )
+        return resolution_session.execute_callback(
+            lambda: self._run_static_latency_only_once(
+                model,
+                database,
+                runtime_config,
+                mode,
+                stride,
+                latency_correction_scale,
+                resolution_session=resolution_session,
+            )
+        )
+
+    def _run_static_latency_only_once(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        mode: str,
+        stride: int,
+        latency_correction_scale: float,
+        *,
+        resolution_session: ResolutionSession | None,
     ) -> float:
         """
-        Run static inference and return only the total latency in milliseconds.
+        Run one static-latency pass without owning callback lifecycle.
 
         This shares the same latency breakdown path as ``run_static`` but skips
         building an ``InferenceSummary``.
@@ -502,7 +610,11 @@ class BaseBackend:
             img_ctx_tokens = self._visual_context_tokens(model, runtime_config)
         else:
             encoder_latency_dict, encoder_energy_wms_dict, _, img_ctx_tokens = self._run_encoder_phase(
-                model, database, runtime_config, runtime_config.batch_size
+                model,
+                database,
+                runtime_config,
+                runtime_config.batch_size,
+                resolution_session=resolution_session,
             )
             if latency_correction_scale != 1.0:
                 for op in encoder_latency_dict:
@@ -525,6 +637,7 @@ class BaseBackend:
             stride,
             latency_correction_scale,
             img_ctx_tokens=img_ctx_tokens,
+            resolution_session=resolution_session,
         )
         return encoder_latency + sum(context_latency_dict.values()) + sum(generation_latency_dict.values())
 
@@ -536,9 +649,45 @@ class BaseBackend:
         mode: str,
         stride: int = 32,
         latency_correction_scale: float = 1.0,
+        *,
+        resolution_session: ResolutionSession | None = None,
+    ) -> InferenceSummary:
+        """Run static inference and optionally resolve one callback-local miss batch."""
+        if resolution_session is None:
+            return self._run_static_once(
+                model,
+                database,
+                runtime_config,
+                mode,
+                stride,
+                latency_correction_scale,
+                resolution_session=None,
+            )
+        return resolution_session.execute_callback(
+            lambda: self._run_static_once(
+                model,
+                database,
+                runtime_config,
+                mode,
+                stride,
+                latency_correction_scale,
+                resolution_session=resolution_session,
+            )
+        )
+
+    def _run_static_once(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        mode: str,
+        stride: int,
+        latency_correction_scale: float,
+        *,
+        resolution_session: ResolutionSession | None,
     ) -> InferenceSummary:
         """
-        Run the static inference.
+        Run one static-inference pass without owning callback lifecycle.
 
         Args:
             model (BaseModel): the model to run inference
@@ -551,15 +700,6 @@ class BaseBackend:
                 default is 1.0.
                 corrected latency = latency * latency_correction_scale
         """
-
-        def _run_encoder(batch_size: int) -> tuple[dict[str, float], dict[str, float], dict[str, str], int]:
-            return self._run_encoder_phase(model, database, runtime_config, batch_size)
-
-        def _run_context(bs: int, effective_isl: int, pfx: int):
-            return self._run_context_phase(model, database, runtime_config, bs, effective_isl, pfx)
-
-        def _run_generation(bs: int, bw: int, effective_isl: int, eff_osl: int, strd: int):
-            return self._run_generation_phase(model, database, runtime_config, bs, bw, effective_isl, eff_osl, strd)
 
         summary = InferenceSummary(runtime_config)
         batch_size, beam_width, isl, osl, prefix = (
@@ -575,8 +715,14 @@ class BaseBackend:
             encoder_source_dict = {}
             img_ctx_tokens = self._visual_context_tokens(model, runtime_config)
         else:
-            encoder_latency_dict, encoder_energy_wms_dict, encoder_source_dict, img_ctx_tokens = _run_encoder(
-                batch_size
+            encoder_latency_dict, encoder_energy_wms_dict, encoder_source_dict, img_ctx_tokens = (
+                self._run_encoder_phase(
+                    model,
+                    database,
+                    runtime_config,
+                    batch_size,
+                    resolution_session=resolution_session,
+                )
             )
 
         if latency_correction_scale != 1.0:
@@ -606,6 +752,7 @@ class BaseBackend:
             stride,
             latency_correction_scale,
             img_ctx_tokens=img_ctx_tokens,
+            resolution_session=resolution_session,
         )
 
         if mode == "static_ctx":

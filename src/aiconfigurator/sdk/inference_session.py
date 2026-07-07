@@ -19,6 +19,7 @@ from aiconfigurator.sdk.picking import (
     _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
     _build_disagg_summary_dict,
 )
+from aiconfigurator.sdk.resolution.session import ResolutionSession
 from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints, get_model_config_from_model_path
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,8 @@ class InferenceSession:
         mode: str,
         stride: int = 32,
         latency_correction_scale: float = 1.0,
+        *,
+        resolution_session: ResolutionSession | None = None,
     ) -> InferenceSummary:
         """
         Run static inference
@@ -71,14 +74,10 @@ class InferenceSession:
         Returns:
             InferenceSummary: the summary of the inference result
         """
-        return self._backend.run_static(
-            self._model,
-            self._database,
-            runtime_config,
-            mode,
-            stride,
-            latency_correction_scale,
-        )
+        args = (self._model, self._database, runtime_config, mode, stride, latency_correction_scale)
+        if resolution_session is None:
+            return self._backend.run_static(*args)
+        return self._backend.run_static(*args, resolution_session=resolution_session)
 
     def run_static_latency_only(
         self,
@@ -86,6 +85,8 @@ class InferenceSession:
         mode: str,
         stride: int = 32,
         latency_correction_scale: float = 1.0,
+        *,
+        resolution_session: ResolutionSession | None = None,
     ) -> float:
         """
         Run static inference and return only scalar latency in milliseconds.
@@ -99,9 +100,10 @@ class InferenceSession:
         Returns:
             float: the total latency in milliseconds
         """
-        return self._backend.run_static_latency_only(
-            self._model, self._database, runtime_config, mode, stride, latency_correction_scale
-        )
+        args = (self._model, self._database, runtime_config, mode, stride, latency_correction_scale)
+        if resolution_session is None:
+            return self._backend.run_static_latency_only(*args)
+        return self._backend.run_static_latency_only(*args, resolution_session=resolution_session)
 
     def run_agg(self, runtime_config: config.RuntimeConfig, **kwargs) -> InferenceSummary:
         """

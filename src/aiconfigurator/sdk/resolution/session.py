@@ -151,6 +151,7 @@ class ResolutionSession:
         self._charged_keys: set[PerfKey] = set()
         self._observed_miss_keys: set[PerfKey] = set()
         self._callback_lock = threading.RLock()
+        self._callback_depth = 0
         self._misses = MissSet()
         self._unresolved: list[UnresolvedReason] = []
         self._negative: dict[PerfKey, UnresolvedReason] = {}
@@ -387,7 +388,17 @@ class ResolutionSession:
 
     def execute_callback(self, query: Callable[[], T]) -> T:
         with self._callback_lock:
-            return self._execute_callback_locked(query)
+            if self._callback_depth:
+                return query()
+            self._callback_depth += 1
+            try:
+                return self._execute_callback_locked(query)
+            except BaseException:
+                self._misses.clear()
+                self._unresolved.clear()
+                raise
+            finally:
+                self._callback_depth -= 1
 
     def _execute_callback_locked(self, query: Callable[[], T]) -> T:
         self._misses.clear()
