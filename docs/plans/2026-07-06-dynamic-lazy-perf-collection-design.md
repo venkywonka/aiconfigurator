@@ -39,6 +39,7 @@ The local AIC checkout is 52 commits behind `upstream/main`. Core AIC operation/
 
 - Dynamo `lib/mocker/src/common/perf_model.rs:30` defines the direct `AicCallback` for prefill and decode.
 - `lib/mocker/src/common/perf_model.rs:220` passes Mocker's prefill/decode scalar shape descriptors to AIC.
+- Scheduler call sites such as `lib/mocker/src/scheduler/sglang/core.rs:540` and `lib/mocker/src/scheduler/vllm/core.rs:1830` currently reduce heterogeneous batches to mean lengths; this is insufficient for shape-faithful lazy collection.
 - `lib/bindings/python/rust/llm/aic_callback.rs:40` implements the default callback as a pure-Rust `RustAicCallback`; it cannot invoke Python collectors on its hot path.
 - `lib/bindings/python/src/dynamo/_internal/aic.py:112` retains a Python `AicSession` operation-walk path that can host the explicit resolving mode.
 - AIC upstream `docs/spica/overview.md` and `src/spica/evaluator.py` establish that Spica owns candidate search while Dynamo Replay/Mocker owns system scheduling and candidate scoring.
@@ -131,18 +132,22 @@ Mocker advances simulated time only after the current callback receives complete
 
 ## Concrete shape propagation
 
-The existing Python backend already passes fields such as `batch_size`, `x`, sequence length, and prefix into the operation walk. The direct Mocker callback currently carries reduced scalar descriptors:
+The existing Python backend already passes fields such as `batch_size`, `x`, sequence length, and prefix into the operation walk. The direct Mocker callback currently carries reduced scalar descriptors, and some scheduler call sites compute those scalars from batch means:
 
 - prefill: `(batch_size, effective_isl, prefix)`
 - decode: `(batch_size, isl, osl)`
 
-The lazy path must preserve these concrete callback fields through normalization and into each operation's `PerfKey` and collector case. It must not reconstruct an exact request shape from AIC's aggregate Rust FPM features. In particular, `rust/aiconfigurator-core/src/fpm/model.rs:76` documents aggregate scheduled-work features, and `:516` reduces a rank's workload to token/request sums.
+Those reduced scalars are adequate for the existing predictor but are not always an exact collection identity. The resolving bridge therefore adds a transient `ConcreteBatchDescriptor` containing the real scheduled metadata needed by collectors: per-request uncached/prefix lengths for prefill and per-request context lengths for decode (or an equivalent lossless normalized representation). It is metadata, not a tensor payload.
 
-V1 uses concrete shape, dtype/layout, and existing operation/configuration parameters. Value-sensitive operations may add a small, operation-defined semantic fingerprint (for example, an MoE load-distribution bucket). The collector deterministically synthesizes tensors from the key and fingerprint. Runtime tensor capture is out of scope.
+AIC derives its existing scalar operation fields from that descriptor (for example, batch size and exact token sums) and supplies an operation-defined normalized length-distribution descriptor/fingerprint only where values beyond the existing columns affect timing. The descriptor must survive until the deterministic input recipe is built; merely hashing a mean is insufficient.
+
+The lazy path must not reconstruct exact request shape from AIC's aggregate Rust FPM features. In particular, `rust/aiconfigurator-core/src/fpm/model.rs:76` documents aggregate scheduled-work features, and `:516` reduces a rank's workload to token/request sums.
+
+V1 uses concrete scheduled metadata, dtype/layout, and existing operation/configuration parameters. Value-sensitive operations may add a small, operation-defined semantic descriptor/fingerprint (for example, a normalized sequence-length histogram or MoE load-distribution bucket). The collector deterministically synthesizes tensors from the key and descriptor. Runtime tensor capture is out of scope.
 
 ## Mocker and Spica bridge contract
 
-Pure/default Mocker prediction keeps the current `RustAicCallback` and its GIL-free compiled-engine hot path. V1 adds a distinct explicit resolving callback mode backed by the existing Python `AicSession` operation walk. The resolving mode carries Mocker's concrete callback descriptor into Python AIC, where operation adapters and the collector registry are available. It does not silently replace the default Rust path.
+Pure/default Mocker prediction keeps the current `RustAicCallback` and its GIL-free compiled-engine hot path. V1 adds a distinct explicit resolving callback mode backed by the existing Python `AicSession` operation walk. The resolving mode accepts `ConcreteBatchDescriptor` rather than only the legacy mean scalars and carries it into Python AIC, where operation adapters and the collector registry are available. It does not silently replace the default Rust path.
 
 The aggregate native Rust FPM remains useful for forward-pass prediction and telemetry correction, but it is not treated as an exact per-operation collection request. Likewise, the current compiled Rust engine does not yet expose a complete `MissSet` or ingest the mutable overlay, so measure-on-miss must not claim that it can stay on that path in V1. Teaching the Rust engine structured miss discovery and overlay refresh is a later optimization after the Python resolving contract is proven.
 
