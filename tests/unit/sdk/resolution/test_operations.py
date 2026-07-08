@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from aiconfigurator.sdk import common
+from aiconfigurator.sdk.errors import PerfDataNotAvailableError
 from aiconfigurator.sdk.operations.base import Operation
 from aiconfigurator.sdk.operations.overlap import FallbackOp, OverlapOp
 from aiconfigurator.sdk.perf_database import _cached_configured_database_view
@@ -56,7 +57,7 @@ def _request(name: str, x: int, protocol: MeasurementProtocol) -> MeasurementReq
     semantic = {"operation": name}
     return MeasurementRequest(
         op_id=name,
-        key=PerfKey.build("test_operation/v1", query, environment, semantic),
+        key=PerfKey.build(f"test_operation/{name}/v1", query, environment),
         query=query,
         environment=environment,
         semantic_descriptor=semantic,
@@ -152,6 +153,97 @@ class _TableOp(Operation):
         return self.curated.get(x)
 
 
+class _NormalizedTableOp(_TableOp):
+    """Measured fake whose three physical lookup paths share one normalizer."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.normalization_calls: list[dict[str, object]] = []
+        self.ordinary_normalized: list[dict[str, object]] = []
+        self.provisional_normalized: list[dict[str, object]] = []
+        self.request_normalized: list[dict[str, object]] = []
+        self.curated_normalized: list[dict[str, object]] = []
+
+    def normalize_perf_query(self, **kwargs) -> dict[str, object]:
+        self.normalization_calls.append(dict(kwargs))
+        return {
+            "x": int(kwargs["tokens"]) * int(kwargs["token_multiplier"]),
+        }
+
+    def query(self, database, **kwargs) -> PerformanceResult:
+        del database
+        normalized = self.normalize_perf_query(**kwargs)
+        self.ordinary_normalized.append(normalized)
+        return self.ordinary
+
+    def provisional_result(self, database, *, normalized_query, **kwargs) -> PerformanceResult:
+        del database, kwargs
+        self.provisional_normalized.append(normalized_query)
+        return self.ordinary
+
+    def _measurement_request_from_normalized(self, database, protocol, *, normalized_query, **kwargs):
+        del database, kwargs
+        self.request_normalized.append(normalized_query)
+        return _request(self._name, int(normalized_query["x"]), protocol)
+
+    def _curated_exact_result_from_normalized(self, database, *, normalized_query, **kwargs):
+        del database, kwargs
+        self.curated_normalized.append(normalized_query)
+        return self.curated.get(int(normalized_query["x"]))
+
+
+class _InvalidNormalizerOp(_TableOp):
+    def normalize_perf_query(self, **kwargs):
+        del kwargs
+        return ["not", "a", "mapping"]
+
+
+class _MissingSiliconTableOp(_TableOp):
+    def query(self, database, **kwargs) -> PerformanceResult:
+        self.query_calls.append((database, kwargs))
+        raise PerfDataNotAvailableError(f"{self._name} has no silicon point")
+
+
+class _MissingSiliconNoAdapterOp(Operation):
+    def query(self, database, **kwargs) -> PerformanceResult:
+        del database, kwargs
+        raise PerfDataNotAvailableError("no curated data and no lazy adapter")
+
+
+class _LegacyKwargsOp(_TableOp):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.request_kwargs: list[dict[str, object]] = []
+        self.exact_kwargs: list[dict[str, object]] = []
+
+    def measurement_request(self, database, protocol, **kwargs):
+        del database
+        self.request_kwargs.append(dict(kwargs))
+        return _request(self._name, int(kwargs["x"]), protocol)
+
+    def curated_exact_result(self, database, **kwargs):
+        del database
+        self.exact_kwargs.append(dict(kwargs))
+        return None
+
+
+class _NarrowLegacyOp(_TableOp):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.request_x: list[int] = []
+        self.exact_x: list[int] = []
+
+    def measurement_request(self, database, protocol, *, x):
+        del database
+        self.request_x.append(x)
+        return _request(self._name, x, protocol)
+
+    def curated_exact_result(self, database, *, x):
+        del database
+        self.exact_x.append(x)
+        return None
+
+
 class _BareOp(Operation):
     def query(self, database, **kwargs) -> PerformanceResult:
         del database, kwargs
@@ -207,6 +299,87 @@ def test_base_no_session_delegates_to_ordinary_query_byte_for_byte() -> None:
 
     assert result is expected
     assert op.query_calls == [(database, {"x": 11, "marker": "unchanged"})]
+
+
+def test_default_perf_query_normalization_is_identity() -> None:
+    raw_query = {"x": 11, "batch_size": 2}
+
+    normalized = _BareOp("plain", 1.0).normalize_perf_query(**raw_query)
+
+    assert normalized == raw_query
+
+
+def test_base_resolution_reuses_one_normalized_mapping_for_request_and_exact_probe(session_factory) -> None:
+    database = _RootDatabase()
+    op = _NormalizedTableOp("normalized")
+    raw_query = {"tokens": 3, "token_multiplier": 4}
+
+    op.query(database, **raw_query)
+    ordinary_normalized = op.ordinary_normalized[0]
+    calls_before_resolution = len(op.normalization_calls)
+
+    result = op.query_with_resolution(
+        database,
+        session=session_factory(_Executor()),
+        **raw_query,
+    )
+
+    assert result is op.ordinary
+    assert len(op.normalization_calls) == calls_before_resolution + 1
+    resolving_normalized = op.request_normalized[0]
+    assert resolving_normalized is op.curated_normalized[0]
+    assert resolving_normalized is op.provisional_normalized[0]
+    assert resolving_normalized == ordinary_normalized == {"x": 12}
+
+
+@pytest.mark.parametrize("wrap", (False, True))
+def test_resolution_rejects_non_mapping_normalization_before_lookup(session_factory, wrap: bool) -> None:
+    invalid = _InvalidNormalizerOp("invalid")
+    op = FallbackOp("wrapper", invalid, []) if wrap else invalid
+
+    with pytest.raises(TypeError, match=r"normalize_perf_query.*Mapping"):
+        op.query_with_resolution(
+            _RootDatabase(),
+            session=session_factory(_Executor()),
+            x=8,
+        )
+
+    assert invalid.measurement_calls == []
+    assert invalid.curated_calls == []
+    assert invalid.query_calls == []
+
+
+@pytest.mark.parametrize("wrap", (False, True))
+def test_normalized_dispatch_does_not_contaminate_legacy_kwargs_hooks(session_factory, wrap: bool) -> None:
+    legacy = _LegacyKwargsOp("legacy")
+    op = FallbackOp("wrapper", legacy, []) if wrap else legacy
+    raw_query = {"x": 8, "marker": "unchanged"}
+
+    op.query_with_resolution(
+        _RootDatabase(),
+        session=session_factory(_Executor()),
+        **raw_query,
+    )
+
+    assert legacy.request_kwargs == [raw_query]
+    assert legacy.exact_kwargs == [raw_query]
+    assert all("normalized_query" not in kwargs for kwargs in legacy.request_kwargs + legacy.exact_kwargs)
+
+
+@pytest.mark.parametrize("wrap", (False, True))
+def test_normalized_dispatch_preserves_narrow_legacy_hook_signatures(session_factory, wrap: bool) -> None:
+    legacy = _NarrowLegacyOp("narrow")
+    op = FallbackOp("wrapper", legacy, []) if wrap else legacy
+
+    result = op.query_with_resolution(
+        _RootDatabase(),
+        session=session_factory(_Executor()),
+        x=8,
+    )
+
+    assert result is legacy.ordinary
+    assert legacy.request_x == [8]
+    assert legacy.exact_x == [8]
 
 
 @pytest.mark.parametrize(
@@ -278,7 +451,7 @@ def test_off_grid_shape_collects_exact_evidence_instead_of_interpolating(session
 
     assert float(result) == pytest.approx(0.25)
     assert result.energy == pytest.approx(0.5)
-    assert op.query_calls == []
+    assert len(op.query_calls) == 1
     assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["off_grid"]]
     assert all(db._default_database_mode is common.DatabaseMode.SILICON for db, _ in op.measurement_calls)
 
@@ -296,18 +469,44 @@ def test_default_hooks_report_missing_adapter_without_collection(session_factory
     assert executor.request_batches == []
 
 
-def test_direct_miss_returns_an_explicit_unresolved_sentinel(session_factory) -> None:
+def test_direct_miss_returns_nonzero_ordinary_result_as_tainted_discovery_surrogate(session_factory) -> None:
     executor = _Executor()
     session = session_factory(executor)
-    op = _TableOp("pending")
+    provisional = PerformanceResult(9.0, energy=90.0, source="empirical")
+    op = _TableOp("pending", ordinary=provisional)
+    database = _RootDatabase()
     checkpoint = session.checkpoint()
 
-    result = op.query_with_resolution(_RootDatabase(), session=session, x=17)
+    result = op.query_with_resolution(database, session=session, x=17)
 
-    assert float(result) == 0.0
-    assert result.energy == 0.0
-    assert result.source == "unresolved"
+    assert result is provisional
     assert session.changed_since(checkpoint)
+    assert op.query_calls == [(database, {"x": 17})]
+    assert executor.request_batches == []
+
+
+def test_missing_silicon_provisional_does_not_abort_collection_before_replay(session_factory) -> None:
+    executor = _Executor({"measured_only": (0.75, 7.5)})
+    session = session_factory(executor)
+    op = _MissingSiliconTableOp("measured_only")
+
+    result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=17))
+
+    assert float(result) == pytest.approx(0.75)
+    assert result.source == "overlay"
+    assert len(op.query_calls) == 1
+    assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["measured_only"]]
+
+
+def test_missing_silicon_without_adapter_fails_structured_instead_of_leaking_query_error(session_factory) -> None:
+    executor = _Executor()
+    session = session_factory(executor)
+    op = _MissingSiliconNoAdapterOp("missing", 1.0)
+
+    with pytest.raises(ResolutionFailed) as failure:
+        session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=17))
+
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.MISSING_ADAPTER]
     assert executor.request_batches == []
 
 
@@ -324,7 +523,44 @@ def test_fallback_adapter_capable_primary_blocks_fallback_discovery(session_fact
     assert result.energy == pytest.approx(3.0)
     assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["primary"]]
     assert fallback_child.measurement_calls == []
-    assert primary.query_calls == []
+    assert len(primary.query_calls) == 1
+
+
+def test_fallback_measured_primary_reuses_one_normalized_mapping_without_recursing(session_factory) -> None:
+    primary = _NormalizedTableOp("primary")
+    fallback_child = _TableOp("fallback_child")
+    op = FallbackOp("wrapper", primary, [fallback_child])
+
+    result = op.query_with_resolution(
+        _RootDatabase(),
+        session=session_factory(_Executor()),
+        tokens=3,
+        token_multiplier=4,
+    )
+
+    assert result is primary.ordinary
+    assert len(primary.normalization_calls) == 1
+    assert primary.request_normalized[0] is primary.curated_normalized[0]
+    assert primary.request_normalized[0] is primary.provisional_normalized[0]
+    assert primary.request_normalized[0] == {"x": 12}
+    assert fallback_child.measurement_calls == []
+    assert fallback_child.query_calls == []
+
+
+def test_fallback_measured_primary_missing_silicon_collects_boundary_without_entering_fallback(session_factory) -> None:
+    executor = _Executor({"primary": (0.75, 7.5), "fallback_child": (9.0, 90.0)})
+    session = session_factory(executor)
+    primary = _MissingSiliconTableOp("primary")
+    fallback_child = _TableOp("fallback_child")
+    op = FallbackOp("wrapper", primary, [fallback_child])
+
+    result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=17))
+
+    assert float(result) == pytest.approx(0.75)
+    assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["primary"]]
+    assert len(primary.query_calls) == 1
+    assert fallback_child.measurement_calls == []
+    assert fallback_child.query_calls == []
 
 
 def test_fallback_resolution_aware_composite_primary_discovers_its_children(session_factory) -> None:
@@ -343,6 +579,49 @@ def test_fallback_resolution_aware_composite_primary_discovers_its_children(sess
     assert result.source == "overlay"
     assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["left", "right"]]
     assert fallback_child.measurement_calls == []
+
+
+def test_measured_compound_emits_only_its_boundary_key_and_never_traverses_children(session_factory) -> None:
+    executor = _Executor({"module_boundary": (0.75, 7.5), "implementation_child": (9.0, 90.0)})
+    session = session_factory(executor)
+    implementation_child = _TableOp("implementation_child")
+    measured_compound = _TableOp("module_boundary", ordinary=PerformanceResult(4.0, source="empirical"))
+    measured_compound.implementation_children = (implementation_child,)
+
+    result = session.execute_callback(
+        lambda: measured_compound.query_with_resolution(_RootDatabase(), session=session, x=8)
+    )
+
+    assert float(result) == pytest.approx(0.75)
+    assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["module_boundary"]]
+    assert implementation_child.measurement_calls == []
+    assert implementation_child.query_calls == []
+
+
+@pytest.mark.parametrize(("shape", "selected_name"), ((8, "small_shape"), (32, "large_shape")))
+def test_compound_branch_selection_is_shape_stable_across_provisional_replay(
+    session_factory,
+    shape: int,
+    selected_name: str,
+) -> None:
+    executor = _Executor({selected_name: (0.5, 5.0)})
+    session = session_factory(executor)
+    children = {
+        "small_shape": _TableOp("small_shape", ordinary=PerformanceResult(100.0, source="empirical")),
+        "large_shape": _TableOp("large_shape", ordinary=PerformanceResult(0.001, source="empirical")),
+    }
+    selections: list[str] = []
+
+    def query_selected_child() -> PerformanceResult:
+        name = "small_shape" if shape <= 8 else "large_shape"
+        selections.append(name)
+        return children[name].query_with_resolution(_RootDatabase(), session=session, x=shape)
+
+    result = session.execute_callback(query_selected_child)
+
+    assert float(result) == pytest.approx(0.5)
+    assert selections == [selected_name, selected_name]
+    assert [[request.op_id for request in batch] for batch in executor.request_batches] == [[selected_name]]
 
 
 def test_fallback_does_not_treat_instrumented_leaf_override_as_composite_owner(session_factory) -> None:
@@ -482,7 +761,23 @@ def test_overlap_discovers_both_groups_in_one_callback_and_preserves_math(sessio
     assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["left", "right"]]
 
 
-def test_overlap_direct_first_walk_preserves_unresolved_descendant_source(session_factory) -> None:
+def test_overlap_replays_duplicate_child_key_at_every_consumer_position(session_factory) -> None:
+    executor = _Executor({"shared": (1.5, 2.0)})
+    session = session_factory(executor)
+    first = _TableOp("shared")
+    second = _TableOp("shared")
+    op = OverlapOp("parallel", [first, second], [])
+
+    result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=8))
+
+    assert float(result) == pytest.approx(3.0)
+    assert result.energy == pytest.approx(4.0)
+    assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["shared"]]
+    assert session.report.unique_misses == 1
+    assert session.report.consumer_misses == 2
+
+
+def test_overlap_direct_first_walk_composes_nonzero_provisional_descendant(session_factory) -> None:
     executor = _Executor()
     session = session_factory(executor)
     left = _TableOp(
@@ -495,13 +790,13 @@ def test_overlap_direct_first_walk_preserves_unresolved_descendant_source(sessio
 
     result = op.query_with_resolution(_RootDatabase(), session=session, x=8)
 
-    assert float(result) == pytest.approx(0.4)
-    assert result.energy == pytest.approx(4.0)
-    assert result.source == "unresolved"
+    assert float(result) == pytest.approx(9.0)
+    assert result.energy == pytest.approx(94.0)
+    assert result.source == "mixed"
     assert session.changed_since(checkpoint)
     assert executor.request_batches == []
     assert left.query_calls == []
-    assert right.query_calls == []
+    assert len(right.query_calls) == 1
 
 
 def test_hybrid_resolution_uses_shared_silicon_view_without_mutating_root(session_factory) -> None:

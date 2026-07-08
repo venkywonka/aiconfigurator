@@ -19,9 +19,10 @@ from aiconfigurator.sdk.resolution import (
     MeasurementRecord,
     MeasurementRequest,
     PerfKey,
+    UnresolvedCode,
 )
 from aiconfigurator.sdk.resolution.overlay import OverlayStore
-from aiconfigurator.sdk.resolution.session import ResolutionBudget, ResolutionSession
+from aiconfigurator.sdk.resolution.session import ResolutionBudget, ResolutionFailed, ResolutionSession
 
 pytestmark = pytest.mark.unit
 
@@ -102,20 +103,45 @@ class _ResolvingStaticOp(Operation):
         del kwargs
         return 0.0
 
-    def measurement_request(self, database, protocol, **kwargs) -> MeasurementRequest:
-        del database
-        query = dict(kwargs)
+    def _measurement_request_from_normalized(
+        self,
+        database,
+        protocol,
+        *,
+        normalized_query,
+        **kwargs,
+    ) -> MeasurementRequest:
+        del database, kwargs
+        query = dict(normalized_query)
         self.measurement_calls.append(query)
         environment = _resolution_environment()
         semantic = {"operation": "shared_context_point"}
         return MeasurementRequest(
             op_id=self._name,
-            key=PerfKey.build("test_backend_static/v1", query, environment, semantic),
+            key=PerfKey.build("test_backend_static/v1", query, environment),
             query=query,
             environment=environment,
             semantic_descriptor=semantic,
             protocol=protocol,
         )
+
+
+class _AlwaysProvisionalStaticOp(_ResolvingStaticOp):
+    """Broken measured lookup used to prove callback-local taint survives float flattening."""
+
+    def query_with_resolution(self, database, *, session=None, **kwargs) -> PerformanceResult:
+        assert session is not None
+        normalized_query = self.normalize_perf_query(**kwargs)
+        request = self._measurement_request_from_normalized(
+            database,
+            session.protocol,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
+        if not self.query_calls:
+            session.record_miss(request, self._name)
+        session.mark_tainted(self._name)
+        return self.query(database, **kwargs)
 
 
 class _ResolutionExecutor:
@@ -349,7 +375,7 @@ def test_run_static_resolution_batches_one_key_and_replays_both_consumers(
     assert session.report.unique_misses == 1
     assert session.report.consumer_misses == 2
     assert [len(op.measurement_calls) for op in ops] == [2, 2]
-    assert [len(op.query_calls) for op in ops] == [0, 0]
+    assert [len(op.query_calls) for op in ops] == [1, 1]
 
     warm = backend.run_static(
         model,
@@ -369,7 +395,7 @@ def test_run_static_resolution_batches_one_key_and_replays_both_consumers(
     ordinary = backend.run_static(model, database, runtime_config, mode="static_ctx")
 
     assert ordinary.get_context_latency_dict() == {"consumer_a": 9.0, "consumer_b": 9.0}
-    assert [len(op.query_calls) for op in ops] == [1, 1]
+    assert [len(op.query_calls) for op in ops] == [2, 2]
     assert [len(op.measurement_calls) for op in ops] == [3, 3]
     assert [len(batch) for batch in executor.request_batches] == [1]
 
@@ -396,7 +422,35 @@ def test_run_static_latency_only_owns_one_resolution_callback(
     assert latency == pytest.approx(0.8)
     assert [len(batch) for batch in executor.request_batches] == [1]
     assert [len(op.measurement_calls) for op in ops] == [2, 2]
-    assert [len(op.query_calls) for op in ops] == [0, 0]
+    assert [len(op.query_calls) for op in ops] == [1, 1]
+
+
+def test_run_static_latency_only_rejects_replay_taint_after_float_flattening(
+    backend: BaseBackend,
+    model,
+    runtime_config: RuntimeConfig,
+    resolution_session_factory,
+) -> None:
+    op = _AlwaysProvisionalStaticOp("always_provisional")
+    model.context_ops = [op]
+    model.generation_ops = []
+    database = _ResolutionDatabase()
+    executor = _ResolutionExecutor()
+    session = resolution_session_factory(executor)
+
+    with pytest.raises(ResolutionFailed) as failure:
+        backend.run_static_latency_only(
+            model,
+            database,
+            runtime_config,
+            mode="static_ctx",
+            resolution_session=session,
+        )
+
+    assert len(op.query_calls) == 2
+    assert [len(batch) for batch in executor.request_batches] == [1]
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.REQUERY_STILL_MISSING]
+    assert [reason.operation for reason in failure.value.reasons] == ["always_provisional"]
 
 
 def test_run_static_latency_only_batches_encoder_context_and_generation_together(

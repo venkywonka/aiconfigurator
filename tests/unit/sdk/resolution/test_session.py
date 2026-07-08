@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from aiconfigurator.sdk.performance_result import PerformanceResult
 from aiconfigurator.sdk.resolution.overlay import OverlayStore
 from aiconfigurator.sdk.resolution.session import (
     MissSet,
@@ -60,7 +61,7 @@ def _request(*, op_id: str = "gemm", m: int = 8, protocol: MeasurementProtocol |
     semantic = {"dtype": "bf16"}
     return MeasurementRequest(
         op_id=op_id,
-        key=PerfKey.build("gemm/v1", query, environment, semantic),
+        key=PerfKey.build("gemm/v1", query, environment),
         query=query,
         environment=environment,
         semantic_descriptor=semantic,
@@ -209,6 +210,36 @@ def test_miss_set_deduplicates_same_perf_identity_across_request_op_ids() -> Non
     assert misses.entries()[0].consumers == ["layer.0.qkv", "layer.1.qkv"]
 
 
+def test_miss_set_deduplicates_same_physical_key_across_semantic_consumers() -> None:
+    environment = _environment()
+    query = {"world_size": 4, "elements": 32768, "dtype": "half"}
+    first_semantic = {"operation": "pre_dispatch_allreduce"}
+    second_semantic = {"operation": "post_dispatch_allreduce"}
+    first = MeasurementRequest(
+        op_id="pre_dispatch_allreduce",
+        key=PerfKey.build("custom_allreduce_perf.txt/v1", query, environment),
+        query=query,
+        environment=environment,
+        semantic_descriptor=first_semantic,
+        protocol=_protocol(),
+    )
+    second = MeasurementRequest(
+        op_id="post_dispatch_allreduce",
+        key=PerfKey.build("custom_allreduce_perf.txt/v1", query, environment),
+        query=query,
+        environment=environment,
+        semantic_descriptor=second_semantic,
+        protocol=_protocol(),
+    )
+    misses = MissSet()
+
+    misses.record(first, "pre_dispatch_allreduce")
+    misses.record(second, "post_dispatch_allreduce")
+
+    assert misses.requests() == (first,)
+    assert misses.entries()[0].consumers == ["pre_dispatch_allreduce", "post_dispatch_allreduce"]
+
+
 def test_miss_set_rejects_same_key_with_conflicting_protocol() -> None:
     first = _request(protocol=_protocol())
     conflicting = _request(protocol=_protocol(warmups=4))
@@ -256,6 +287,67 @@ def test_execute_callback_collects_then_requeries_exactly_once(tmp_path) -> None
         "unresolved": [],
     }
     assert json.loads(json.dumps(payload, allow_nan=False)) == payload
+
+
+def test_unresolved_replay_result_without_new_miss_fails_after_one_replay(tmp_path) -> None:
+    request = _request()
+    executor = _Executor(lambda requests: [_valid_record(requests[0], 1.25)])
+    session = _session(tmp_path, executor)
+    calls = 0
+
+    def query() -> PerformanceResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            session.record_miss(request, request.op_id)
+        return PerformanceResult(0.0, energy=0.0, source="unresolved")
+
+    with pytest.raises(ResolutionFailed) as failure:
+        session.execute_callback(query)
+
+    assert calls == 2
+    assert executor.request_batches == [(request,)]
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.REQUERY_STILL_MISSING]
+    assert [reason.operation for reason in failure.value.reasons] == [request.op_id]
+
+
+def test_explicit_replay_taint_cannot_escape_through_plain_float_callback(tmp_path) -> None:
+    request = _request()
+    executor = _Executor(lambda requests: [_valid_record(requests[0], 1.25)])
+    session = _session(tmp_path, executor)
+    calls = 0
+
+    def query() -> float:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            session.record_miss(request, request.op_id)
+        session.mark_tainted(request.op_id)
+        return 19.0
+
+    with pytest.raises(ResolutionFailed) as failure:
+        session.execute_callback(query)
+
+    assert calls == 2
+    assert executor.request_batches == [(request,)]
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.REQUERY_STILL_MISSING]
+    assert [reason.operation for reason in failure.value.reasons] == [request.op_id]
+
+
+def test_first_walk_taint_without_a_recorded_miss_fails_closed(tmp_path) -> None:
+    executor = _Executor(lambda requests: [])
+    session = _session(tmp_path, executor)
+
+    def query() -> float:
+        session.mark_tainted("provisional_only")
+        return 19.0
+
+    with pytest.raises(ResolutionFailed) as failure:
+        session.execute_callback(query)
+
+    assert executor.request_batches == []
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.REQUERY_STILL_MISSING]
+    assert [reason.operation for reason in failure.value.reasons] == ["provisional_only"]
 
 
 def test_nested_execute_callback_joins_outer_collection_cycle(tmp_path) -> None:

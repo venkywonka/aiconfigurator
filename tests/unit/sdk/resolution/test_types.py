@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import json
 import math
 import pickle
 from collections.abc import Iterator, Mapping
+from dataclasses import fields
+from inspect import signature
 
 import pytest
 
+import aiconfigurator.sdk.resolution as resolution_api
+import aiconfigurator.sdk.resolution.types as resolution_types
 from aiconfigurator.sdk.resolution.types import (
     MeasurementEnvironment,
     MeasurementProtocol,
@@ -107,6 +112,25 @@ def _key(query: dict[str, object] | None = None) -> PerfKey:
     )
 
 
+def test_perf_key_namespace_is_the_only_persisted_dataset_identity() -> None:
+    key = _key()
+
+    assert set(json.loads(key.canonical)) == {
+        "namespace",
+        "query",
+        "environment",
+    }
+    persisted_fields = {
+        field.name
+        for evidence_type in (PerfKey, MeasurementRequest, MeasurementRecord)
+        for field in fields(evidence_type)
+    }
+    assert persisted_fields.isdisjoint({"dataset_id", "collector_ref"})
+    for module in (resolution_api, resolution_types):
+        assert not hasattr(module, "EvidenceQuery")
+        assert not hasattr(module, "PerfNamespace")
+
+
 def test_perf_key_is_order_independent() -> None:
     left = PerfKey.build(
         namespace="trtllm/gemm/v1",
@@ -126,15 +150,13 @@ def test_perf_key_is_order_independent() -> None:
 def test_perf_key_copies_nested_identity_inputs() -> None:
     query = {"shape": [8, 4096], "options": {"layout": "row_major"}}
     environment = {"system": "h100_sxm", "versions": {"cuda": "12.8"}}
-    semantic = {"lengths": [128, 256]}
-    key = PerfKey.build("trtllm/gemm/v1", query, environment, semantic)
+    key = PerfKey.build("trtllm/gemm/v1", query, environment)
     canonical = key.canonical
     digest = key.digest
 
     query["shape"][0] = 16
     query["options"]["layout"] = "column_major"
     environment["versions"]["cuda"] = "13.0"
-    semantic["lengths"].append(512)
 
     assert key.canonical == canonical
     assert key.digest == digest
@@ -142,7 +164,7 @@ def test_perf_key_copies_nested_identity_inputs() -> None:
 
 def test_direct_perf_key_construction_normalizes_json_encoding() -> None:
     built = PerfKey.build("n", {"a": 1, "b": 2}, {})
-    direct = PerfKey("n", '{"b": 2, "a": 1}', "{ }", "{ }")
+    direct = PerfKey("n", '{"b": 2, "a": 1}', "{ }")
 
     assert direct == built
     assert direct.digest == built.digest
@@ -154,7 +176,6 @@ def test_direct_perf_key_construction_normalizes_json_encoding() -> None:
         ({"namespace": "trtllm/gemm/v2"}, "namespace"),
         ({"query": {"m": 16}}, "query"),
         ({"environment": {**_environment_dict(), "system": "h200_sxm"}}, "environment"),
-        ({"semantic": {"length_bucket": 2}}, "semantic"),
     ],
 )
 def test_each_perf_key_identity_component_changes_digest(overrides: dict[str, object], field: str) -> None:
@@ -162,14 +183,18 @@ def test_each_perf_key_identity_component_changes_digest(overrides: dict[str, ob
         "namespace": "trtllm/gemm/v1",
         "query": {"m": 8},
         "environment": _environment_dict(),
-        "semantic": {"length_bucket": 1},
     }
     values.update(overrides)
 
     changed = PerfKey.build(**values)
-    baseline = PerfKey.build("trtllm/gemm/v1", {"m": 8}, _environment_dict(), {"length_bucket": 1})
+    baseline = PerfKey.build("trtllm/gemm/v1", {"m": 8}, _environment_dict())
 
     assert changed.digest != baseline.digest, field
+
+
+def test_perf_key_api_has_no_semantic_identity_component() -> None:
+    assert "semantic" not in signature(PerfKey.build).parameters
+    assert "semantic_json" not in {field.name for field in fields(PerfKey)}
 
 
 @pytest.mark.parametrize(
@@ -229,11 +254,11 @@ def test_environment_copies_runtime_versions() -> None:
         environment.runtime_versions["cuda"] = "13.0"
 
 
-def test_request_accepts_matching_environment_query_and_semantic_identity() -> None:
+def test_request_accepts_semantic_metadata_outside_physical_identity() -> None:
     query = {"m": 8}
     semantic = {"length_bucket": [128, 256]}
     environment = _environment()
-    key = PerfKey.build("trtllm/gemm/v1", query, environment, semantic)
+    key = PerfKey.build("trtllm/gemm/v1", query, environment)
 
     request = MeasurementRequest(
         op_id="gemm",
@@ -289,13 +314,6 @@ def test_typed_environment_identity_detects_mismatch() -> None:
             {},
             "environment",
         ),
-        (
-            PerfKey.build("trtllm/gemm/v1", {"m": 8}, _environment_dict(), {"bucket": 1}),
-            {"m": 8},
-            _environment(),
-            {"bucket": 2},
-            "semantic",
-        ),
     ],
 )
 def test_request_rejects_identity_mismatch(
@@ -321,7 +339,7 @@ def test_request_copies_nested_query_and_semantic_descriptor() -> None:
     semantic = {"lengths": [128, 256]}
     request = MeasurementRequest(
         op_id="gemm",
-        key=PerfKey.build("trtllm/gemm/v1", query, _environment_dict(), semantic),
+        key=PerfKey.build("trtllm/gemm/v1", query, _environment_dict()),
         query=query,
         environment=_environment(),
         semantic_descriptor=semantic,
@@ -356,7 +374,7 @@ def test_request_is_pickle_safe_for_spawn_workers() -> None:
     semantic = {"lengths": [128, 256]}
     request = MeasurementRequest(
         op_id="gemm",
-        key=PerfKey.build("trtllm/gemm/v1", query, _environment_dict(), semantic),
+        key=PerfKey.build("trtllm/gemm/v1", query, _environment_dict()),
         query=query,
         environment=_environment(),
         semantic_descriptor=semantic,

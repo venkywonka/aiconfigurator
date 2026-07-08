@@ -31,6 +31,7 @@ import csv
 import logging
 import os
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, ClassVar
 
 from aiconfigurator.sdk.performance_result import PerformanceResult
@@ -159,6 +160,24 @@ class Operation:
         """Return latency (scaled by ``scale_factor``) plus energy/source data."""
         raise NotImplementedError
 
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
+        """Return the canonical physical query consumed by exact lookup paths.
+
+        Operations with aliases, sharding, or shape transforms override this
+        method and call it from their ordinary ``query`` implementation. The
+        identity default preserves existing operations during migration.
+        """
+        return dict(kwargs)
+
+    def _normalize_for_resolution(self, **kwargs: object) -> Mapping[str, object]:
+        normalized_query = self.normalize_perf_query(**kwargs)
+        if not isinstance(normalized_query, Mapping):
+            raise TypeError(
+                f"{type(self).__name__}.normalize_perf_query() must return a Mapping, "
+                f"got {type(normalized_query).__name__}"
+            )
+        return normalized_query
+
     def measurement_request(
         self,
         database: PerfDatabase,
@@ -168,9 +187,55 @@ class Operation:
         """Build one exact lazy-measurement request, or report no adapter."""
         return None
 
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        """Dispatch a normalized lookup without changing legacy hook kwargs."""
+        del normalized_query
+        return self.measurement_request(database, protocol, **kwargs)
+
     def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
         """Return one final, already-scaled literal curated row, or ``None``; never interpolate."""
         return None
+
+    def _curated_exact_result_from_normalized(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult | None:
+        """Dispatch an exact probe without changing legacy hook kwargs."""
+        del normalized_query
+        return self.curated_exact_result(database, **kwargs)
+
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        """Return the ordinary approximate value used only for dependency discovery.
+
+        Covered operations may override this seam to consume the already-normalized
+        mapping without repeating normalization. The compatibility default preserves
+        the existing ordinary query path while operations migrate. A measured-only
+        operation may have no approximate row; that expected miss becomes a zero
+        discovery placeholder and remains protected by the session taint.
+        """
+        del normalized_query
+        from aiconfigurator.sdk.perf_database import _MISSING_SILICON_DATA_EXCEPTIONS
+
+        try:
+            return self.query(database, **kwargs)
+        except _MISSING_SILICON_DATA_EXCEPTIONS:
+            return PerformanceResult(0.0, energy=0.0, source="unresolved")
 
     def performance_from_record(self, record: MeasurementRecord, **kwargs) -> PerformanceResult:
         """Convert validated overlay evidence using this operation's scaling."""
@@ -195,13 +260,23 @@ class Operation:
             common.DatabaseMode.SILICON,
             getattr(database, "transfer_policy", None),
         )
-        request = self.measurement_request(exact_database, session.protocol, **kwargs)
+        normalized_query = self._normalize_for_resolution(**kwargs)
+        request = self._measurement_request_from_normalized(
+            exact_database,
+            session.protocol,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
         if request is not None:
             record = session.lookup(request.key)
             if record is not None:
                 return self.performance_from_record(record, **kwargs)
 
-        curated = self.curated_exact_result(exact_database, **kwargs)
+        curated = self._curated_exact_result_from_normalized(
+            exact_database,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
         if curated is not None:
             return curated
 
@@ -212,7 +287,12 @@ class Operation:
             )
         else:
             session.record_miss(request, self._name)
-        return PerformanceResult(0.0, energy=0.0, source="unresolved")
+        session.mark_tainted(self._name)
+        return self.provisional_result(
+            database,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
 
     def get_weights(self, **kwargs):
         raise NotImplementedError

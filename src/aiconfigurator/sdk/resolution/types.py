@@ -98,12 +98,11 @@ class PerfKey:
     namespace: str
     query_json: str
     environment_json: str
-    semantic_json: str = "{}"
 
     def __post_init__(self) -> None:
         if not self.namespace:
             raise ValueError("namespace must not be empty")
-        for field_name in ("query_json", "environment_json", "semantic_json"):
+        for field_name in ("query_json", "environment_json"):
             raw_json = getattr(self, field_name)
             try:
                 value = json.loads(raw_json)
@@ -119,7 +118,6 @@ class PerfKey:
         namespace: str,
         query: Mapping[str, Any],
         environment: Mapping[str, Any] | MeasurementEnvironment,
-        semantic: Mapping[str, Any] | None = None,
     ) -> PerfKey:
         environment_json = (
             environment.canonical if isinstance(environment, MeasurementEnvironment) else canonical_json(environment)
@@ -128,7 +126,6 @@ class PerfKey:
             namespace,
             canonical_json(query),
             environment_json,
-            canonical_json(semantic or {}),
         )
 
     @property
@@ -138,7 +135,6 @@ class PerfKey:
                 "namespace": self.namespace,
                 "query": json.loads(self.query_json),
                 "environment": json.loads(self.environment_json),
-                "semantic": json.loads(self.semantic_json),
             }
         )
 
@@ -231,7 +227,7 @@ class MeasurementRequest:
 
     def __post_init__(self) -> None:
         query, query_json = _snapshot_json_mapping(self.query, field_name="query")
-        semantic_descriptor, semantic_json = _snapshot_json_mapping(
+        semantic_descriptor, _ = _snapshot_json_mapping(
             self.semantic_descriptor,
             field_name="semantic_descriptor",
         )
@@ -239,8 +235,6 @@ class MeasurementRequest:
             raise ValueError("request query does not match PerfKey query")
         if self.key.environment_json != self.environment.canonical:
             raise ValueError("request environment does not match PerfKey environment")
-        if self.key.semantic_json != semantic_json:
-            raise ValueError("request semantic descriptor does not match PerfKey semantic identity")
         object.__setattr__(self, "query", query)
         object.__setattr__(self, "semantic_descriptor", semantic_descriptor)
 

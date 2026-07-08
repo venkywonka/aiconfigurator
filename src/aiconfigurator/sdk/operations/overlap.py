@@ -131,9 +131,11 @@ class FallbackOp(Operation):
             common.DatabaseMode.SILICON,
             getattr(database, "transfer_policy", None),
         )
-        primary_request = self._primary.measurement_request(
+        normalized_query = self._primary._normalize_for_resolution(**kwargs)
+        primary_request = self._primary._measurement_request_from_normalized(
             primary_database,
             session.protocol,
+            normalized_query=normalized_query,
             **kwargs,
         )
         if primary_request is not None:
@@ -141,13 +143,22 @@ class FallbackOp(Operation):
             if record is not None:
                 return self._primary.performance_from_record(record, **kwargs)
 
-        primary_curated = self._primary.curated_exact_result(primary_database, **kwargs)
+        primary_curated = self._primary._curated_exact_result_from_normalized(
+            primary_database,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
         if primary_curated is not None:
             return primary_curated
 
         if primary_request is not None:
             session.record_miss(primary_request, self._primary._name)
-            return PerformanceResult(0.0, energy=0.0, source="unresolved")
+            session.mark_tainted(self._primary._name)
+            return self._primary.provisional_result(
+                database,
+                normalized_query=normalized_query,
+                **kwargs,
+            )
 
         logger.debug(
             "FallbackOp '%s': primary op '%s' has no literal row or lazy adapter, using fallback ops",

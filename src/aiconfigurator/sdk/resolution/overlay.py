@@ -224,7 +224,6 @@ class OverlayStore:
                 namespace=key_value["namespace"],
                 query=key_value["query"],
                 environment=key_value["environment"],
-                semantic=key_value["semantic"],
             ),
             status=RecordStatus(row["status"]),
             latency_ms=row["latency_ms"],

@@ -70,7 +70,6 @@ class MissSet:
             left.key == right.key
             and left.query == right.query
             and left.environment == right.environment
-            and left.semantic_descriptor == right.semantic_descriptor
             and left.protocol == right.protocol
         )
 
@@ -173,6 +172,7 @@ class ResolutionSession:
         self._callback_depth = 0
         self._misses = MissSet()
         self._unresolved: list[UnresolvedReason] = []
+        self._tainted_operations: list[str] = []
         self._negative: dict[PerfKey, UnresolvedReason] = {}
         self._transient_attempts: dict[PerfKey, int] = {}
 
@@ -213,6 +213,13 @@ class ResolutionSession:
 
     def record_unresolved(self, reason: UnresolvedReason) -> None:
         self._unresolved.append(reason)
+
+    def mark_tainted(self, operation: str) -> None:
+        """Mark the active operation walk as containing provisional evidence."""
+        if not isinstance(operation, str) or not operation.strip():
+            raise ValueError("tainted operation must be a non-empty string")
+        if operation not in self._tainted_operations:
+            self._tainted_operations.append(operation)
 
     def checkpoint(self) -> tuple[int, int]:
         return len(self._misses), len(self._unresolved)
@@ -415,6 +422,7 @@ class ResolutionSession:
             except BaseException:
                 self._misses.clear()
                 self._unresolved.clear()
+                self._tainted_operations.clear()
                 raise
             finally:
                 self._callback_depth -= 1
@@ -422,13 +430,41 @@ class ResolutionSession:
     def _execute_callback_locked(self, query: Callable[[], T]) -> T:
         self._misses.clear()
         self._unresolved.clear()
+        self._tainted_operations.clear()
         first = query()
         if not self._misses and not self._unresolved:
+            if self._tainted_operations:
+                self._fail(
+                    [
+                        UnresolvedReason(
+                            UnresolvedCode.REQUERY_STILL_MISSING,
+                            operation,
+                            "provisional evidence was produced without a recorded miss",
+                        )
+                        for operation in self._tainted_operations
+                    ]
+                )
             return first
+        first_pass_entries = self._misses.entries()
         self.resolve_pending()
         self._misses.clear()
         self._unresolved.clear()
+        self._tainted_operations.clear()
         result = query()
+        replay_tainted_operations = tuple(self._tainted_operations)
+        replay_tainted = bool(replay_tainted_operations) or getattr(result, "source", None) == "unresolved"
+        if replay_tainted and not self._misses and not self._unresolved:
+            operations = replay_tainted_operations or tuple(entry.request.op_id for entry in first_pass_entries)
+            self._fail(
+                [
+                    UnresolvedReason(
+                        UnresolvedCode.REQUERY_STILL_MISSING,
+                        operation,
+                        "provisional evidence remained after collection",
+                    )
+                    for operation in operations
+                ]
+            )
         if self._misses or self._unresolved:
             reasons = list(self._unresolved)
             reasons.extend(
