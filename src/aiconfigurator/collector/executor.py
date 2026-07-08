@@ -20,6 +20,7 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -853,7 +854,7 @@ class PersistentMeasurementExecutor:
         self._clock = clock
         self._device_by_id = {device.index: device for device in inventory.devices}
         self._leases: dict[_LeaseKey, WorkerChannel] = {}
-        self._closed_channel_ids: set[int] = set()
+        self._closed_channel_refs: list[Callable[[], WorkerChannel | None]] = []
         self._lock = threading.RLock()
         self._closed = False
 
@@ -1246,10 +1247,17 @@ class PersistentMeasurementExecutor:
         self._close_channel(channel)
 
     def _close_channel(self, channel: WorkerChannel) -> None:
-        channel_id = id(channel)
-        if channel_id in self._closed_channel_ids:
+        live_refs = [reference for reference in self._closed_channel_refs if reference() is not None]
+        self._closed_channel_refs = live_refs
+        if any(reference() is channel for reference in live_refs):
             return
-        self._closed_channel_ids.add(channel_id)
+        try:
+            reference = weakref.ref(channel)
+        except TypeError:
+            # WorkerChannel is a structural protocol, so retain a strong
+            # identity reference for unusual non-weakrefable implementations.
+            reference = lambda channel=channel: channel
+        self._closed_channel_refs.append(reference)
         try:
             channel.close()
         except Exception:

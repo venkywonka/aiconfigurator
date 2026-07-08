@@ -261,7 +261,27 @@ def _dsv4_resolve_head_key(quant_data, num_heads):
     return None
 
 
-def _dsv4_resolve_module_slice(quant_data, num_heads, tp_size, compress_ratio):
+def _dsv4_is_module_slice(value: object, *, phase: str) -> bool:
+    """Recognize the fixed numeric-axis depth of one context/decode slice."""
+
+    if phase not in {"context", "generation"}:
+        raise ValueError(f"unsupported DSv4 attention phase {phase!r}")
+    axis_count = 3 if phase == "context" else 2
+    level = (value,)
+    for _ in range(axis_count):
+        next_level = []
+        for mapping in level:
+            if not isinstance(mapping, Mapping) or not mapping:
+                return False
+            children = tuple(mapping.values())
+            if any(not isinstance(child, Mapping) for child in children):
+                return False
+            next_level.extend(children)
+        level = tuple(next_level)
+    return bool(level) and all(isinstance(leaf, Mapping) and "latency" in leaf for leaf in level)
+
+
+def _dsv4_resolve_module_slice(quant_data, num_heads, tp_size, compress_ratio, *, phase: str):
     """Return one DSv4 module slice from either persisted-table shape.
 
     Current module collectors persist the padded head count and retain TP as a
@@ -280,11 +300,14 @@ def _dsv4_resolve_module_slice(quant_data, num_heads, tp_size, compress_ratio):
     # Only an exact padded-head key proves the TP-preserving schema.  When
     # head resolution falls back to a rank-local legacy key, a numeric prefix
     # or batch may equal ``tp_size`` and must not be mistaken for a TP axis.
-    tp_data = head_data.get(tp_size) if head_axis == padded_heads else None
-    module_slice = tp_data.get(compress_ratio) if isinstance(tp_data, Mapping) else None
-    if module_slice is None:
-        module_slice = head_data.get(compress_ratio)
-    return head_axis, module_slice
+    if head_axis == padded_heads:
+        tp_data = head_data.get(tp_size)
+        module_slice = tp_data.get(compress_ratio) if isinstance(tp_data, Mapping) else None
+        if _dsv4_is_module_slice(module_slice, phase=phase):
+            return head_axis, module_slice
+        legacy_slice = head_data.get(compress_ratio)
+        return head_axis, legacy_slice if _dsv4_is_module_slice(legacy_slice, phase=phase) else None
+    return head_axis, head_data.get(compress_ratio)
 
 
 def _dsv4_lookup_prefix_resolved(database, cr_dict, prefix, s, b):
@@ -944,6 +967,11 @@ class _BaseDeepSeekV4AttentionModule(Operation):
         "moe_ep_size": 4,
         "nextn": 0,
     }
+    _V1_2_RUNTIME_VERSIONS: ClassVar[dict[str, str]] = {
+        "cuda": "13.0",
+        "model_profile": "dsv4-v1.2",
+        "sglang": "0.5.10",
+    }
     _ATTENTION_PHASE: ClassVar[str]
 
     def __init__(
@@ -1043,7 +1071,10 @@ class _BaseDeepSeekV4AttentionModule(Operation):
             or environment.backend != "sglang"
             or environment.backend_version != "0.5.10"
             or " ".join(environment.gpu_class.split()).casefold() != "nvidia gb200"
-            or environment.runtime_versions.get("model_profile") != "dsv4-v1.2"
+            or any(
+                environment.runtime_versions.get(name) != version
+                for name, version in self._V1_2_RUNTIME_VERSIONS.items()
+            )
             or dict(environment.profile_compatibility or {}) != self._V1_2_PROFILE_COMPATIBILITY
         ):
             raise ValueError("DSv4 attention request is outside the frozen V1.2 deployment profile")
@@ -1498,6 +1529,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                     num_heads,
                     tp_size,
                     compress_ratio,
+                    phase="context",
                 )
                 if head_axis is None or module_slice is None:
                     raise PerfDataNotAvailableError("No context DeepSeek-V4 attention head slice is available.")
@@ -1581,6 +1613,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 num_heads,
                 tp_size,
                 compress_ratio,
+                phase="context",
             )
             if head_axis is None:
                 raise PerfDataNotAvailableError(
@@ -1974,6 +2007,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                     num_heads,
                     tp_size,
                     compress_ratio,
+                    phase="generation",
                 )
                 if head_axis is None or module_slice is None:
                     raise PerfDataNotAvailableError("No generation DeepSeek-V4 attention head slice is available.")
@@ -2022,6 +2056,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 num_heads,
                 tp_size,
                 compress_ratio,
+                phase="generation",
             )
             if head_axis is None:
                 raise PerfDataNotAvailableError(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import gc
 import json
 import math
@@ -176,6 +177,33 @@ def _free_tcp_port() -> int:
         return int(port_socket.getsockname()[1])
 
 
+def _is_address_in_use(error: OSError | RuntimeError) -> bool:
+    if isinstance(error, OSError) and error.errno == errno.EADDRINUSE:
+        return True
+    message = str(error).casefold()
+    return "address already in use" in message or "eaddrinuse" in message
+
+
+def _construct_model_runner(
+    model_runner_factory: Callable[..., Any],
+    model_runner_kwargs: dict[str, Any],
+    *,
+    port_factory: Callable[[], int] = _free_tcp_port,
+    max_attempts: int = 3,
+):
+    """Construct a runner, retrying the unavoidable free-port bind race."""
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    for attempt in range(max_attempts):
+        try:
+            return model_runner_factory(nccl_port=port_factory(), **model_runner_kwargs)
+        except (OSError, RuntimeError) as error:
+            if not _is_address_in_use(error) or attempt + 1 == max_attempts:
+                raise
+    raise AssertionError("unreachable")
+
+
 def _proper_initialize_model_runner(model_runner, *, torch_module) -> None:
     if os.environ.get("AIC_DSV4_PROPER_INIT") != "1":
         raise RuntimeError("representative DSv4 proper initialization was not enabled")
@@ -248,18 +276,20 @@ def _load_model_runner(
     _set_envs_and_config(server_args)
     model_config = ModelConfig.from_server_args(server_args)
     with _tp_load_model_patch(tp_size):
-        model_runner = ModelRunner(
-            model_config=model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=gpu_id,
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
-            moe_ep_rank=0,
-            moe_ep_size=1,
-            nccl_port=_free_tcp_port(),
-            server_args=server_args,
+        model_runner = _construct_model_runner(
+            ModelRunner,
+            {
+                "model_config": model_config,
+                "mem_fraction_static": server_args.mem_fraction_static,
+                "gpu_id": gpu_id,
+                "tp_rank": 0,
+                "tp_size": 1,
+                "pp_rank": 0,
+                "pp_size": 1,
+                "moe_ep_rank": 0,
+                "moe_ep_size": 1,
+                "server_args": server_args,
+            },
         )
     _proper_initialize_model_runner(model_runner, torch_module=torch_module)
     return model_runner

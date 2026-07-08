@@ -117,6 +117,8 @@ def _validate_capability(request: MeasurementRequest, route: _Route) -> None:
         raise ValueError("DSv4 attention profile compatibility does not match the frozen V1.2 deployment")
     if dict(request.semantic_descriptor) != _SEMANTIC_DESCRIPTOR:
         raise ValueError("DSv4 attention semantic descriptor does not describe the frozen full module")
+    if request.protocol.samples < 3:
+        raise ValueError("DSv4 attention protocol samples must be at least three")
 
     query = request.query
     expected_fields = _CONTEXT_QUERY_FIELDS if route.mode == "context" else _GENERATION_QUERY_FIELDS
@@ -134,6 +136,8 @@ def _validate_capability(request: MeasurementRequest, route: _Route) -> None:
             raise ValueError("DSv4 context attention requires bfloat16 MLA/FMHA inputs")
     if query["kv_cache_dtype"] != "fp8" or query["gemm_type"] != "fp8_block":
         raise ValueError("DSv4 attention requires FP8 KV cache and fp8_block GEMM")
+    if route.mode == "generation" and query["sequence_length"] < 2:
+        raise ValueError("DSv4 generation attention sequence_length must be at least two")
 
 
 def dsv4_attn_request_to_case(request: MeasurementRequest) -> dict[str, Any]:

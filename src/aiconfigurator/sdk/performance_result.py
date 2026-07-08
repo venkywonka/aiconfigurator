@@ -208,17 +208,11 @@ class PerformanceResult(float):
 
     def __eq__(self, other):
         """Equality comparison based on latency."""
-        try:
-            return float(self) == float(other)
-        except (TypeError, ValueError):
-            return False
+        return float.__eq__(self, other)
 
     def __ne__(self, other):
         """Inequality comparison based on latency."""
-        try:
-            return float(self) != float(other)
-        except (TypeError, ValueError):
-            return True
+        return float.__ne__(self, other)
 
     def __abs__(self):
         """Absolute value of latency and energy."""
@@ -230,8 +224,8 @@ class PerformanceResult(float):
         )
 
     def __hash__(self):
-        """Hash based on latency and energy for use in sets/dicts."""
-        return hash((float(self), self.energy))
+        """Hash the latency used by equality and float compatibility."""
+        return hash(float(self))
 
     def __str__(self):
         """String representation (acts like float for easy printing)."""

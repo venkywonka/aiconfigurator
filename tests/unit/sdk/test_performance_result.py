@@ -45,6 +45,24 @@ class TestConstruction:
         r = pr(5.0, energy=250.0)
         assert r.energy == 250.0
 
+    def test_latency_equality_and_hash_obey_python_key_contract(self):
+        low_energy = pr(5.0, energy=100.0)
+        high_energy = pr(5.0, energy=250.0)
+
+        assert low_energy == high_energy
+        assert hash(low_energy) == hash(high_energy) == hash(5.0)
+        assert {low_energy: "value"}[high_energy] == "value"
+
+    def test_equality_does_not_coerce_non_numeric_float_convertible_objects(self):
+        class FloatConvertible:
+            def __float__(self):
+                return 5.0
+
+        result = pr(5.0)
+
+        assert result != "5"
+        assert result != FloatConvertible()
+
 
 # -------------------------------------------------------------------------
 # _merge_source

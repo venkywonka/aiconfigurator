@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import builtins
+import errno
 import importlib
 import inspect
 import sys
@@ -395,6 +396,50 @@ def test_attention_capability_mismatch_fails_before_resource_acquisition(
 
 
 @pytest.mark.parametrize(
+    ("route", "request_factory", "error_match"),
+    [
+        pytest.param(
+            _ROUTES[0],
+            lambda route: replace(
+                _request(route),
+                protocol=replace(_protocol(), samples=2),
+            ),
+            "samples",
+            id="samples-below-three",
+        ),
+        pytest.param(
+            _ROUTES[2],
+            lambda route: _request(route, query=_query(route, sequence_length=1)),
+            "sequence_length",
+            id="generation-sequence-length-one",
+        ),
+    ],
+)
+def test_attention_route_prepare_rejects_before_resource_acquisition(
+    route: _Route,
+    request_factory,
+    error_match: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource_calls: list[tuple[MeasurementRequest, Mapping[str, Any]]] = []
+    real_resource = dsv4_attn_adapter.dsv4_attn_resource_for_request
+
+    def tracked_resource(request: MeasurementRequest, case: Mapping[str, Any]) -> ResourceContract:
+        resource_calls.append((request, case))
+        return real_resource(request, case)
+
+    monkeypatch.setattr(dsv4_attn_adapter, "dsv4_attn_resource_for_request", tracked_resource)
+    index = LazyAdapterIndex.from_registries({"sglang": SGLANG_LAZY_REGISTRY})
+    resolved = index.routes_for((route.namespace, "sglang", "0.5.10"))
+    assert len(resolved) == 1
+
+    with pytest.raises(ValueError, match=error_match):
+        resolved[0].prepare(request_factory(route))
+
+    assert resource_calls == []
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         lambda raw: raw["perf_row"].__setitem__("num_heads", _CANONICAL_NUM_HEADS),
@@ -517,3 +562,44 @@ def test_attention_runner_is_exact_only_import_light_and_has_no_offline_output_a
 
     monkeypatch.setattr(builtins, "__import__", _guarded_import)
     importlib.import_module(module_name)
+
+
+def test_model_runner_construction_retries_with_a_fresh_nccl_port_after_collision() -> None:
+    ports = iter((45101, 45102))
+    attempted_ports: list[int] = []
+
+    def model_runner_factory(**kwargs):
+        attempted_ports.append(kwargs["nccl_port"])
+        if len(attempted_ports) == 1:
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+        return object()
+
+    result = dsv4_attn._construct_model_runner(
+        model_runner_factory,
+        {"model_config": object()},
+        port_factory=lambda: next(ports),
+    )
+
+    assert result is not None
+    assert attempted_ports == [45101, 45102]
+
+
+def test_model_runner_construction_does_not_retry_unrelated_failures() -> None:
+    port_calls = 0
+
+    def port_factory() -> int:
+        nonlocal port_calls
+        port_calls += 1
+        return 45101
+
+    def model_runner_factory(**kwargs):
+        raise RuntimeError("model initialization failed")
+
+    with pytest.raises(RuntimeError, match="model initialization failed"):
+        dsv4_attn._construct_model_runner(
+            model_runner_factory,
+            {"model_config": object()},
+            port_factory=port_factory,
+        )
+
+    assert port_calls == 1

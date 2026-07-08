@@ -471,6 +471,24 @@ def test_literal_curated_attention_rejects_operation_model_and_profile_mismatche
     assert operation.curated_exact_result(database, **_runtime_inputs(phase)) is None
 
 
+def test_literal_curated_attention_rejects_cuda_runtime_mismatch(
+    dsv4_profile_model,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase = "context"
+    compress_ratio = 4
+    operation = _operation(dsv4_profile_model, phase, compress_ratio)
+    database = _ProfileDatabase()
+    _inject_literal_attention_row(database, phase=phase, compress_ratio=compress_ratio)
+    _disable_attention_loading(monkeypatch, operation)
+    database.measurement_environment = replace(
+        database.measurement_environment,
+        runtime_versions={**_RUNTIME_VERSIONS, "cuda": "12.9"},
+    )
+
+    assert operation.curated_exact_result(database, **_runtime_inputs(phase)) is None
+
+
 @pytest.mark.parametrize(("phase", "compress_ratio", "namespace"), _CASES)
 def test_representative_full_module_overlay_is_scaled_once_without_legacy_curated_delta(
     dsv4_profile_model,
@@ -585,6 +603,7 @@ def test_legacy_context_slice_does_not_treat_prefix_equal_to_tp_as_a_tp_axis() -
         num_heads=16,
         tp_size=4,
         compress_ratio=4,
+        phase="context",
     )
 
     assert head_axis == 16
@@ -603,9 +622,63 @@ def test_legacy_generation_slice_does_not_treat_batch_equal_to_tp_as_a_tp_axis()
         num_heads=16,
         tp_size=4,
         compress_ratio=4,
+        phase="generation",
     )
 
     assert head_axis == 16
+    assert module_slice is expected_batch_rows
+
+
+def test_tp_preserving_slice_missing_compression_does_not_fall_back_to_tp_axis() -> None:
+    hca_only_tp4_slice = {128: {0: {257: {3: {"latency": 2.0}}}}}
+    quant_data = {
+        64: {
+            2: {4: {0: {257: {3: {"latency": 9.0}}}}},
+            4: hca_only_tp4_slice,
+        }
+    }
+
+    head_axis, module_slice = _dsv4_resolve_module_slice(
+        quant_data,
+        num_heads=16,
+        tp_size=4,
+        compress_ratio=4,
+        phase="context",
+    )
+
+    assert head_axis == 64
+    assert module_slice is None
+
+
+def test_legacy_tp1_slice_with_exact_head_match_remains_resolvable() -> None:
+    expected_prefix_rows = {0: {257: {3: {"latency": 1.0}}}}
+    legacy_quant_data = {16: {4: expected_prefix_rows}}
+
+    head_axis, module_slice = _dsv4_resolve_module_slice(
+        legacy_quant_data,
+        num_heads=16,
+        tp_size=1,
+        compress_ratio=4,
+        phase="context",
+    )
+
+    assert head_axis == 16
+    assert module_slice is expected_prefix_rows
+
+
+def test_legacy_generation_slice_with_padded_head_collision_remains_resolvable() -> None:
+    expected_batch_rows = {1: {2065: {"latency": 1.0}}}
+    legacy_quant_data = {64: {4: expected_batch_rows}}
+
+    head_axis, module_slice = _dsv4_resolve_module_slice(
+        legacy_quant_data,
+        num_heads=16,
+        tp_size=4,
+        compress_ratio=4,
+        phase="generation",
+    )
+
+    assert head_axis == 64
     assert module_slice is expected_batch_rows
 
 

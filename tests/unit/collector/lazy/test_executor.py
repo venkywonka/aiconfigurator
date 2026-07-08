@@ -925,3 +925,34 @@ def test_concurrent_execute_calls_serialize_and_close_is_idempotent() -> None:
     assert len(factory.channels) == 1
     assert factory.channels[0].close_calls == 1
     assert factory.channels[0].join_calls == 1
+
+
+def test_reused_python_id_does_not_skip_cleanup_for_logically_new_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    factory = _Factory(api, events)
+    executor = _executor(1, events, resolver=lambda request: adapter, factory=factory)
+    bootstrap = SimpleNamespace(device_uuids=("GPU-0",))
+    reused_id = 0xA1C1345
+    real_id = id
+
+    def deterministic_id(candidate: object) -> int:
+        return reused_id if isinstance(candidate, _Channel) else real_id(candidate)
+
+    monkeypatch.setattr(api, "id", deterministic_id, raising=False)
+
+    first = _Channel(bootstrap, events, lambda command: None)
+    executor._close_channel(first)
+    assert first.close_calls == 1
+    assert first.join_calls == 1
+    del first
+
+    replacement = _Channel(bootstrap, events, lambda command: None)
+    assert api.id(replacement) == reused_id
+    executor._close_channel(replacement)
+
+    assert replacement.close_calls == 1
+    assert replacement.join_calls == 1
