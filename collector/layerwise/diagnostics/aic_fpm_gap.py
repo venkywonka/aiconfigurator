@@ -1057,6 +1057,13 @@ def _parse_args():
     p.add_argument("--model", default=DEFAULT_MODEL, help="HF model name (e.g. Qwen/Qwen3-32B).")
     p.add_argument("--system", default=DEFAULT_SYSTEM, help="systems-data SKU dir (e.g. h100_sxm, b300_sxm).")
     p.add_argument("--backend", default=DEFAULT_BACKEND, help="backend dir (vllm).")
+    p.add_argument(
+        "--tp",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=TP_VALUES[0],
+        help="tensor-parallel prediction lane; must match the FPM run's effective config",
+    )
     p.add_argument("--compute-version", default=DEFAULT_COMPUTE_VERSION,
                    help="layerwise CSV version (version-matched to FPM, e.g. 0.20.1).")
     p.add_argument("--comm-version", default=DEFAULT_COMM_VERSION,
@@ -1083,9 +1090,10 @@ def _parse_args():
 
 
 def main():
-    global MODEL_NAME
+    global MODEL_NAME, TP_VALUES
     args = _parse_args()
     MODEL_NAME = args.model  # read by build_model_and_db + the decode KV-snap
+    TP_VALUES = (args.tp,)
     repo_root = Path(args.repo_root).resolve()
     fpm_run = Path(args.fpm_run) if args.fpm_run else (repo_root / DEFAULT_FPM_RUN)
     out_dir = Path(args.out_dir) if args.out_dir else (Path(__file__).resolve().parent / "out")

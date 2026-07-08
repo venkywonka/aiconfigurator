@@ -393,5 +393,47 @@ class ReadRuntimeConfigBackCompatTests(unittest.TestCase):
             aic_fpm_gap._read_runtime_config(Path(td))
 
 
+class CliTpSelectionTests(unittest.TestCase):
+    def test_main_uses_explicit_tp_prediction_lane(self):
+        import tempfile
+        from unittest import mock
+
+        previous_model = aic_fpm_gap.MODEL_NAME
+        previous_tp_values = aic_fpm_gap.TP_VALUES
+        observed_tp_values = []
+
+        def fake_run(*_args, **_kwargs):
+            observed_tp_values.append(aic_fpm_gap.TP_VALUES)
+            return {"summary": []}
+
+        try:
+            with (
+                tempfile.TemporaryDirectory() as td,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "aic_fpm_gap",
+                        "--tp",
+                        "1",
+                        "--repo-root",
+                        td,
+                        "--fpm-run",
+                        td,
+                        "--out-dir",
+                        td,
+                        "--no-html",
+                    ],
+                ),
+                mock.patch.object(aic_fpm_gap, "run", side_effect=fake_run),
+            ):
+                aic_fpm_gap.main()
+        finally:
+            aic_fpm_gap.MODEL_NAME = previous_model
+            aic_fpm_gap.TP_VALUES = previous_tp_values
+
+        self.assertEqual(observed_tp_values, [(1,)])
+
+
 if __name__ == "__main__":
     unittest.main()
