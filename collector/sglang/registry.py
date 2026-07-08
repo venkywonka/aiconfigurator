@@ -8,7 +8,14 @@ No version forks exist yet. When SGLang API changes require a fork,
 add a ``versions`` tuple following the trtllm registry pattern.
 """
 
-from aiconfigurator.collector.sglang.registry import GEMM_LAZY_SPEC, MHC_LAZY_SPEC
+from aiconfigurator.collector.sglang.registry import (
+    DSV4_CSA_CONTEXT_LAZY_SPEC,
+    DSV4_CSA_GENERATION_LAZY_SPEC,
+    DSV4_HCA_CONTEXT_LAZY_SPEC,
+    DSV4_HCA_GENERATION_LAZY_SPEC,
+    GEMM_LAZY_SPEC,
+    MHC_LAZY_SPEC,
+)
 from collector.registry_types import OpEntry, PerfFile
 
 REGISTRY: list[OpEntry] = [
@@ -123,6 +130,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_dsv4_csa_context_test_cases",
         run_func="run_dsv4_attn_worker",
         perf_filename=PerfFile.DSV4_CSA_CONTEXT_MODULE,
+        lazy=DSV4_CSA_CONTEXT_LAZY_SPEC,
     ),
     OpEntry(
         op="dsv4_hca_context_module",
@@ -130,6 +138,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_dsv4_hca_context_test_cases",
         run_func="run_dsv4_attn_worker",
         perf_filename=PerfFile.DSV4_HCA_CONTEXT_MODULE,
+        lazy=DSV4_HCA_CONTEXT_LAZY_SPEC,
     ),
     OpEntry(
         op="dsv4_csa_generation_module",
@@ -137,6 +146,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_dsv4_csa_generation_test_cases",
         run_func="run_dsv4_attn_worker",
         perf_filename=PerfFile.DSV4_CSA_GENERATION_MODULE,
+        lazy=DSV4_CSA_GENERATION_LAZY_SPEC,
     ),
     OpEntry(
         op="dsv4_hca_generation_module",
@@ -144,6 +154,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_dsv4_hca_generation_test_cases",
         run_func="run_dsv4_attn_worker",
         perf_filename=PerfFile.DSV4_HCA_GENERATION_MODULE,
+        lazy=DSV4_HCA_GENERATION_LAZY_SPEC,
     ),
     # DeepSeek-V4 currently models CSA/HCA through full attention-module data
     # above.  Keep these kernel-level collectors as supporting data for future

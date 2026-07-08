@@ -261,6 +261,32 @@ def _dsv4_resolve_head_key(quant_data, num_heads):
     return None
 
 
+def _dsv4_resolve_module_slice(quant_data, num_heads, tp_size, compress_ratio):
+    """Return one DSv4 module slice from either persisted-table shape.
+
+    Current module collectors persist the padded head count and retain TP as a
+    separate axis.  Some unit callers and older in-memory tables still expose
+    the legacy rank-local-head -> compression-ratio shape, so keep that literal
+    fallback at this single boundary.
+    """
+
+    padded_heads = num_heads * tp_size
+    head_axis = _dsv4_resolve_head_key(quant_data, padded_heads)
+    if head_axis is None:
+        return None, None
+    head_data = quant_data[head_axis]
+    if not isinstance(head_data, Mapping):
+        return head_axis, None
+    # Only an exact padded-head key proves the TP-preserving schema.  When
+    # head resolution falls back to a rank-local legacy key, a numeric prefix
+    # or batch may equal ``tp_size`` and must not be mistaken for a TP axis.
+    tp_data = head_data.get(tp_size) if head_axis == padded_heads else None
+    module_slice = tp_data.get(compress_ratio) if isinstance(tp_data, Mapping) else None
+    if module_slice is None:
+        module_slice = head_data.get(compress_ratio)
+    return head_axis, module_slice
+
+
 def _dsv4_lookup_prefix_resolved(database, cr_dict, prefix, s, b):
     """SCHEME A prefix-resolved silicon lookup.
 
@@ -907,6 +933,19 @@ class _BaseDeepSeekV4AttentionModule(Operation):
     silicon data cache.
     """
 
+    _V1_2_PROFILE_COMPATIBILITY: ClassVar[dict[str, object]] = {
+        "model_artifact": "sgl-project/DeepSeek-V4-Flash-FP8",
+        "serving_mode": "aggregated",
+        "tp_size": 4,
+        "attention_dp_size": 1,
+        "cp_size": 1,
+        "pp_size": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 4,
+        "nextn": 0,
+    }
+    _ATTENTION_PHASE: ClassVar[str]
+
     def __init__(
         self,
         name: str,
@@ -979,6 +1018,169 @@ class _BaseDeepSeekV4AttentionModule(Operation):
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
 
+    @staticmethod
+    def _positive_runtime_integer(value: object, *, field: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"DSv4 attention {field} must be an integer")
+        if value <= 0:
+            raise ValueError(f"DSv4 attention {field} must be positive")
+        return value
+
+    @staticmethod
+    def _measurement_environment(database: PerfDatabase) -> MeasurementEnvironment:
+        environment = getattr(database, "measurement_environment", None)
+        if not isinstance(environment, MeasurementEnvironment):
+            raise TypeError("DSv4 attention lazy collection requires a bound MeasurementEnvironment")
+        expected = (database.system, database.backend, database.version)
+        actual = (environment.system, environment.backend, environment.backend_version)
+        if actual != expected:
+            raise ValueError("database measurement environment does not match system/backend/version")
+        return environment
+
+    def _validate_v1_2_measurement_capability(self, environment: MeasurementEnvironment) -> None:
+        if (
+            environment.system != "gb200"
+            or environment.backend != "sglang"
+            or environment.backend_version != "0.5.10"
+            or " ".join(environment.gpu_class.split()).casefold() != "nvidia gb200"
+            or environment.runtime_versions.get("model_profile") != "dsv4-v1.2"
+            or dict(environment.profile_compatibility or {}) != self._V1_2_PROFILE_COMPATIBILITY
+        ):
+            raise ValueError("DSv4 attention request is outside the frozen V1.2 deployment profile")
+        if (
+            self._tp_size != 4
+            or self._cp_size != 1
+            or self._native_heads != 64
+            or self._num_heads != 16
+            or self._compress_ratio not in {4, 128}
+            or self._kvcache_quant_mode is not common.KVCacheQuantMode.fp8
+            or self._fmha_quant_mode is not common.FMHAQuantMode.bfloat16
+            or self._gemm_quant_mode is not common.GEMMQuantMode.fp8_block
+        ):
+            raise ValueError("DSv4 attention operation is outside the frozen TP4/CP1 quantization envelope")
+
+    def _measurement_request_for_phase(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        normalized_query: Mapping[str, object],
+        *,
+        phase: str,
+    ) -> MeasurementRequest | None:
+        namespace_by_shape = {
+            ("context", 4): "dsv4_csa_context_module_perf.txt",
+            ("context", 128): "dsv4_hca_context_module_perf.txt",
+            ("generation", 4): "dsv4_csa_generation_module_perf.txt",
+            ("generation", 128): "dsv4_hca_generation_module_perf.txt",
+        }
+        perf_filename = namespace_by_shape.get((phase, self._compress_ratio))
+        if perf_filename is None:
+            return None
+        environment = self._measurement_environment(database)
+        self._validate_v1_2_measurement_capability(environment)
+        query = dict(normalized_query)
+        namespace = perf_namespace(perf_filename)
+        return MeasurementRequest(
+            op_id=self._name,
+            key=PerfKey.build(namespace, query, environment),
+            query=query,
+            environment=environment,
+            semantic_descriptor={
+                "full_module": True,
+                "tensor_generator": "normal-v1",
+                "seed": 0,
+                "tp_simulation": "single-gpu-tp4",
+                "canonical_num_heads": self._num_heads,
+                "padded_num_heads": self._native_heads,
+            },
+            protocol=protocol,
+        )
+
+    def _is_v1_2_curated_compatible(self, database: PerfDatabase) -> bool:
+        environment = getattr(database, "measurement_environment", None)
+        if not isinstance(environment, MeasurementEnvironment):
+            return False
+        try:
+            self._validate_v1_2_measurement_capability(environment)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._curated_exact_result_from_normalized(
+            database,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _curated_exact_result_from_normalized(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult | None:
+        del kwargs
+        if not self._is_v1_2_curated_compatible(database):
+            return None
+        self.load_data(database)
+
+        padded_heads = int(normalized_query["num_heads"]) * int(normalized_query["tp_size"])
+        try:
+            if self._ATTENTION_PHASE == "context":
+                data = getattr(database, "_context_deepseek_v4_attention_module_data", None)
+                row = util_empirical.require_data_slice(
+                    data,
+                    common.FMHAQuantMode[str(normalized_query["mla_dtype"])],
+                    common.KVCacheQuantMode[str(normalized_query["kv_cache_dtype"])],
+                    common.GEMMQuantMode[str(normalized_query["gemm_type"])],
+                    padded_heads,
+                    int(normalized_query["tp_size"]),
+                    int(normalized_query["compress_ratio"]),
+                    int(normalized_query["prefix_length"]),
+                    int(normalized_query["sequence_length"]),
+                    int(normalized_query["batch_size"]),
+                )
+            else:
+                data = getattr(database, "_generation_deepseek_v4_attention_module_data", None)
+                row = util_empirical.require_data_slice(
+                    data,
+                    common.KVCacheQuantMode[str(normalized_query["kv_cache_dtype"])],
+                    common.GEMMQuantMode[str(normalized_query["gemm_type"])],
+                    padded_heads,
+                    int(normalized_query["tp_size"]),
+                    int(normalized_query["compress_ratio"]),
+                    int(normalized_query["batch_size"]),
+                    int(normalized_query["sequence_length"]),
+                )
+        except (KeyError, PerfDataNotAvailableError):
+            return None
+        if not isinstance(row, Mapping):
+            raise TypeError("Malformed literal DSv4 attention row: expected a mapping")
+
+        latency = float(row["latency"])
+        energy = float(row.get("energy", 0.0))
+        if int(normalized_query["compress_ratio"]) == 4 and _TOPK_CORRECTION_ENABLED:
+            if self._ATTENTION_PHASE == "context":
+                prefix = int(normalized_query["prefix_length"])
+                sequence_length = int(normalized_query["sequence_length"])
+            else:
+                prefix = max(int(normalized_query["sequence_length"]) - 1, 0)
+                sequence_length = 1
+            delta = _dsv4_topk_delta_ms(
+                _get_dsv4_topk_calib(database),
+                prefix,
+                sequence_length,
+                int(normalized_query["batch_size"]),
+            )
+            latency, energy = _apply_dsv4_topk_calibration(latency, energy, delta)
+        return PerformanceResult(
+            latency * self._scale_factor,
+            energy=energy * self._scale_factor,
+            source="curated_exact",
+        )
+
 
 # ───────────────────────────────────────────────────────────────────────
 # ContextDeepSeekV4AttentionModule
@@ -1000,6 +1202,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
     _data_cache: ClassVar[dict] = {}
     _raw_data_cache: ClassVar[dict] = {}
     _sparse_kernel_cache: ClassVar[dict] = {}
+    _ATTENTION_PHASE = "context"
 
     # ------------------------------------------------------------------
     # Data ownership
@@ -1290,14 +1493,15 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                     kvcache_quant_mode,
                     gemm_quant_mode,
                 )
-                head_axis = _dsv4_resolve_head_key(quant_data, num_heads)
-                if head_axis is None:
-                    raise PerfDataNotAvailableError("No context DeepSeek-V4 attention head slice is available.")
-                return util_empirical.require_data_slice(
+                head_axis, module_slice = _dsv4_resolve_module_slice(
                     quant_data,
-                    head_axis,
+                    num_heads,
+                    tp_size,
                     compress_ratio,
-                )  # {prefix: {s: {b: leaf}}}
+                )
+                if head_axis is None or module_slice is None:
+                    raise PerfDataNotAvailableError("No context DeepSeek-V4 attention head slice is available.")
+                return module_slice  # {prefix: {s: {b: leaf}}}
 
             try:
                 prefix_keys = tuple(sorted(_slice().keys()))
@@ -1362,24 +1566,31 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                     f"DeepSeek-V4 context attention module data not loaded for system='{database.system}', "
                     f"backend='{database.backend}', version='{database.version}'."
                 )
-            # SCHEME A: head axis is the rank-local head count the model passes.
+            # Released DSv4 module rows persist FMLA's padded head count while
+            # AIC models the rank-local count.  Prefer the exact padded-head +
+            # TP slice; retain the legacy head->compress-ratio form for callers
+            # that inject pre-V1.2 tables directly.
             quant_data = util_empirical.require_data_slice(
                 data,
                 fmha_quant_mode,
                 kvcache_quant_mode,
                 gemm_quant_mode,
             )
-            head_axis = _dsv4_resolve_head_key(quant_data, num_heads)
+            head_axis, cr_dict = _dsv4_resolve_module_slice(
+                quant_data,
+                num_heads,
+                tp_size,
+                compress_ratio,
+            )
             if head_axis is None:
                 raise PerfDataNotAvailableError(
                     f"No DeepSeek-V4 context attention silicon data for num_heads={num_heads}, "
                     f"loaded head keys={list(quant_data.keys())}."
                 )
-            cr_dict = quant_data[head_axis].get(compress_ratio)
             if cr_dict is None:
                 raise PerfDataNotAvailableError(
                     f"No DeepSeek-V4 context attention silicon data for num_heads={num_heads}, "
-                    f"compress_ratio={compress_ratio}, loaded cr keys="
+                    f"tp_size={tp_size}, compress_ratio={compress_ratio}, loaded head keys="
                     f"{list(quant_data[head_axis].keys())}."
                 )
 
@@ -1443,13 +1654,81 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             gemm_quant_mode=self._gemm_quant_mode,
         )
 
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
+        batch_size = self._positive_runtime_integer(kwargs.get("batch_size"), field="batch_size")
+        sequence_length = self._positive_runtime_integer(kwargs.get("s"), field="sequence_length")
+        prefix_length = kwargs.get("prefix", 0)
+        if isinstance(prefix_length, bool) or not isinstance(prefix_length, int):
+            raise TypeError("DSv4 attention prefix_length must be an integer")
+        if prefix_length < 0:
+            raise ValueError("DSv4 attention prefix_length must be non-negative")
+        return {
+            "tp_size": self._tp_size,
+            "num_heads": self._num_heads,
+            "compress_ratio": self._compress_ratio,
+            "batch_size": batch_size,
+            "sequence_length": sequence_length,
+            "prefix_length": prefix_length,
+            "mla_dtype": self._fmha_quant_mode.name,
+            "kv_cache_dtype": self._kvcache_quant_mode.name,
+            "gemm_type": self._gemm_quant_mode.name,
+        }
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._measurement_request_from_normalized(
+            database,
+            protocol,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        del kwargs
+        return self._measurement_request_for_phase(
+            database,
+            protocol,
+            normalized_query,
+            phase="context",
+        )
+
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
-        batch_size = kwargs.get("batch_size")
-        isl = kwargs.get("s")
-        prefix = kwargs.get("prefix", 0)
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._query_from_normalized(database, normalized)
+
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        del kwargs
+        return self._query_from_normalized(database, normalized_query)
+
+    def _query_from_normalized(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
+        batch_size = int(normalized_query["batch_size"])
+        sequence_length = int(normalized_query["sequence_length"])
+        prefix_length = int(normalized_query["prefix_length"])
         if self._cp_size and self._cp_size > 1:
-            return self._query_cp(database, batch_size, isl, prefix)
-        result = self._module_base(database, batch_size, isl, prefix)
+            return self._query_cp(database, batch_size, sequence_length, prefix_length)
+        result = self._module_base(database, batch_size, sequence_length, prefix_length)
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,
@@ -1581,6 +1860,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
     """
 
     _data_cache: ClassVar[dict] = {}
+    _ATTENTION_PHASE = "generation"
 
     # ------------------------------------------------------------------
     # Data ownership
@@ -1689,14 +1969,15 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 if not data:
                     raise PerfDataNotAvailableError("No generation DeepSeek-V4 attention data is loaded.")
                 quant_data = util_empirical.require_data_slice(data, kvcache_quant_mode, gemm_quant_mode)
-                head_axis = _dsv4_resolve_head_key(quant_data, num_heads)
-                if head_axis is None:
-                    raise PerfDataNotAvailableError("No generation DeepSeek-V4 attention head slice is available.")
-                return util_empirical.require_data_slice(
+                head_axis, module_slice = _dsv4_resolve_module_slice(
                     quant_data,
-                    head_axis,
+                    num_heads,
+                    tp_size,
                     compress_ratio,
-                )  # {b: {s_total: leaf}}
+                )
+                if head_axis is None or module_slice is None:
+                    raise PerfDataNotAvailableError("No generation DeepSeek-V4 attention head slice is available.")
+                return module_slice  # {b: {s_total: leaf}}
 
             grid = util_empirical.grid_for(
                 (
@@ -1732,19 +2013,26 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                     f"DeepSeek-V4 generation attention module data not loaded for system='{database.system}', "
                     f"backend='{database.backend}', version='{database.version}'."
                 )
-            # SCHEME A: head axis is the rank-local head count the model passes.
+            # Prefer the exact padded-head + TP slice emitted by the DSv4
+            # collector, with a compatibility fallback for legacy injected
+            # head->compress-ratio tables.
             quant_data = util_empirical.require_data_slice(data, kvcache_quant_mode, gemm_quant_mode)
-            head_axis = _dsv4_resolve_head_key(quant_data, num_heads)
+            head_axis, deepseek_v4_dict = _dsv4_resolve_module_slice(
+                quant_data,
+                num_heads,
+                tp_size,
+                compress_ratio,
+            )
             if head_axis is None:
                 raise PerfDataNotAvailableError(
                     f"No DeepSeek-V4 generation attention silicon data for num_heads={num_heads}, "
                     f"loaded head keys={list(quant_data.keys())}."
                 )
-            deepseek_v4_dict = quant_data[head_axis].get(compress_ratio)
             if deepseek_v4_dict is None:
                 raise PerfDataNotAvailableError(
                     f"No DeepSeek-V4 generation attention silicon data for num_heads={num_heads}, "
-                    f"compress_ratio={compress_ratio}, loaded cr keys={list(quant_data[head_axis].keys())}."
+                    f"tp_size={tp_size}, compress_ratio={compress_ratio}, "
+                    f"loaded head keys={list(quant_data[head_axis].keys())}."
                 )
             # SCHEME A generation dict is {head}{cr}{b}{s_total}; wrap with the
             # head key and let the robust lookup walk (head -> b -> s_total).
@@ -1776,13 +2064,74 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
     # Op contract
     # ------------------------------------------------------------------
 
-    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
         beam_width = kwargs.get("beam_width")
         if beam_width != 1:
             raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
+        batch_size = self._positive_runtime_integer(kwargs.get("batch_size"), field="batch_size")
+        sequence_length = self._positive_runtime_integer(kwargs.get("s"), field="sequence_length")
+        return {
+            "tp_size": self._tp_size,
+            "num_heads": self._num_heads,
+            "compress_ratio": self._compress_ratio,
+            "batch_size": batch_size,
+            "sequence_length": sequence_length,
+            "kv_cache_dtype": self._kvcache_quant_mode.name,
+            "gemm_type": self._gemm_quant_mode.name,
+        }
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._measurement_request_from_normalized(
+            database,
+            protocol,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        del kwargs
+        return self._measurement_request_for_phase(
+            database,
+            protocol,
+            normalized_query,
+            phase="generation",
+        )
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._query_from_normalized(database, normalized)
+
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        del kwargs
+        return self._query_from_normalized(database, normalized_query)
+
+    def _query_from_normalized(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
         result = database.query_generation_deepseek_v4_attention_module(
-            b=kwargs.get("batch_size"),
-            s=kwargs.get("s"),
+            b=int(normalized_query["batch_size"]),
+            s=int(normalized_query["sequence_length"]),
             num_heads=self._num_heads,
             native_heads=self._native_heads,
             tp_size=self._tp_size,
@@ -2262,13 +2611,15 @@ _MISSING = object()
 def load_context_dsv4_kind_module_data(file_path: str):
     """Load ONE DeepSeek-V4 context CSV (single attn_kind / compress_ratio).
 
-    SCHEME A.  Returns a 7-level prefix-resolved nested dict:
-        data[fmha_quant][kv_quant][gemm_quant][num_heads_local][compress_ratio]
-            [prefix][s][b] = {"latency": ms, "power": W, "energy": J}
+    SCHEME A. Returns a TP-preserving prefix-resolved nested dict:
+        data[fmha_quant][kv_quant][gemm_quant][padded_num_heads][tp_size]
+            [compress_ratio][prefix][s][b] = {"latency": ms, "power": W,
+                                               "energy": J}
 
-    The head axis is the rank-LOCAL head count = ``int(row["num_heads"])``
-    (the collector writes ``local_attention_heads = native // tp``).  There is
-    NO separate ``tp_size`` key and NO reconstructed native-head key.
+    The collector persists FMLA's padded head count (64 for the frozen DSv4
+    profile) for every simulated TP. Keeping TP as a separate axis prevents
+    TP1/2/4/8 rows from silently overwriting one another; operation-local
+    canonicalization reconstructs rank-local heads as padded heads / TP.
 
     ``prefix`` is the past-KV length, ``int(float(row["step"]))``; ``s`` is the
     context chunk length (``isl``).  Multiple files (csa/hca) merge cleanly
@@ -2279,13 +2630,13 @@ def load_context_dsv4_kind_module_data(file_path: str):
         logger.debug(f"DSV4 module data file {file_path} not found.")
         return None
 
-    # 7-level nesting: fmha → kv → gemm → num_heads_local → cr → prefix → s → b
+    # 8-level nesting: fmha → kv → gemm → padded_heads → tp → cr → prefix → s → b
     def _make_nested(depth: int):
         if depth == 0:
             return defaultdict()
         return defaultdict(lambda d=depth: _make_nested(d - 1))
 
-    data = _make_nested(7)
+    data = _make_nested(8)
     has_power = bool(rows) and "power" in rows[0]
 
     for row in rows:
@@ -2295,14 +2646,14 @@ def load_context_dsv4_kind_module_data(file_path: str):
             b = int(row["batch_size"])
             s = int(row["isl"])
             prefix = int(float(row.get("step", 0) or 0))
+            tp_size = int(row["tp_size"])
             cr = int(row["compress_ratio"])
             latency = float(row["latency"])
         except (TypeError, ValueError, KeyError):
             continue
         power = float(row.get("power", 0.0)) if has_power else 0.0
 
-        # SCHEME A: head key is the rank-local head count straight from the CSV.
-        num_heads_local = int(row["num_heads"])
+        padded_num_heads = int(row["num_heads"])
         gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
         fmha_mode = common.FMHAQuantMode[_dsv4_normalize_dtype(row["mla_dtype"])]
         kv_dtype = common.KVCacheQuantMode[_dsv4_normalize_dtype(row["kv_cache_dtype"])]
@@ -2310,7 +2661,7 @@ def load_context_dsv4_kind_module_data(file_path: str):
         # NOTE: the topK DELTA correction (degenerate -> representative) is
         # applied ONCE at query time for compress_ratio==4 (CSA). Do NOT
         # subtract it here, or the CSA module latency would be double-corrected.
-        data[fmha_mode][kv_dtype][gemm_mode][num_heads_local][cr][prefix][s][b] = {
+        data[fmha_mode][kv_dtype][gemm_mode][padded_num_heads][tp_size][cr][prefix][s][b] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
@@ -2322,8 +2673,8 @@ def load_generation_dsv4_kind_module_data(file_path: str):
     """Load ONE DeepSeek-V4 generation CSV.
 
     Generation lookup uses absolute KV length ``s_total = isl + step`` (decode
-    is q_len=1 with past_kv = step).  SCHEME A dict shape:
-        data[kv_quant][gemm_quant][num_heads_local][compress_ratio]
+    is q_len=1 with past_kv = step). SCHEME A dict shape:
+        data[kv_quant][gemm_quant][padded_num_heads][tp_size][compress_ratio]
             [b][s_total]
     """
     rows = _read_filtered_rows(file_path)
@@ -2331,13 +2682,13 @@ def load_generation_dsv4_kind_module_data(file_path: str):
         logger.debug(f"DSV4 module data file {file_path} not found.")
         return None
 
-    # SCHEME A: 5-level nesting kv → gemm → num_heads_local → cr → b → s_total
+    # SCHEME A: 6-level nesting kv → gemm → padded_heads → tp → cr → b → s_total
     def _make_nested(depth: int):
         if depth == 0:
             return defaultdict()
         return defaultdict(lambda d=depth: _make_nested(d - 1))
 
-    data = _make_nested(5)
+    data = _make_nested(6)
     has_power = bool(rows) and "power" in rows[0]
 
     for row in rows:
@@ -2346,20 +2697,20 @@ def load_generation_dsv4_kind_module_data(file_path: str):
         try:
             b = int(row["batch_size"])
             s_total = int(row["isl"]) + int(row["step"])
+            tp_size = int(row["tp_size"])
             cr = int(row["compress_ratio"])
             latency = float(row["latency"])
         except (TypeError, ValueError, KeyError):
             continue
         power = float(row.get("power", 0.0)) if has_power else 0.0
 
-        # SCHEME A: head key is the rank-local head count straight from the CSV;
-        # no tp_size key, no native reconstruction.  Generation convention puts
-        # ``b`` before ``s_total`` (matches the (head, b, s) lookup order).
-        num_heads_local = int(row["num_heads"])
+        # Generation convention puts ``b`` before ``s_total`` (matching the
+        # final robust-lookup order inside the selected padded-head/TP slice).
+        padded_num_heads = int(row["num_heads"])
         gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
         kv_dtype = common.KVCacheQuantMode[_dsv4_normalize_dtype(row["kv_cache_dtype"])]
 
-        data[kv_dtype][gemm_mode][num_heads_local][cr][b][s_total] = {
+        data[kv_dtype][gemm_mode][padded_num_heads][tp_size][cr][b][s_total] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
