@@ -8,7 +8,7 @@ No version forks exist yet. When SGLang API changes require a fork,
 add a ``versions`` tuple following the trtllm registry pattern.
 """
 
-from aiconfigurator.collector.sglang.registry import GEMM_LAZY_SPEC
+from aiconfigurator.collector.sglang.registry import GEMM_LAZY_SPEC, MHC_LAZY_SPEC
 from collector.registry_types import OpEntry, PerfFile
 
 REGISTRY: list[OpEntry] = [
@@ -215,5 +215,6 @@ REGISTRY: list[OpEntry] = [
         get_func="get_mhc_module_test_cases",
         run_func="run_mhc_module_worker",
         perf_filename=PerfFile.MHC_MODULE,
+        lazy=MHC_LAZY_SPEC,
     ),
 ]

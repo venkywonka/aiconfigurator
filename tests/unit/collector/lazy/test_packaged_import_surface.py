@@ -144,6 +144,19 @@ def test_packaged_sglang_registry_resolves_the_frozen_gemm_route() -> None:
     assert routes[0].lazy is GEMM_LAZY_SPEC
 
 
+def test_packaged_sglang_registry_resolves_the_frozen_mhc_route() -> None:
+    from aiconfigurator.collector.adapters import LazyAdapterIndex
+    from aiconfigurator.collector.sglang.registry import MHC_LAZY_SPEC, SGLANG_LAZY_REGISTRY
+
+    routes = LazyAdapterIndex.from_registries({"sglang": SGLANG_LAZY_REGISTRY}).routes_for(
+        (MHC_LAZY_SPEC.namespace, "sglang", "0.5.10")
+    )
+
+    assert len(routes) == 1
+    assert routes[0].collector_module == "aiconfigurator.collector.sglang.mhc"
+    assert routes[0].lazy is MHC_LAZY_SPEC
+
+
 def test_raw_measurement_mapping_survives_pickle_round_trip() -> None:
     measurement = RawMeasurement(
         latency_ms=1.25,

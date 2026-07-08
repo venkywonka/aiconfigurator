@@ -44,6 +44,13 @@ from aiconfigurator.sdk import common, interpolation
 from aiconfigurator.sdk.errors import PerfDataNotAvailableError
 from aiconfigurator.sdk.operations import util_empirical
 from aiconfigurator.sdk.operations.base import Operation, _read_filtered_rows
+from aiconfigurator.sdk.perf_namespace import perf_namespace
+from aiconfigurator.sdk.resolution.types import (
+    MeasurementEnvironment,
+    MeasurementProtocol,
+    MeasurementRequest,
+    PerfKey,
+)
 
 logger = logging.getLogger(__name__)
 from aiconfigurator.sdk.performance_result import PerformanceResult
@@ -492,6 +499,17 @@ class DeepSeekV4MHCModule(Operation):
 
     _data_cache: ClassVar[dict] = {}
     _CP_AWARE: ClassVar[bool] = True  # token-major: query divides num_tokens by self._seq_split
+    _V1_2_PROFILE_COMPATIBILITY: ClassVar[dict[str, object]] = {
+        "model_artifact": "sgl-project/DeepSeek-V4-Flash-FP8",
+        "serving_mode": "aggregated",
+        "tp_size": 4,
+        "attention_dp_size": 1,
+        "cp_size": 1,
+        "pp_size": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 4,
+        "nextn": 0,
+    }
 
     def __init__(
         self,
@@ -707,14 +725,164 @@ class DeepSeekV4MHCModule(Operation):
     # Op contract
     # ------------------------------------------------------------------
 
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
+        """Normalize one runtime invocation to the persisted full-module key."""
+
+        x = kwargs.get("x")
+        if isinstance(x, bool) or not isinstance(x, int):
+            raise TypeError("mHC x must be an integer")
+        if x <= 0:
+            raise ValueError("mHC x must be positive")
+        if not isinstance(self._quant_mode, common.GEMMQuantMode):
+            raise TypeError("mHC quant_mode must be a GEMMQuantMode")
+        return {
+            "op": self._op,
+            "num_tokens": -(-x // self._seq_split),
+            "hidden_size": self._hidden_size,
+            "hc_mult": self._hc_mult,
+            "sinkhorn_iters": self._sinkhorn_iters,
+            "quant_mode": self._quant_mode.name,
+        }
+
+    @staticmethod
+    def _measurement_environment(database: PerfDatabase) -> MeasurementEnvironment:
+        environment = getattr(database, "measurement_environment", None)
+        if not isinstance(environment, MeasurementEnvironment):
+            raise TypeError("mHC lazy collection requires a bound MeasurementEnvironment")
+        expected = (database.system, database.backend, database.version)
+        actual = (environment.system, environment.backend, environment.backend_version)
+        if actual != expected:
+            raise ValueError("database measurement environment does not match system/backend/version")
+        return environment
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._measurement_request_from_normalized(
+            database,
+            protocol,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        del kwargs
+        if normalized_query.get("op") not in {"pre", "post"}:
+            return None
+        if self._seq_split != 1:
+            raise ValueError("mHC lazy collection supports only the frozen CP1 profile (seq_split=1)")
+        query = dict(normalized_query)
+        environment = self._measurement_environment(database)
+        namespace = perf_namespace("mhc_module_perf.txt")
+        return MeasurementRequest(
+            op_id=self._name,
+            key=PerfKey.build(namespace, query, environment),
+            query=query,
+            environment=environment,
+            semantic_descriptor={
+                "num_sites": 2,
+                "tensor_generator": "normal-v1",
+                "seed": 0,
+            },
+            protocol=protocol,
+        )
+
+    def _is_v1_2_curated_compatible(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> bool:
+        environment = getattr(database, "measurement_environment", None)
+        if not isinstance(environment, MeasurementEnvironment):
+            return False
+        return (
+            environment.system == "gb200"
+            and environment.backend == "sglang"
+            and environment.backend_version == "0.5.10"
+            and " ".join(environment.gpu_class.split()).casefold() == "nvidia gb200"
+            and environment.runtime_versions.get("model_profile") == "dsv4-v1.2"
+            and dict(environment.profile_compatibility or {}) == self._V1_2_PROFILE_COMPATIBILITY
+            and self._seq_split == 1
+            and normalized_query.get("op") in {"pre", "post"}
+            and normalized_query.get("hidden_size") == 4096
+            and normalized_query.get("hc_mult") == 4
+            and normalized_query.get("sinkhorn_iters") == 20
+            and normalized_query.get("quant_mode") == common.GEMMQuantMode.bfloat16.name
+        )
+
+    def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._curated_exact_result_from_normalized(
+            database,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _curated_exact_result_from_normalized(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult | None:
+        del kwargs
+        if not self._is_v1_2_curated_compatible(database, normalized_query):
+            return None
+        self.load_data(database)
+        data = getattr(database, "_mhc_module_data", None)
+        if not isinstance(data, Mapping) or getattr(data, "loaded", True) is False:
+            return None
+        by_hc = data.get(normalized_query["op"])
+        by_hidden = by_hc.get(normalized_query["hc_mult"]) if isinstance(by_hc, Mapping) else None
+        by_tokens = by_hidden.get(normalized_query["hidden_size"]) if isinstance(by_hidden, Mapping) else None
+        row = by_tokens.get(normalized_query["num_tokens"]) if isinstance(by_tokens, Mapping) else None
+        if not isinstance(row, Mapping):
+            return None
+        latency = float(row["latency"])
+        energy = float(row.get("energy", 0.0))
+        return PerformanceResult(
+            latency=latency * self._scale_factor,
+            energy=energy * self._scale_factor,
+            source="curated_exact",
+        )
+
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._query_from_normalized(database, normalized)
+
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        del kwargs
+        return self._query_from_normalized(database, normalized_query)
+
+    def _query_from_normalized(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
         result = database.query_mhc_module(
-            num_tokens=-(-kwargs.get("x") // self._seq_split),  # CP: per-rank token count (ceil = busiest rank)
-            hidden_size=self._hidden_size,
-            hc_mult=self._hc_mult,
-            sinkhorn_iters=self._sinkhorn_iters,
-            op=self._op,
-            quant_mode=self._quant_mode,
+            num_tokens=int(normalized_query["num_tokens"]),
+            hidden_size=int(normalized_query["hidden_size"]),
+            hc_mult=int(normalized_query["hc_mult"]),
+            sinkhorn_iters=int(normalized_query["sinkhorn_iters"]),
+            op=str(normalized_query["op"]),
+            quant_mode=common.GEMMQuantMode[str(normalized_query["quant_mode"])],
         )
         return PerformanceResult(
             float(result) * self._scale_factor,
