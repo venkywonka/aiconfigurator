@@ -35,7 +35,14 @@ from aiconfigurator.sdk import common, interpolation
 from aiconfigurator.sdk.errors import EmpiricalNotImplementedError, PerfDataNotAvailableError
 from aiconfigurator.sdk.operations import util_empirical
 from aiconfigurator.sdk.operations.base import Operation, _read_filtered_rows
+from aiconfigurator.sdk.perf_namespace import perf_namespace
 from aiconfigurator.sdk.performance_result import PerformanceResult
+from aiconfigurator.sdk.resolution.types import (
+    MeasurementEnvironment,
+    MeasurementProtocol,
+    MeasurementRequest,
+    PerfKey,
+)
 
 if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
@@ -513,12 +520,131 @@ class NCCL(Operation):
     # Op contract
     # ------------------------------------------------------------------
 
-    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
-        """Query NCCL latency with power data."""
-        # CP: ceil = busiest rank
-        message_size = (-(-kwargs.get("x") // self._seq_split)) * self._num_elements_per_token
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
+        x = kwargs.get("x")
+        if isinstance(x, bool) or not isinstance(x, int):
+            raise TypeError("NCCL x must be an integer")
+        message_size = (-(-x // self._seq_split)) * self._num_elements_per_token
+        return {
+            "nccl_dtype": self._comm_quant_mode.name,
+            "operation": self._nccl_op,
+            "num_gpus": self._num_gpus,
+            "message_size": message_size,
+        }
 
-        result = database.query_nccl(self._comm_quant_mode, self._num_gpus, self._nccl_op, message_size)
+    @staticmethod
+    def _measurement_environment(database: PerfDatabase) -> MeasurementEnvironment:
+        environment = getattr(database, "measurement_environment", None)
+        if not isinstance(environment, MeasurementEnvironment):
+            raise TypeError("NCCL lazy collection requires a bound MeasurementEnvironment")
+        return environment
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._measurement_request_from_normalized(
+            database,
+            protocol,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        del kwargs
+        if int(normalized_query["num_gpus"]) <= 1:
+            return None
+        query = dict(normalized_query)
+        environment = self._measurement_environment(database)
+        namespace = perf_namespace("nccl_perf.txt")
+        return MeasurementRequest(
+            op_id=self._name,
+            key=PerfKey.build(namespace, query, environment),
+            query=query,
+            environment=environment,
+            semantic_descriptor={"tensor_generator": "normal-v1", "seed": 0},
+            protocol=protocol,
+        )
+
+    def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._curated_exact_result_from_normalized(
+            database,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _curated_exact_result_from_normalized(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult | None:
+        del kwargs
+        try:
+            dtype = common.CommQuantMode[str(normalized_query["nccl_dtype"])]
+            operation = str(normalized_query["operation"])
+            num_gpus = int(normalized_query["num_gpus"])
+            message_size = int(normalized_query["message_size"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if num_gpus == 1:
+            return PerformanceResult(0.0, energy=0.0, source="curated_exact")
+        self.load_data(database)
+        wrapper = database._nccl_data
+        by_operation = wrapper.data.get(dtype)
+        by_world = by_operation.get(operation) if isinstance(by_operation, Mapping) else None
+        by_size = by_world.get(num_gpus) if isinstance(by_world, Mapping) else None
+        result = by_size.get(message_size) if isinstance(by_size, Mapping) else None
+        if result is None:
+            return None
+        if isinstance(result, Mapping):
+            latency = float(result["latency"])
+            energy = float(result.get("energy", 0.0))
+        else:
+            latency = float(result)
+            energy = 0.0
+        return PerformanceResult(
+            latency * self._scale_factor,
+            energy=energy * self._scale_factor,
+            source="curated_exact",
+        )
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._query_from_normalized(database, normalized)
+
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        del kwargs
+        return self._query_from_normalized(database, normalized_query)
+
+    def _query_from_normalized(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
+        dtype = common.CommQuantMode[str(normalized_query["nccl_dtype"])]
+        num_gpus = int(normalized_query["num_gpus"])
+        operation = str(normalized_query["operation"])
+        message_size = int(normalized_query["message_size"])
+        result = database.query_nccl(dtype, num_gpus, operation, message_size)
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,

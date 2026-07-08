@@ -254,6 +254,32 @@ def test_environment_copies_runtime_versions() -> None:
         environment.runtime_versions["cuda"] = "13.0"
 
 
+@pytest.mark.parametrize("field", ["system", "backend", "backend_version", "gpu_class"])
+def test_environment_rejects_blank_identity_fields(field: str) -> None:
+    values = {
+        "system": "h100_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.2.0",
+        "gpu_class": "h100-sxm-80gb",
+        "runtime_versions": {"trtllm": "1.2.0"},
+    }
+    values[field] = " "
+
+    with pytest.raises(ValueError, match=field):
+        MeasurementEnvironment(**values)
+
+
+def test_environment_rejects_backend_runtime_version_disagreement() -> None:
+    with pytest.raises(ValueError, match=r"runtime_versions|backend_version"):
+        MeasurementEnvironment(
+            system="h100_sxm",
+            backend="trtllm",
+            backend_version="1.2.0",
+            gpu_class="h100-sxm-80gb",
+            runtime_versions={"trtllm": "1.1.0", "cuda": "12.8"},
+        )
+
+
 def test_request_accepts_semantic_metadata_outside_physical_identity() -> None:
     query = {"m": 8}
     semantic = {"length_bucket": [128, 256]}

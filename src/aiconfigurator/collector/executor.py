@@ -11,13 +11,18 @@ return raw result mappings; they never construct or persist performance rows.
 from __future__ import annotations
 
 import importlib
+import json
+import multiprocessing
 import os
+import queue
+import tempfile
 import threading
 import time
+import traceback
 import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Any, Protocol
 
@@ -26,6 +31,7 @@ from aiconfigurator.collector.scheduler import HardwareAwareScheduler, Unschedul
 from aiconfigurator.collector.types import Assignment, CollectionJob, HardwareInventory
 from aiconfigurator.sdk.resolution.session import CancellationToken
 from aiconfigurator.sdk.resolution.types import (
+    MeasurementProtocol,
     MeasurementRecord,
     MeasurementRequest,
     RecordStatus,
@@ -34,12 +40,493 @@ from aiconfigurator.sdk.resolution.types import (
 )
 
 __all__ = [
+    "NcclRankBootstrap",
+    "NcclRankCommand",
+    "NcclRankReply",
     "PersistentMeasurementExecutor",
+    "PersistentNcclRankGroup",
+    "PersistentNcclRuntime",
+    "ProcessWorkerFactory",
     "WorkerBootstrap",
     "WorkerCommand",
     "WorkerReply",
     "bind_and_import_runner",
+    "nccl_rank_process_main",
+    "worker_process_main",
 ]
+
+
+class PersistentNcclRuntime:
+    """Persistent collective measurement facade owned by one worker lease.
+
+    The process-group transport is injected so the coordinator and lightweight
+    imports remain Torch-free. The concrete multiprocessing rank group is
+    installed by the GPU worker factory.
+    """
+
+    _OPERATIONS = frozenset({"all_reduce", "all_gather", "reduce_scatter", "alltoall"})
+    _DTYPES = frozenset({"half", "int8"})
+
+    def __init__(
+        self,
+        measure: Callable[[str, str, int], Sequence[float]] | None = None,
+        close: Callable[[], None] | None = None,
+        protocol: MeasurementProtocol | None = None,
+    ) -> None:
+        self._measure = measure
+        self._close = close
+        self._protocol = protocol
+        self._closed = False
+
+    @property
+    def protocol_digest(self) -> str | None:
+        return self._protocol.digest if self._protocol is not None else None
+
+    def measure(self, dtype: str, operation: str, element_count: int) -> tuple[float, ...]:
+        if self._closed:
+            raise RuntimeError("persistent NCCL runtime is closed")
+        if dtype not in self._DTYPES:
+            raise ValueError(f"unsupported NCCL dtype {dtype!r}")
+        if operation not in self._OPERATIONS:
+            raise ValueError(f"unsupported NCCL operation {operation!r}")
+        if isinstance(element_count, bool) or not isinstance(element_count, int) or element_count <= 0:
+            raise ValueError("NCCL element_count must be a positive integer")
+        if self._measure is None:
+            raise RuntimeError("persistent NCCL rank group has not been initialized")
+        try:
+            samples = tuple(float(sample) for sample in self._measure(dtype, operation, element_count))
+        except BaseException:
+            self.close()
+            raise
+        if not samples:
+            raise RuntimeError("persistent NCCL rank group returned no samples")
+        return samples
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._close is not None:
+            self._close()
+
+
+@dataclass(frozen=True, slots=True)
+class NcclRankBootstrap:
+    """Immutable identity for one rank in a persistent local NCCL group."""
+
+    rank: int
+    world_size: int
+    device_uuid: str
+    protocol: MeasurementProtocol
+
+
+@dataclass(frozen=True, slots=True)
+class NcclRankCommand:
+    """One exact collective case broadcast to every persistent rank."""
+
+    invocation_id: str
+    dtype: str
+    operation: str
+    element_count: int
+    protocol: MeasurementProtocol
+
+
+@dataclass(frozen=True, slots=True)
+class NcclRankReply:
+    """Per-rank completion acknowledgement; only rank zero carries samples."""
+
+    invocation_id: str
+    rank: int
+    samples_ms: tuple[float, ...] = ()
+    error: str | None = None
+
+
+def _nccl_alltoall_splits(
+    element_count: int,
+    world_size: int,
+    rank: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return exact per-destination sends and per-source receives for one rank."""
+
+    if element_count <= 0 or world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError("invalid NCCL alltoall shape or rank")
+    base, remainder = divmod(element_count, world_size)
+    input_splits = tuple(base + (destination < remainder) for destination in range(world_size))
+    output_splits = (input_splits[rank],) * world_size
+    return input_splits, output_splits
+
+
+class _TorchNcclRankBackend:
+    """Heavy Torch backend imported only inside a UUID-restricted rank."""
+
+    def __init__(self, bootstrap: NcclRankBootstrap) -> None:
+        self._bootstrap = bootstrap
+        self._torch: Any = None
+        self._dist: Any = None
+        self._cases: dict[tuple[str, str, int], tuple[Callable[[], None], Callable[[], None]]] = {}
+
+    def initialize(self) -> None:
+        import torch
+        import torch.distributed as dist
+
+        torch.cuda.set_device(self._bootstrap.rank)
+        init_method = os.environ.get("AICONFIGURATOR_NCCL_INIT_METHOD")
+        if not init_method:
+            raise RuntimeError("NCCL rank rendezvous is not configured")
+        dist.init_process_group(
+            backend="nccl",
+            init_method=init_method,
+            rank=self._bootstrap.rank,
+            world_size=self._bootstrap.world_size,
+        )
+        self._torch = torch
+        self._dist = dist
+
+    def _tensor(self, count: int, dtype: Any) -> Any:
+        torch = self._torch
+        device = f"cuda:{self._bootstrap.rank}"
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        if dtype is torch.int8:
+            return torch.randint(-8, 8, (count,), dtype=dtype, device=device, generator=generator)
+        return torch.randn((count,), dtype=dtype, device=device, generator=generator)
+
+    def _prepare_case(
+        self,
+        dtype_name: str,
+        operation: str,
+        element_count: int,
+    ) -> tuple[Callable[[], None], Callable[[], None]]:
+        torch = self._torch
+        dist = self._dist
+        dtype = {"half": torch.float16, "int8": torch.int8}[dtype_name]
+        world_size = self._bootstrap.world_size
+
+        if operation == "all_reduce":
+            template = self._tensor(element_count, dtype)
+            tensor = template.clone()
+
+            def prepare() -> None:
+                tensor.copy_(template)
+
+            def invoke() -> None:
+                dist.all_reduce(tensor)
+
+            return prepare, invoke
+
+        if operation == "all_gather":
+            tensor = self._tensor(element_count, dtype)
+            outputs = [torch.empty_like(tensor) for _ in range(world_size)]
+            return (lambda: None), lambda: dist.all_gather(outputs, tensor)
+
+        if operation == "reduce_scatter":
+            output = torch.empty((element_count,), dtype=dtype, device=tensor_device(self._bootstrap.rank))
+            inputs = [self._tensor(element_count, dtype) for _ in range(world_size)]
+            return (lambda: None), lambda: dist.reduce_scatter(output, inputs)
+
+        if operation == "alltoall":
+            tensor = self._tensor(element_count, dtype)
+            input_splits, output_splits = _nccl_alltoall_splits(
+                element_count,
+                world_size,
+                self._bootstrap.rank,
+            )
+            output = torch.empty(
+                (sum(output_splits),),
+                dtype=dtype,
+                device=tensor_device(self._bootstrap.rank),
+            )
+            return (lambda: None), lambda: dist.all_to_all_single(
+                output,
+                tensor,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+            )
+        raise ValueError(f"unsupported NCCL operation {operation!r}")
+
+    def run(self, dtype: str, operation: str, element_count: int) -> float:
+        key = (dtype, operation, element_count)
+        case = self._cases.get(key)
+        if case is None:
+            case = self._prepare_case(*key)
+            self._cases[key] = case
+        prepare, invoke = case
+        prepare()
+        self._torch.cuda.synchronize()
+        start = self._torch.cuda.Event(enable_timing=True)
+        end = self._torch.cuda.Event(enable_timing=True)
+        start.record()
+        invoke()
+        end.record()
+        end.synchronize()
+        return float(start.elapsed_time(end))
+
+    def destroy(self) -> None:
+        if self._dist is not None and self._dist.is_initialized():
+            self._dist.destroy_process_group()
+
+    def abort(self) -> None:
+        # Never enter another process-group operation after one rank fails.
+        # The owning parent terminates every rank in the lease.
+        return
+
+
+def tensor_device(rank: int) -> str:
+    """Return the local CUDA ordinal after UUID visibility restriction."""
+
+    return f"cuda:{rank}"
+
+
+def nccl_rank_process_main(
+    bootstrap: NcclRankBootstrap,
+    command_queue: Any,
+    reply_queue: Any,
+    *,
+    runtime_factory: Callable[[NcclRankBootstrap], Any] = _TorchNcclRankBackend,
+) -> None:
+    """Initialize one NCCL rank once and serve independent exact cases."""
+
+    backend = runtime_factory(bootstrap)
+    command: NcclRankCommand | None = None
+    failed = False
+    try:
+        backend.initialize()
+        while True:
+            candidate = command_queue.get()
+            if candidate is None:
+                break
+            if not isinstance(candidate, NcclRankCommand):
+                raise TypeError("NCCL rank received a malformed command")
+            command = candidate
+            try:
+                if command.protocol != bootstrap.protocol:
+                    raise ValueError("NCCL rank command protocol does not match its lease")
+                if command.dtype not in PersistentNcclRuntime._DTYPES:
+                    raise ValueError(f"unsupported NCCL dtype {command.dtype!r}")
+                if command.operation not in PersistentNcclRuntime._OPERATIONS:
+                    raise ValueError(f"unsupported NCCL operation {command.operation!r}")
+                if (
+                    isinstance(command.element_count, bool)
+                    or not isinstance(command.element_count, int)
+                    or command.element_count <= 0
+                ):
+                    raise ValueError("NCCL element_count must be a positive integer")
+                for _ in range(command.protocol.warmups):
+                    backend.run(command.dtype, command.operation, command.element_count)
+                samples = tuple(
+                    float(backend.run(command.dtype, command.operation, command.element_count))
+                    for _ in range(command.protocol.samples)
+                )
+                reply_queue.put(
+                    NcclRankReply(
+                        invocation_id=command.invocation_id,
+                        rank=bootstrap.rank,
+                        samples_ms=samples if bootstrap.rank == 0 else (),
+                    )
+                )
+            except BaseException:
+                failed = True
+                backend.abort()
+                reply_queue.put(
+                    NcclRankReply(
+                        invocation_id=command.invocation_id,
+                        rank=bootstrap.rank,
+                        error=traceback.format_exc(),
+                    )
+                )
+                return
+    except BaseException:
+        failed = True
+        backend.abort()
+        reply_queue.put(
+            NcclRankReply(
+                invocation_id=command.invocation_id if command is not None else "",
+                rank=bootstrap.rank,
+                error=traceback.format_exc(),
+            )
+        )
+    finally:
+        if not failed:
+            backend.destroy()
+
+
+class PersistentNcclRankGroup:
+    """Spawn and reuse one local rank process per assigned GPU UUID."""
+
+    def __init__(
+        self,
+        *,
+        device_uuids: tuple[str, ...],
+        protocol: MeasurementProtocol,
+        context_getter: Callable[[str], Any] = multiprocessing.get_context,
+        worker_target: Callable[..., None] = nccl_rank_process_main,
+        reply_timeout_seconds: float = 120.0,
+        shutdown_timeout_seconds: float = 5.0,
+    ) -> None:
+        if not isinstance(device_uuids, tuple) or not device_uuids:
+            raise ValueError("persistent NCCL group requires assigned device UUIDs")
+        if len(set(device_uuids)) != len(device_uuids):
+            raise ValueError("persistent NCCL group device UUIDs must be unique")
+        if not isinstance(protocol, MeasurementProtocol):
+            raise TypeError("persistent NCCL group protocol must be a MeasurementProtocol")
+        if reply_timeout_seconds <= 0 or shutdown_timeout_seconds < 0:
+            raise ValueError("persistent NCCL group timeouts must be positive")
+
+        self._device_uuids = device_uuids
+        self._protocol = protocol
+        self._reply_timeout_seconds = reply_timeout_seconds
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._context = context_getter("spawn")
+        self._reply_queue = self._context.Queue()
+        self._command_queues: list[Any] = []
+        self._processes: list[Any] = []
+        self._closed = False
+        self._poisoned = False
+        self._rendezvous = tempfile.TemporaryDirectory(prefix="aic-nccl-rendezvous-")
+        init_method = f"file://{self._rendezvous.name}/store"
+        previous_init_method = os.environ.get("AICONFIGURATOR_NCCL_INIT_METHOD")
+        os.environ["AICONFIGURATOR_NCCL_INIT_METHOD"] = init_method
+        try:
+            for rank, device_uuid in enumerate(device_uuids):
+                command_queue = self._context.Queue()
+                bootstrap = NcclRankBootstrap(
+                    rank=rank,
+                    world_size=len(device_uuids),
+                    device_uuid=device_uuid,
+                    protocol=protocol,
+                )
+                process = self._context.Process(
+                    target=worker_target,
+                    args=(bootstrap, command_queue, self._reply_queue),
+                    daemon=False,
+                )
+                process.start()
+                self._command_queues.append(command_queue)
+                self._processes.append(process)
+        except BaseException:
+            self._poison()
+            raise
+        finally:
+            if previous_init_method is None:
+                os.environ.pop("AICONFIGURATOR_NCCL_INIT_METHOD", None)
+            else:
+                os.environ["AICONFIGURATOR_NCCL_INIT_METHOD"] = previous_init_method
+
+    @property
+    def protocol_digest(self) -> str:
+        return self._protocol.digest
+
+    @property
+    def device_uuids(self) -> tuple[str, ...]:
+        return self._device_uuids
+
+    @property
+    def poisoned(self) -> bool:
+        return self._poisoned
+
+    @property
+    def rank_pids(self) -> tuple[int | None, ...]:
+        return tuple(getattr(process, "pid", None) for process in self._processes)
+
+    def _get_reply(self) -> object:
+        try:
+            return self._reply_queue.get(timeout=self._reply_timeout_seconds)
+        except TypeError:
+            return self._reply_queue.get()
+        except queue.Empty as error:
+            raise TimeoutError("persistent NCCL rank group timed out") from error
+
+    def measure(self, dtype: str, operation: str, element_count: int) -> tuple[float, ...]:
+        if self._closed:
+            raise RuntimeError("persistent NCCL rank group is closed")
+        if self._poisoned:
+            raise RuntimeError("persistent NCCL rank group is poisoned")
+        if dtype not in PersistentNcclRuntime._DTYPES:
+            raise ValueError(f"unsupported NCCL dtype {dtype!r}")
+        if operation not in PersistentNcclRuntime._OPERATIONS:
+            raise ValueError(f"unsupported NCCL operation {operation!r}")
+        if isinstance(element_count, bool) or not isinstance(element_count, int) or element_count <= 0:
+            raise ValueError("NCCL element_count must be a positive integer")
+
+        command = NcclRankCommand(
+            invocation_id=uuid.uuid4().hex,
+            dtype=dtype,
+            operation=operation,
+            element_count=element_count,
+            protocol=self._protocol,
+        )
+        for command_queue in self._command_queues:
+            command_queue.put(command)
+
+        rank_zero_samples: tuple[float, ...] | None = None
+        completed_ranks: set[int] = set()
+        try:
+            for _ in self._processes:
+                reply = self._get_reply()
+                if not isinstance(reply, NcclRankReply):
+                    raise TypeError("persistent NCCL rank returned a malformed reply")
+                if reply.invocation_id != command.invocation_id:
+                    raise RuntimeError("persistent NCCL rank reply identity mismatch")
+                if reply.rank in completed_ranks or not 0 <= reply.rank < len(self._processes):
+                    raise RuntimeError("persistent NCCL rank reply has an invalid rank")
+                if reply.error is not None:
+                    raise RuntimeError(reply.error)
+                completed_ranks.add(reply.rank)
+                if reply.rank == 0:
+                    rank_zero_samples = tuple(reply.samples_ms)
+                elif reply.samples_ms:
+                    raise RuntimeError("only NCCL rank zero may return timing samples")
+            if rank_zero_samples is None or len(rank_zero_samples) != self._protocol.samples:
+                raise RuntimeError("NCCL rank zero returned an invalid sample count")
+            return rank_zero_samples
+        except BaseException:
+            self._poison()
+            raise
+
+    def _join_or_kill(self, process: Any) -> None:
+        process.join(self._shutdown_timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(self._shutdown_timeout_seconds)
+        if process.is_alive():
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+                process.join(self._shutdown_timeout_seconds)
+
+    def _cleanup(self, *, forced: bool) -> None:
+        for queue_object in (*self._command_queues, self._reply_queue):
+            if forced:
+                cancel_join_thread = getattr(queue_object, "cancel_join_thread", None)
+                if callable(cancel_join_thread):
+                    cancel_join_thread()
+            close = getattr(queue_object, "close", None)
+            if callable(close):
+                close()
+        self._rendezvous.cleanup()
+
+    def _poison(self) -> None:
+        if self._poisoned:
+            return
+        self._poisoned = True
+        for process in self._processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self._processes:
+            process.join(self._shutdown_timeout_seconds)
+        self._cleanup(forced=True)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._poisoned:
+            return
+        for command_queue in self._command_queues:
+            command_queue.put(None)
+        for process in self._processes:
+            self._join_or_kill(process)
+        self._cleanup(forced=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +554,7 @@ class WorkerCommand:
     invocation_id: str
     request_digest: str
     payload: bytes
+    protocol: MeasurementProtocol | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +596,199 @@ def bind_and_import_runner(
         raise AttributeError(
             f"runner module {bootstrap.run_module!r} has no attribute {bootstrap.run_func!r}"
         ) from error
+
+
+def worker_process_main(
+    bootstrap: WorkerBootstrap,
+    command_queue: Any,
+    reply_queue: Any,
+    *,
+    import_module: Callable[[str], ModuleType | object] = importlib.import_module,
+) -> None:
+    """Serve exact cases until the parent closes this persistent worker.
+
+    Device UUID visibility is installed before the runner module is imported.
+    The wire boundary intentionally contains only immutable command objects and
+    plain result dictionaries; row validation and persistence stay parent-owned.
+    """
+
+    runner = bind_and_import_runner(bootstrap, import_module=import_module)
+    try:
+        while True:
+            command = command_queue.get()
+            if command is None:
+                return
+            if not isinstance(command, WorkerCommand):
+                raise TypeError("worker received a malformed command")
+
+            try:
+                if command.protocol is None:
+                    raise ValueError("worker command is missing its measurement protocol")
+                if command.protocol.digest != bootstrap.protocol_digest:
+                    raise ValueError("worker command protocol does not match its persistent lease")
+                case = json.loads(command.payload)
+                if not isinstance(case, dict):
+                    raise TypeError("worker case payload must decode to a JSON object")
+                raw_result = runner(**case, protocol=command.protocol)
+                if not isinstance(raw_result, Mapping):
+                    raise TypeError("exact runner must return a raw result mapping")
+                reply = WorkerReply(
+                    invocation_id=command.invocation_id,
+                    request_digest=command.request_digest,
+                    raw_result=dict(raw_result),
+                )
+            except BaseException:
+                reply = WorkerReply(
+                    invocation_id=command.invocation_id,
+                    request_digest=command.request_digest,
+                    error=traceback.format_exc(),
+                )
+            reply_queue.put(reply)
+    finally:
+        close_worker = getattr(runner, "close_worker", None)
+        if callable(close_worker):
+            close_worker()
+
+
+class _ProcessWorkerChannel:
+    """Queue-backed persistent worker channel owned by one hardware lease."""
+
+    def __init__(
+        self,
+        command_queue: Any,
+        reply_queue: Any,
+        process: Any,
+        *,
+        shutdown_timeout_seconds: float,
+    ) -> None:
+        self._command_queue = command_queue
+        self._reply_queue = reply_queue
+        self._process = process
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._closed = False
+        self._joined = False
+
+    @property
+    def ready_handles(self) -> tuple[object, object]:
+        return (self._reply_queue._reader, self._process.sentinel)
+
+    def send(self, command: WorkerCommand) -> None:
+        if self._closed:
+            raise RuntimeError("persistent worker channel is closed")
+        self._command_queue.put(command)
+
+    def recv(self) -> object:
+        return self._reply_queue.get()
+
+    def is_alive(self) -> bool:
+        return bool(self._process.is_alive())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._command_queue.put(None)
+
+    def join(self) -> None:
+        if self._joined:
+            return
+        self._joined = True
+
+        def _bounded_join() -> None:
+            try:
+                self._process.join(self._shutdown_timeout_seconds)
+            except TypeError:
+                # Test doubles and a few process-like transports expose join()
+                # without multiprocessing's optional timeout.
+                self._process.join()
+
+        forced_termination = False
+        _bounded_join()
+        if self._process.is_alive():
+            forced_termination = True
+            self._process.terminate()
+            _bounded_join()
+        if self._process.is_alive():
+            kill = getattr(self._process, "kill", None)
+            if not callable(kill):
+                raise RuntimeError("persistent worker survived termination and cannot be killed")
+            kill()
+            _bounded_join()
+        if self._process.is_alive():
+            raise RuntimeError("persistent worker survived forced kill")
+
+        for queue_object in (self._command_queue, self._reply_queue):
+            if forced_termination:
+                cancel_join_thread = getattr(queue_object, "cancel_join_thread", None)
+                if callable(cancel_join_thread):
+                    cancel_join_thread()
+            close = getattr(queue_object, "close", None)
+            if callable(close):
+                close()
+            if not forced_termination:
+                join_thread = getattr(queue_object, "join_thread", None)
+                if callable(join_thread):
+                    join_thread()
+
+
+class ProcessWorkerFactory:
+    """Create spawn-safe persistent workers and wait on replies or exits."""
+
+    def __init__(
+        self,
+        *,
+        context_getter: Callable[[str], Any] = multiprocessing.get_context,
+        worker_target: Callable[..., None] = worker_process_main,
+        connection_wait: Callable[[Sequence[object], float], Sequence[object]] | None = None,
+        shutdown_timeout_seconds: float = 5.0,
+    ) -> None:
+        if shutdown_timeout_seconds < 0:
+            raise ValueError("worker shutdown timeout must be non-negative")
+        if connection_wait is None:
+            from multiprocessing.connection import wait as connection_wait
+
+        self._context = context_getter("spawn")
+        self._worker_target = worker_target
+        self._connection_wait = connection_wait
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
+
+    def __call__(self, bootstrap: WorkerBootstrap) -> WorkerChannel:
+        command_queue = self._context.Queue()
+        reply_queue = self._context.Queue()
+        process = self._context.Process(
+            target=self._worker_target,
+            args=(bootstrap, command_queue, reply_queue),
+            daemon=False,
+        )
+        process.start()
+        return _ProcessWorkerChannel(
+            command_queue,
+            reply_queue,
+            process,
+            shutdown_timeout_seconds=self._shutdown_timeout_seconds,
+        )
+
+    def wait_ready(
+        self,
+        channels: Sequence[WorkerChannel],
+        timeout_seconds: float,
+    ) -> tuple[WorkerChannel, ...]:
+        if timeout_seconds < 0:
+            raise ValueError("worker wait timeout must be non-negative")
+        handles: list[object] = []
+        owner_by_handle_id: dict[int, WorkerChannel] = {}
+        for channel in channels:
+            if not isinstance(channel, _ProcessWorkerChannel):
+                raise TypeError("process worker factory can only wait on its own channels")
+            for handle in channel.ready_handles:
+                handles.append(handle)
+                owner_by_handle_id[id(handle)] = channel
+        if not handles:
+            return ()
+        ready_handle_ids = {id(handle) for handle in self._connection_wait(handles, timeout_seconds)}
+        return tuple(
+            channel for channel in channels if any(id(handle) in ready_handle_ids for handle in channel.ready_handles)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +916,16 @@ class PersistentMeasurementExecutor:
                     "duplicate request identity in one executor batch",
                 )
                 continue
+            requested_gpu_class = " ".join(request.environment.gpu_class.split()).casefold()
+            if any(
+                " ".join(device.name.split()).casefold() != requested_gpu_class for device in self._inventory.devices
+            ):
+                records[index] = self._failure(
+                    request,
+                    UnresolvedCode.IDENTITY_MISMATCH,
+                    "request GPU class does not match the collector inventory",
+                )
+                continue
             if request.environment.topology_fingerprint != self._inventory.topology_fingerprint:
                 records[index] = self._failure(
                     request,
@@ -327,6 +1018,7 @@ class PersistentMeasurementExecutor:
                     invocation_id=uuid.uuid4().hex,
                     request_digest=prepared_job.request.key.digest,
                     payload=prepared_job.job.payload,
+                    protocol=prepared_job.request.protocol,
                 )
                 try:
                     channel.send(command)
@@ -434,7 +1126,19 @@ class PersistentMeasurementExecutor:
                 "worker must return a raw result mapping",
             )
         try:
-            return invocation.prepared_job.adapter.record(invocation.prepared_job.prepared, reply.raw_result)
+            record = invocation.prepared_job.adapter.record(invocation.prepared_job.prepared, reply.raw_result)
+            parent_provenance = {
+                "measurement_environment": json.loads(request.environment.canonical),
+                "assigned_device_uuids": [self._device_by_id[gpu_id].uuid for gpu_id in invocation.assignment.gpu_ids],
+                "assigned_gpu_ids": list(invocation.assignment.gpu_ids),
+                "topology_fingerprint": request.environment.topology_fingerprint,
+                "invocation_id": invocation.command.invocation_id,
+                "request_digest": invocation.command.request_digest,
+            }
+            return replace(
+                record,
+                provenance={**dict(record.provenance), **parent_provenance},
+            )
         except Exception as error:
             self._evict(channel)
             return self._failure(

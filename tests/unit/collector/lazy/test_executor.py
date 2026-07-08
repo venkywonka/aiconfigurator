@@ -358,6 +358,49 @@ def test_wave_submits_every_job_before_multiplexed_receive_and_returns_request_o
     }
 
 
+def test_gpu_class_mismatch_fails_before_adapter_preparation_or_worker_creation() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    factory = _Factory(api, events)
+    executor = _executor(1, events, resolver=lambda request: adapter, factory=factory)
+    request = _request(1)
+    environment = replace(request.environment, gpu_class="NVIDIA H100")
+    request = replace(
+        request,
+        key=PerfKey.build(request.key.namespace, request.query, environment),
+        environment=environment,
+    )
+
+    records = tuple(executor.execute((request,), deadline_monotonic=20.0, cancellation=_Cancellation()))
+
+    _assert_failure(records[0], UnresolvedCode.IDENTITY_MISMATCH)
+    assert not events
+    assert not factory.channels
+
+
+def test_parent_attaches_environment_assignment_and_invocation_provenance() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    factory = _Factory(api, events)
+    executor = _executor(1, events, resolver=lambda request: adapter, factory=factory)
+    request = _request(1)
+
+    records = tuple(executor.execute((request,), deadline_monotonic=20.0, cancellation=_Cancellation()))
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.status is RecordStatus.VALID
+    assert record.provenance["measurement_environment"] == json.loads(request.environment.canonical)
+    assert tuple(record.provenance["assigned_device_uuids"]) == ("GPU-0",)
+    assert tuple(record.provenance["assigned_gpu_ids"]) == (0,)
+    assert record.provenance["topology_fingerprint"] == request.environment.topology_fingerprint
+    command = factory.channels[0].commands[0]
+    assert record.provenance["invocation_id"] == command.invocation_id
+    assert record.provenance["request_digest"] == request.key.digest
+
+
 def test_compatible_leases_reuse_but_protocol_adapter_and_uuid_tuples_isolate() -> None:
     adapters, api = _apis()
     events: list[str] = []

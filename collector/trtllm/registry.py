@@ -8,6 +8,7 @@ TRT-LLM collectors target the current manifest runtime. Each module file still
 declares its precise ``__compat__`` constraint, which is validated at runtime.
 """
 
+from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
 from collector.registry_types import OpEntry, PerfFile
 
 REGISTRY: list[OpEntry] = [
@@ -17,6 +18,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_gemm_test_cases",
         run_func="run_gemm",
         perf_filename=PerfFile.GEMM,
+        lazy=GEMM_LAZY_SPEC,
     ),
     OpEntry(
         op="compute_scale",

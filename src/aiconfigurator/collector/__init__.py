@@ -12,6 +12,7 @@ from aiconfigurator.collector.types import (
     HardwareDiscoveryEvidence,
     HardwareInventory,
     LazyOpEntry,
+    RawMeasurement,
     ResourceContract,
     canonical_topology_fingerprint,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "LazyOpEntry",
     "OpEntry",
     "PerfFile",
+    "RawMeasurement",
     "ResourceContract",
     "VersionRoute",
     "canonical_topology_fingerprint",

@@ -305,6 +305,33 @@ def test_sibling_only_with_no_active_data(env: Path) -> None:
     assert _gemm_lookup(db, 1024, 4096, 4096) == 0.7
 
 
+def test_inherited_literal_gemm_exact_result_retains_source_origin(env: Path) -> None:
+    """An inherited exact row remains attributable to its sibling source."""
+    from aiconfigurator.sdk.operations.gemm import GEMM
+
+    active_csv = _backend_csv(env)
+    active_csv.parent.mkdir(parents=True, exist_ok=True)
+    active_csv.write_text(_GEMM_HEADER)
+
+    sibling_csv = _backend_csv(env, version="0.9")
+    _write_gemm_csv(sibling_csv, [("trtllm", "torch_flow", 1024, 4096, 4096, 0.7)])
+    _make_manifest(env, [("gemm_perf.txt", "torch_flow", "shared", ["trtllm"])])
+
+    result = GEMM(
+        "mlp",
+        1.0,
+        n=4096,
+        k=4096,
+        quant_mode=common.GEMMQuantMode.bfloat16,
+    ).curated_exact_result(_build_db(env), x=1024)
+
+    assert result is not None
+    assert result.source == "curated_exact"
+    assert result.provenance["source_path"] == str(sibling_csv)
+    assert result.provenance["source_backend"] == "trtllm"
+    assert result.provenance["source_version"] == "0.9"
+
+
 def test_merged_no_conflict(env: Path) -> None:
     """Active has shape A, sibling version has shape B → both present in merged dict."""
     _write_gemm_csv(_backend_csv(env), [("trtllm", "torch_flow", 1024, 4096, 4096, 0.5)])

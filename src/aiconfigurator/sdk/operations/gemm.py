@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
@@ -28,7 +29,14 @@ from aiconfigurator.sdk import common, interpolation
 from aiconfigurator.sdk.errors import EmpiricalNotImplementedError, PerfDataNotAvailableError
 from aiconfigurator.sdk.operations import util_empirical
 from aiconfigurator.sdk.operations.base import Operation, _read_filtered_rows
+from aiconfigurator.sdk.perf_namespace import perf_namespace
 from aiconfigurator.sdk.performance_result import PerformanceResult
+from aiconfigurator.sdk.resolution.types import (
+    MeasurementEnvironment,
+    MeasurementProtocol,
+    MeasurementRequest,
+    PerfKey,
+)
 
 if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
@@ -128,6 +136,8 @@ class GEMM(Operation):
     _data_cache: ClassVar[dict] = {}
     _compute_scale_cache: ClassVar[dict] = {}
     _scale_matrix_cache: ClassVar[dict] = {}
+    _literal_row_cache: ClassVar[dict[tuple, frozenset[tuple[common.GEMMQuantMode, int, int, int]]]] = {}
+    _literal_row_source_cache: ClassVar[dict[tuple, dict[tuple, Mapping[str, str]]]] = {}
     _compute_scale_delta_lookup_cache: ClassVar[dict[int, _ZeroAwareDeltaLookup]] = {}
     _CP_AWARE: ClassVar[bool] = True  # query divides x (token count) by self._seq_split
 
@@ -189,7 +199,13 @@ class GEMM(Operation):
         from aiconfigurator.sdk.perf_database import LoadedOpData, PerfDataFilename
 
         key = cls._cache_key(database)
-        if key not in cls._data_cache or key not in cls._compute_scale_cache or key not in cls._scale_matrix_cache:
+        if (
+            key not in cls._data_cache
+            or key not in cls._compute_scale_cache
+            or key not in cls._scale_matrix_cache
+            or key not in cls._literal_row_cache
+            or key not in cls._literal_row_source_cache
+        ):
             system_data_root = os.path.join(database.systems_root, database.system_spec["data_dir"])
             data_dir = os.path.join(system_data_root, database.backend, database.version)
 
@@ -205,6 +221,20 @@ class GEMM(Operation):
             gemm_loaded = _load(PerfDataFilename.gemm, load_gemm_data)
             compute_scale_loaded = _load(PerfDataFilename.compute_scale, load_compute_scale_data)
             scale_matrix_loaded = _load(PerfDataFilename.scale_matrix, load_scale_matrix_data)
+            literal_rows = frozenset(
+                (quant_mode, int(m), int(n), int(k))
+                for quant_mode, by_m in gemm_loaded.items()
+                for m, by_n in by_m.items()
+                for n, by_k in by_n.items()
+                for k in by_k
+            )
+            literal_row_sources = {
+                (quant_mode, int(m), int(n), int(k)): dict(value.get("_source", {}))
+                for quant_mode, by_m in gemm_loaded.items()
+                for m, by_n in by_m.items()
+                for n, by_k in by_n.items()
+                for k, value in by_k.items()
+            }
 
             # Correct + extrapolate the CANONICAL class-cache values directly
             # (not via ``database._gemm_data``) so a pre-set test override
@@ -233,6 +263,8 @@ class GEMM(Operation):
             cls._data_cache[key] = gemm_loaded
             cls._compute_scale_cache[key] = compute_scale_loaded
             cls._scale_matrix_cache[key] = scale_matrix_loaded
+            cls._literal_row_cache[key] = literal_rows
+            cls._literal_row_source_cache[key] = literal_row_sources
 
             cls._record_load()
 
@@ -251,6 +283,8 @@ class GEMM(Operation):
         cls._data_cache.clear()
         cls._compute_scale_cache.clear()
         cls._scale_matrix_cache.clear()
+        cls._literal_row_cache.clear()
+        cls._literal_row_source_cache.clear()
         cls._compute_scale_delta_lookup_cache.clear()
         query = cls.__dict__.get("query")
         if query is not None and hasattr(query, "cache_clear"):
@@ -776,7 +810,157 @@ class GEMM(Operation):
     # Op contract: query() + get_weights()
     # ------------------------------------------------------------------
 
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
+        """Normalize runtime token and quantization inputs exactly once."""
+
+        x = kwargs.get("x")
+        if isinstance(x, bool) or not isinstance(x, int):
+            raise TypeError("GEMM x must be an integer")
+        x //= self._scale_num_tokens
+        x = -(-x // self._seq_split)
+        overwrite_quant_mode = kwargs.get("quant_mode")
+        quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
+        if not isinstance(quant_mode, common.GEMMQuantMode):
+            raise TypeError("GEMM quant_mode must be a GEMMQuantMode")
+        return {
+            "gemm_type": quant_mode.name,
+            "m": x,
+            "n": self._n,
+            "k": self._k,
+        }
+
+    @staticmethod
+    def _measurement_environment(database: PerfDatabase) -> MeasurementEnvironment:
+        environment = getattr(database, "measurement_environment", None)
+        if environment is None:
+            gpu_spec = database.system_spec.get("gpu", {})
+            environment = MeasurementEnvironment(
+                system=database.system,
+                backend=database.backend,
+                backend_version=database.version,
+                gpu_class=str(gpu_spec.get("name", database.system)),
+                runtime_versions={database.backend: database.version},
+                topology_schema=getattr(database, "topology_schema", None),
+                topology_fingerprint=getattr(database, "topology_fingerprint", None),
+            )
+        if not isinstance(environment, MeasurementEnvironment):
+            raise TypeError("database measurement_environment must be a MeasurementEnvironment")
+        expected = (database.system, database.backend, database.version)
+        actual = (environment.system, environment.backend, environment.backend_version)
+        if actual != expected:
+            raise ValueError("database measurement environment does not match system/backend/version")
+        return environment
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._measurement_request_from_normalized(
+            database,
+            protocol,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        del kwargs
+        if normalized_query.get("gemm_type") == common.GEMMQuantMode.fp8_static.name:
+            return None
+        query = dict(normalized_query)
+        environment = self._measurement_environment(database)
+        namespace = perf_namespace("gemm_perf.txt")
+        return MeasurementRequest(
+            op_id=self._name,
+            key=PerfKey.build(namespace, query, environment),
+            query=query,
+            environment=environment,
+            semantic_descriptor={"tensor_generator": "normal-v1", "seed": 0},
+            protocol=protocol,
+        )
+
+    def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._curated_exact_result_from_normalized(
+            database,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _curated_exact_result_from_normalized(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult | None:
+        del kwargs
+        gemm_type = normalized_query.get("gemm_type")
+        if gemm_type == common.GEMMQuantMode.fp8_static.name:
+            return None
+        try:
+            quant_mode = common.GEMMQuantMode[str(gemm_type)]
+            m = int(normalized_query["m"])
+            n = int(normalized_query["n"])
+            k = int(normalized_query["k"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        table_quant_mode = self._normalize_gemm_quant_mode_for_table(quant_mode)
+        self.load_data(database)
+        cache_key = self._cache_key(database)
+        if (table_quant_mode, m, n, k) not in self._literal_row_cache.get(cache_key, frozenset()):
+            return None
+        wrapper = database._gemm_data
+        by_m = wrapper.data.get(table_quant_mode)
+        by_n = by_m.get(m) if isinstance(by_m, Mapping) else None
+        by_k = by_n.get(n) if isinstance(by_n, Mapping) else None
+        result = by_k.get(k) if isinstance(by_k, Mapping) else None
+        if result is None:
+            return None
+        if isinstance(result, Mapping):
+            latency = float(result["latency"])
+            energy = float(result.get("energy", 0.0))
+        else:
+            latency = float(result)
+            energy = 0.0
+        return PerformanceResult(
+            latency=latency * self._scale_factor,
+            energy=energy * self._scale_factor,
+            source="curated_exact",
+            provenance=self._literal_row_source_cache.get(cache_key, {}).get(
+                (table_quant_mode, m, n, k),
+                {},
+            ),
+        )
+
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._query_from_normalized(database, normalized)
+
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        del kwargs
+        return self._query_from_normalized(database, normalized_query)
+
+    def _query_from_normalized(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
         """
         Query GEMM latency with energy data.
 
@@ -788,11 +972,8 @@ class GEMM(Operation):
                               Energy data accessible via .energy attribute.
                               Power can be derived as energy/latency.
         """
-        x = kwargs.get("x")
-        x //= self._scale_num_tokens
-        x = -(-x // self._seq_split)  # CP: per-rank token count (ceil = busiest rank)
-        overwrite_quant_mode = kwargs.get("quant_mode")
-        quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
+        x = int(normalized_query["m"])
+        quant_mode = common.GEMMQuantMode[str(normalized_query["gemm_type"])]
         is_fp8_static = quant_mode == common.GEMMQuantMode.fp8_static
         latency_floor = 0.0
 
@@ -927,6 +1108,11 @@ def load_gemm_data(gemm_file):
                 "latency": latency,
                 "power": power,  # Keep for reference
                 "energy": energy,  # NEW: precomputed energy
+                "_source": {
+                    "source_path": row.get("__aic_source_path", ""),
+                    "source_backend": row.get("__aic_source_backend", ""),
+                    "source_version": row.get("__aic_source_version", ""),
+                },
             }
 
     return gemm_data

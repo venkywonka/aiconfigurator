@@ -55,6 +55,10 @@ class ResolvedLazyAdapter:
         ):
             if actual != expected:
                 raise ValueError(f"request protocol {field_name}={actual!r} does not match adapter {expected!r}")
+        if protocol.statistic != "median":
+            raise ValueError(
+                f"request protocol statistic={protocol.statistic!r} is unsupported; adapters require 'median'"
+            )
 
         environment = request.environment
         if environment.backend != self.backend:

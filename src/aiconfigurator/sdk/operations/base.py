@@ -110,7 +110,14 @@ def _read_filtered_rows(file_or_sources):
         any_exists = True
         for row in _read_perf_rows(path):
             if ks_filter is None or row.get("kernel_source") in ks_filter:
-                rows.append(row)
+                rows.append(
+                    {
+                        **row,
+                        "__aic_source_path": path,
+                        "__aic_source_backend": os.path.basename(os.path.dirname(os.path.dirname(path))),
+                        "__aic_source_version": os.path.basename(os.path.dirname(path)),
+                    }
+                )
     return rows if any_exists else None
 
 

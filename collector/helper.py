@@ -32,6 +32,8 @@ from typing import Optional
 
 import numpy as np
 
+from aiconfigurator.collector.benchmark import benchmark_with_power as _benchmark_with_power
+
 # Exit codes
 EXIT_CODE_RESTART = 10  # Exit code to indicate restart is needed
 
@@ -175,7 +177,7 @@ class PowerMonitor:
 
 
 @contextmanager
-def benchmark_with_power(
+def _legacy_benchmark_with_power(
     device,
     kernel_func,
     num_warmups: int = 3,
@@ -382,6 +384,36 @@ def benchmark_with_power(
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+
+
+@contextmanager
+def benchmark_with_power(
+    device,
+    kernel_func,
+    num_warmups: int = 3,
+    num_runs: int = 6,
+    repeat_n: int = 1,
+    measure_power: bool | None = None,
+    power_min_duration: float | None = None,
+    allow_graph_fail: bool = False,
+    use_cuda_graph: bool = True,
+    return_samples: bool = False,
+):
+    """Compatibility delegate to the installable collector benchmark."""
+
+    with _benchmark_with_power(
+        device=device,
+        kernel_func=kernel_func,
+        num_warmups=num_warmups,
+        num_runs=num_runs,
+        repeat_n=repeat_n,
+        measure_power=measure_power,
+        power_min_duration=power_min_duration,
+        allow_graph_fail=allow_graph_fail,
+        use_cuda_graph=use_cuda_graph,
+        return_samples=return_samples,
+    ) as result:
+        yield result
 
 
 @contextmanager

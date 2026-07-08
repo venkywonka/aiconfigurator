@@ -21,6 +21,7 @@ from aiconfigurator.sdk.common import PerfDataFilename, parse_support_matrix_ver
 from aiconfigurator.sdk.errors import PerfDataNotAvailableError
 from aiconfigurator.sdk.interpolation import InterpolationDataNotAvailableError
 from aiconfigurator.sdk.performance_result import PerformanceResult
+from aiconfigurator.sdk.resolution.types import MeasurementEnvironment
 from aiconfigurator.sdk.system_spec import SystemSpec
 
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
@@ -1701,6 +1702,22 @@ class PerfDatabase:
     def _get_p2p_bandwidth(self, num_gpus: int) -> float:
         """Thin wrapper — delegates to ``SystemSpec.get_p2p_bandwidth``."""
         return self.system_spec.get_p2p_bandwidth(num_gpus)
+
+    def set_measurement_environment(self, environment: MeasurementEnvironment) -> None:
+        """Bind live hardware/software identity used only by explicit resolution."""
+
+        if not isinstance(environment, MeasurementEnvironment):
+            raise TypeError("environment must be a MeasurementEnvironment")
+        expected_route = (self.system, self.backend, self.version)
+        actual_route = (environment.system, environment.backend, environment.backend_version)
+        if actual_route != expected_route:
+            raise ValueError(
+                "measurement environment route does not match this database: "
+                f"expected={expected_route!r}, actual={actual_route!r}"
+            )
+        if not environment.topology_schema or not environment.topology_fingerprint:
+            raise ValueError("measurement environment requires topology schema and fingerprint")
+        self.measurement_environment = environment
 
     def set_default_database_mode(self, mode: common.DatabaseMode) -> None:
         """

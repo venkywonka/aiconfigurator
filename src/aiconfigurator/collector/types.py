@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar
 
 _Key = TypeVar("_Key")
 _Value = TypeVar("_Value")
@@ -77,6 +78,70 @@ class ResourceContract:
             raise TypeError("reserve_fabric_domain must be a bool")
         if self.gpu_count == 1 and self.fabric is not FabricRequirement.NONE:
             raise ValueError("single-GPU work cannot require a GPU fabric")
+
+
+@dataclass(frozen=True, slots=True)
+class RawMeasurement(Mapping[str, Any]):
+    """Side-effect-free runner result with a mapping-compatible wire surface."""
+
+    latency_ms: float
+    energy_wms: float
+    samples_ms: tuple[float, ...]
+    statistic: str
+    perf_row: Mapping[str, Any]
+    provenance: Mapping[str, Any]
+    protocol_digest: str | None = None
+    power_stats: Mapping[str, Any] | None = None
+
+    _FIELDS: ClassVar[tuple[str, ...]] = (
+        "latency_ms",
+        "energy_wms",
+        "samples_ms",
+        "statistic",
+        "perf_row",
+        "provenance",
+        "protocol_digest",
+        "power_stats",
+    )
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.latency_ms) or self.latency_ms <= 0:
+            raise ValueError("latency_ms must be positive and finite")
+        if not math.isfinite(self.energy_wms) or self.energy_wms < 0:
+            raise ValueError("energy_wms must be finite and non-negative")
+        samples = tuple(float(sample) for sample in self.samples_ms)
+        if not samples or any(not math.isfinite(sample) or sample <= 0 for sample in samples):
+            raise ValueError("samples_ms must contain positive finite values")
+        if not isinstance(self.statistic, str) or not self.statistic.strip():
+            raise ValueError("statistic must be a non-empty string")
+        if not isinstance(self.perf_row, Mapping):
+            raise TypeError("perf_row must be a mapping")
+        if not isinstance(self.provenance, Mapping):
+            raise TypeError("provenance must be a mapping")
+        if self.protocol_digest is not None and (
+            not isinstance(self.protocol_digest, str) or not self.protocol_digest.strip()
+        ):
+            raise ValueError("protocol_digest must be a non-empty string or None")
+        if self.power_stats is not None and not isinstance(self.power_stats, Mapping):
+            raise TypeError("power_stats must be a mapping or None")
+        object.__setattr__(self, "latency_ms", float(self.latency_ms))
+        object.__setattr__(self, "energy_wms", float(self.energy_wms))
+        object.__setattr__(self, "samples_ms", samples)
+        object.__setattr__(self, "perf_row", dict(self.perf_row))
+        object.__setattr__(self, "provenance", dict(self.provenance))
+        if self.power_stats is not None:
+            object.__setattr__(self, "power_stats", dict(self.power_stats))
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._FIELDS:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._FIELDS)
+
+    def __len__(self) -> int:
+        return 8
 
 
 @dataclass(frozen=True, slots=True)

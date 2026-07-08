@@ -196,11 +196,20 @@ class MeasurementEnvironment:
     profile_compatibility: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        for field_name in ("system", "backend", "backend_version", "gpu_class"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string")
+            if not value.strip():
+                raise ValueError(f"{field_name} must be non-empty")
         object.__setattr__(
             self,
             "runtime_versions",
             _immutable_json_mapping(self.runtime_versions, field_name="runtime_versions"),
         )
+        backend_runtime_version = self.runtime_versions.get(self.backend)
+        if backend_runtime_version is not None and backend_runtime_version != self.backend_version:
+            raise ValueError("runtime_versions backend entry must match backend_version")
         if self.profile_compatibility is not None:
             object.__setattr__(
                 self,
