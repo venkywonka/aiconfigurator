@@ -14,7 +14,7 @@ from aiconfigurator.sdk.operations.dsv4 import (
 )
 from aiconfigurator.sdk.operations.elementwise import ElementWise
 from aiconfigurator.sdk.operations.embedding import Embedding
-from aiconfigurator.sdk.operations.moe import MoEDispatch
+from aiconfigurator.sdk.operations.moe import MoEDispatch, _MoEDispatchResolutionDatabase
 from aiconfigurator.sdk.perf_database import PerformanceResult
 from aiconfigurator.sdk.resolution import MeasurementEnvironment, MeasurementProtocol, PerfKey
 from aiconfigurator.sdk.resolution.overlay import OverlayStore
@@ -223,6 +223,34 @@ def test_moe_dispatch_without_session_preserves_direct_database_query() -> None:
 
     assert float(result) == 1.25
     assert database.custom_allreduce_queries == [(common.CommQuantMode.half, 4, 32768)]
+
+
+class _RecordingResolutionSession:
+    def __init__(self) -> None:
+        self.missing: list[tuple[str, Exception]] = []
+        self.tainted: list[str] = []
+
+    def record_missing_adapter(self, operation: str, error: Exception) -> None:
+        self.missing.append((operation, error))
+
+    def mark_tainted(self, operation: str) -> None:
+        self.tainted.append(operation)
+
+
+def test_moe_dispatch_non_half_custom_allreduce_is_structured_before_provisional_query() -> None:
+    database = _MoEDatabase()
+    session = _RecordingResolutionSession()
+    proxy = _MoEDispatchResolutionDatabase(database, session, "dispatch")
+
+    result = proxy.query_custom_allreduce(common.CommQuantMode.fp8, 4, 1024)
+
+    operation = "dispatch.query_custom_allreduce"
+    assert float(result) == 1.25
+    assert database.custom_allreduce_queries == [(common.CommQuantMode.fp8, 4, 1024)]
+    assert [(name, str(error)) for name, error in session.missing] == [
+        (operation, "dispatch: resolving CustomAllReduce supports half, got CommQuantMode.fp8")
+    ]
+    assert session.tainted == [operation]
 
 
 class _UnsupportedMoEDatabase(_MoEDatabase):

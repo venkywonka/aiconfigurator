@@ -89,7 +89,11 @@ class _MoEDispatchResolutionDatabase:
         size: int,
     ) -> PerformanceResult:
         if quant_mode is not common.CommQuantMode.half:
-            raise RuntimeError(f"{self._consumer}: resolving CustomAllReduce supports half, got {quant_mode}")
+            operation = f"{self._consumer}.query_custom_allreduce"
+            error = RuntimeError(f"{self._consumer}: resolving CustomAllReduce supports half, got {quant_mode}")
+            self._session.record_missing_adapter(operation, error)
+            self._session.mark_tainted(operation)
+            return self._database.query_custom_allreduce(quant_mode, tp_size, size)
 
         from aiconfigurator.sdk.operations.communication import CustomAllReduce
 
