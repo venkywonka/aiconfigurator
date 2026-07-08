@@ -50,7 +50,14 @@ from aiconfigurator.sdk import common, interpolation
 from aiconfigurator.sdk.errors import PerfDataNotAvailableError
 from aiconfigurator.sdk.operations import util_empirical
 from aiconfigurator.sdk.operations.base import Operation, _read_filtered_rows
+from aiconfigurator.sdk.perf_namespace import perf_namespace
 from aiconfigurator.sdk.performance_result import PerformanceResult
+from aiconfigurator.sdk.resolution.types import (
+    MeasurementEnvironment,
+    MeasurementProtocol,
+    MeasurementRequest,
+    PerfKey,
+)
 
 if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
@@ -192,6 +199,22 @@ class MoE(Operation):
     _low_latency_data_cache: ClassVar[dict] = {}
     _wideep_context_data_cache: ClassVar[dict] = {}
     _wideep_generation_data_cache: ClassVar[dict] = {}
+    _V1_2_RUNTIME_VERSIONS: ClassVar[dict[str, str]] = {
+        "cuda": "13.0",
+        "model_profile": "dsv4-v1.2",
+        "sglang": "0.5.10",
+    }
+    _V1_2_PROFILE_COMPATIBILITY: ClassVar[dict[str, object]] = {
+        "model_artifact": "sgl-project/DeepSeek-V4-Flash-FP8",
+        "serving_mode": "aggregated",
+        "tp_size": 4,
+        "attention_dp_size": 1,
+        "cp_size": 1,
+        "pp_size": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 4,
+        "nextn": 0,
+    }
 
     def __init__(
         self,
@@ -234,6 +257,171 @@ class MoE(Operation):
             * num_gemms
             // self._moe_ep_size
             // self._moe_tp_size
+        )
+
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
+        """Normalize the phase-independent physical MoE compute identity."""
+
+        x = kwargs.get("x")
+        if isinstance(x, bool) or not isinstance(x, int):
+            raise TypeError("MoE token count must be a positive integer")
+        x *= self._attention_dp_size
+        if x <= 0:
+            raise ValueError("MoE token count must be a positive integer")
+        overwrite_quant_mode = kwargs.get("quant_mode")
+        quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
+        if not isinstance(quant_mode, common.MoEQuantMode):
+            raise TypeError("MoE quant_mode must be a MoEQuantMode")
+        return {
+            "num_tokens": x,
+            "hidden_size": self._hidden_size,
+            "inter_size": self._inter_size,
+            "topk": self._topk,
+            "num_experts": self._num_experts,
+            "moe_tp_size": self._moe_tp_size,
+            "moe_ep_size": self._moe_ep_size,
+            "quant_mode": quant_mode.name,
+            "workload_distribution": self._workload_distribution,
+        }
+
+    @staticmethod
+    def _measurement_environment(database: PerfDatabase) -> MeasurementEnvironment:
+        environment = getattr(database, "measurement_environment", None)
+        if environment is None:
+            gpu_spec = database.system_spec.get("gpu", {})
+            environment = MeasurementEnvironment(
+                system=database.system,
+                backend=database.backend,
+                backend_version=database.version,
+                gpu_class=str(gpu_spec.get("name", database.system)),
+                runtime_versions={database.backend: database.version},
+                topology_schema=getattr(database, "topology_schema", None),
+                topology_fingerprint=getattr(database, "topology_fingerprint", None),
+            )
+        if not isinstance(environment, MeasurementEnvironment):
+            raise TypeError("database measurement_environment must be a MeasurementEnvironment")
+        expected = (database.system, database.backend, database.version)
+        actual = (environment.system, environment.backend, environment.backend_version)
+        if actual != expected:
+            raise ValueError("database measurement environment does not match system/backend/version")
+        return environment
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._measurement_request_from_normalized(
+            database,
+            protocol,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        del kwargs
+        query = dict(normalized_query)
+        environment = self._measurement_environment(database)
+        return MeasurementRequest(
+            op_id=self._name,
+            key=PerfKey.build(perf_namespace("moe_perf.txt"), query, environment),
+            query=query,
+            environment=environment,
+            semantic_descriptor={
+                "workload_generator": "power_law_v3",
+                "seed": 0,
+                "rank_simulation": "single-gpu-ep4-rank0",
+            },
+            protocol=protocol,
+        )
+
+    def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._curated_exact_result_from_normalized(
+            database,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _is_v1_2_curated_compatible(self, database: PerfDatabase) -> bool:
+        environment = getattr(database, "measurement_environment", None)
+        return bool(
+            isinstance(environment, MeasurementEnvironment)
+            and environment.system == "gb200"
+            and environment.backend == "sglang"
+            and environment.backend_version == "0.5.10"
+            and " ".join(environment.gpu_class.split()).casefold() == "nvidia gb200"
+            and all(
+                environment.runtime_versions.get(name) == version
+                for name, version in self._V1_2_RUNTIME_VERSIONS.items()
+            )
+            and dict(environment.profile_compatibility or {}) == self._V1_2_PROFILE_COMPATIBILITY
+        )
+
+    def _curated_exact_result_from_normalized(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult | None:
+        del kwargs
+        if not self._is_v1_2_curated_compatible(database):
+            return None
+        try:
+            quant_mode = common.MoEQuantMode[str(normalized_query["quant_mode"])]
+            path = (
+                quant_mode,
+                str(normalized_query["workload_distribution"]),
+                int(normalized_query["topk"]),
+                int(normalized_query["num_experts"]),
+                int(normalized_query["hidden_size"]),
+                int(normalized_query["inter_size"]),
+                int(normalized_query["moe_tp_size"]),
+                int(normalized_query["moe_ep_size"]),
+                int(normalized_query["num_tokens"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        self.load_data(database)
+        wrapper = getattr(database, "_moe_data", None)
+        if wrapper is None:
+            return None
+        value: object = wrapper.data if hasattr(wrapper, "data") else wrapper
+        try:
+            for component in path:
+                if not isinstance(value, Mapping):
+                    return None
+                value = value[component]
+        except KeyError:
+            return None
+        if isinstance(value, Mapping):
+            try:
+                latency = float(value["latency"])
+                energy = float(value.get("energy", 0.0))
+            except (KeyError, TypeError, ValueError):
+                return None
+        else:
+            try:
+                latency = float(value)
+            except (TypeError, ValueError):
+                return None
+            energy = 0.0
+        return PerformanceResult(
+            latency=latency * self._scale_factor,
+            energy=energy * self._scale_factor,
+            source="curated_exact",
+            provenance={"curated_path": getattr(wrapper, "filepath", None)},
         )
 
     # ------------------------------------------------------------------
@@ -1009,21 +1197,36 @@ class MoE(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query MoE latency with energy data."""
-        # attention dp size will scale up the total input tokens.
-        x = kwargs.get("x") * self._attention_dp_size
-        overwrite_quant_mode = kwargs.get("quant_mode")
-        quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._query_from_normalized(database, normalized)
+
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        del kwargs
+        return self._query_from_normalized(database, normalized_query)
+
+    def _query_from_normalized(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
+        quant_mode = common.MoEQuantMode[str(normalized_query["quant_mode"])]
 
         result = database.query_moe(
-            num_tokens=x,
-            hidden_size=self._hidden_size,
-            inter_size=self._inter_size,
-            topk=self._topk,
-            num_experts=self._num_experts,
-            moe_tp_size=self._moe_tp_size,
-            moe_ep_size=self._moe_ep_size,
+            num_tokens=int(normalized_query["num_tokens"]),
+            hidden_size=int(normalized_query["hidden_size"]),
+            inter_size=int(normalized_query["inter_size"]),
+            topk=int(normalized_query["topk"]),
+            num_experts=int(normalized_query["num_experts"]),
+            moe_tp_size=int(normalized_query["moe_tp_size"]),
+            moe_ep_size=int(normalized_query["moe_ep_size"]),
             quant_mode=quant_mode,
-            workload_distribution=self._workload_distribution,
+            workload_distribution=str(normalized_query["workload_distribution"]),
             is_context=self._is_context,
             moe_backend=self._moe_backend,
             is_gated=self._is_gated,

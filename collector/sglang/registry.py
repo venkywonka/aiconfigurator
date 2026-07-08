@@ -15,6 +15,7 @@ from aiconfigurator.collector.sglang.registry import (
     DSV4_HCA_GENERATION_LAZY_SPEC,
     GEMM_LAZY_SPEC,
     MHC_LAZY_SPEC,
+    MOE_LAZY_SPEC,
 )
 from collector.registry_types import OpEntry, PerfFile
 
@@ -68,6 +69,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_moe_test_cases",
         run_func="run_moe_torch",
         perf_filename=PerfFile.MOE,
+        lazy=MOE_LAZY_SPEC,
     ),
     OpEntry(
         op="attention_context",

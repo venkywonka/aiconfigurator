@@ -21,6 +21,19 @@ MHC_LAZY_SPEC = LazyOpEntry(
     tuning_revision="sglang-mhc-v1",
 )
 
+MOE_LAZY_SPEC = LazyOpEntry(
+    namespace=perf_namespace(str(PerfFile.MOE)),
+    run_module="aiconfigurator.collector.sglang.moe",
+    run_func="run_moe_case",
+    adapter_module="aiconfigurator.collector.sglang.moe_adapter",
+    case_func="moe_request_to_case",
+    result_func="moe_result_to_record",
+    resource_func="moe_resource_for_request",
+    protocol_revision="cuda-event-samples-v1",
+    timer="cuda_event",
+    tuning_revision="sglang-moe-v1",
+)
+
 
 def _dsv4_attention_lazy_spec(perf_file: PerfFile) -> LazyOpEntry:
     return LazyOpEntry(
@@ -58,6 +71,14 @@ SGLANG_LAZY_REGISTRY = (
         run_func="run_mhc_case",
         perf_filename=PerfFile.MHC_MODULE,
         lazy=MHC_LAZY_SPEC,
+    ),
+    OpEntry(
+        op="moe",
+        module="aiconfigurator.collector.sglang.moe",
+        get_func="get_moe_test_cases",
+        run_func="run_moe_case",
+        perf_filename=PerfFile.MOE,
+        lazy=MOE_LAZY_SPEC,
     ),
     OpEntry(
         op="dsv4_csa_context_module",
@@ -100,5 +121,6 @@ __all__ = [
     "DSV4_HCA_GENERATION_LAZY_SPEC",
     "GEMM_LAZY_SPEC",
     "MHC_LAZY_SPEC",
+    "MOE_LAZY_SPEC",
     "SGLANG_LAZY_REGISTRY",
 ]
