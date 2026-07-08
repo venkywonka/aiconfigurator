@@ -284,10 +284,16 @@ class Operation:
             normalized_query=normalized_query,
             **kwargs,
         )
+        binding_error: Exception | None = None
         if request is not None:
-            record = session.lookup(request.key)
-            if record is not None:
-                return self.performance_from_record(record, **kwargs)
+            try:
+                request = session.bind_request(request)
+            except Exception as error:
+                binding_error = error
+            else:
+                record = session.lookup(request.key, request.protocol)
+                if record is not None:
+                    return self.performance_from_record(record, **kwargs)
 
         curated = self._curated_exact_result_from_normalized(
             exact_database,
@@ -297,11 +303,14 @@ class Operation:
         if curated is not None:
             return curated
 
-        if request is None:
-            session.record_missing_adapter(
-                self._name,
-                RuntimeError("operation has no literal exact row or lazy adapter for this query"),
-            )
+        if request is None or binding_error is not None:
+            if binding_error is not None:
+                session.record_binding_error(self._name, binding_error)
+            else:
+                session.record_missing_adapter(
+                    self._name,
+                    RuntimeError("operation has no literal exact row or lazy adapter for this query"),
+                )
         else:
             session.record_miss(request, self._name)
         session.mark_tainted(self._name)

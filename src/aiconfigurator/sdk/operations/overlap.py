@@ -138,10 +138,16 @@ class FallbackOp(Operation):
             normalized_query=normalized_query,
             **kwargs,
         )
+        binding_error: Exception | None = None
         if primary_request is not None:
-            record = session.lookup(primary_request.key)
-            if record is not None:
-                return self._primary.performance_from_record(record, **kwargs)
+            try:
+                primary_request = session.bind_request(primary_request)
+            except Exception as error:
+                binding_error = error
+            else:
+                record = session.lookup(primary_request.key, primary_request.protocol)
+                if record is not None:
+                    return self._primary.performance_from_record(record, **kwargs)
 
         primary_curated = self._primary._curated_exact_result_from_normalized(
             primary_database,
@@ -151,8 +157,17 @@ class FallbackOp(Operation):
         if primary_curated is not None:
             return primary_curated
 
-        if primary_request is not None:
+        if primary_request is not None and binding_error is None:
             session.record_miss(primary_request, self._primary._name)
+            session.mark_tainted(self._primary._name)
+            return self._primary.provisional_result(
+                database,
+                normalized_query=normalized_query,
+                **kwargs,
+            )
+
+        if binding_error is not None:
+            session.record_binding_error(self._primary._name, binding_error)
             session.mark_tainted(self._primary._name)
             return self._primary.provisional_result(
                 database,

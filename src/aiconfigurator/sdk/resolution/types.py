@@ -184,6 +184,10 @@ class MeasurementProtocol:
         return hashlib.sha256(self.canonical.encode("utf-8")).hexdigest()
 
 
+class ProtocolMismatchError(ValueError):
+    """A measurement request is incompatible with its resolved protocol."""
+
+
 @dataclass(frozen=True, slots=True)
 class MeasurementEnvironment:
     system: str

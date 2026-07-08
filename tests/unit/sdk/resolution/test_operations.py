@@ -5,11 +5,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from aiconfigurator.collector.adapters import ProtocolMismatchError
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.errors import PerfDataNotAvailableError
 from aiconfigurator.sdk.operations.base import Operation
@@ -114,6 +116,26 @@ class _Executor:
         batch = tuple(requests)
         self.request_batches.append(batch)
         return tuple(_record(request, *self.values.get(request.op_id, (1.0, 0.0))) for request in batch)
+
+
+class _BindingExecutor(_Executor):
+    def __init__(
+        self,
+        bound_protocol: MeasurementProtocol,
+        values: dict[str, tuple[float, float]] | None = None,
+        *,
+        binding_error: Exception | None = None,
+    ) -> None:
+        super().__init__(values)
+        self.bound_protocol = bound_protocol
+        self.binding_error = binding_error
+        self.binding_inputs: list[MeasurementRequest] = []
+
+    def bind_request(self, request: MeasurementRequest) -> MeasurementRequest:
+        self.binding_inputs.append(request)
+        if self.binding_error is not None:
+            raise self.binding_error
+        return replace(request, protocol=self.bound_protocol)
 
 
 class _TableOp(Operation):
@@ -420,6 +442,69 @@ def test_overlay_precedes_curated_and_scales_the_measurement(session_factory) ->
     assert executor.request_batches == []
     assert op.curated_calls == []
     assert op.query_calls == []
+
+
+def test_operation_binds_template_request_before_overlay_lookup_and_miss(session_factory) -> None:
+    template = _protocol()
+    bound_protocol = MeasurementProtocol(
+        revision="route-owned-v1",
+        warmups=template.warmups,
+        samples=template.samples,
+        statistic=template.statistic,
+        timer="route-owned-timer",
+        tuning_revision="route-owned-tuning-v1",
+    )
+    executor = _BindingExecutor(bound_protocol, {"bound": (0.25, 0.5)})
+    session = session_factory(executor, template)
+    op = _TableOp("bound")
+
+    result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=8))
+
+    assert float(result) == pytest.approx(0.25)
+    assert result.energy == pytest.approx(0.5)
+    assert result.source == "overlay"
+    assert [request.protocol for request in executor.binding_inputs] == [template, template]
+    assert len(executor.request_batches) == 1
+    dispatched = executor.request_batches[0][0]
+    assert dispatched.protocol == bound_protocol
+    assert session.overlay.lookup(dispatched.key, bound_protocol) is not None
+    assert session.overlay.lookup(dispatched.key, template) is None
+
+
+def test_literal_curated_hit_survives_route_binding_failure(session_factory) -> None:
+    template = _protocol()
+    expected = PerformanceResult(0.4, energy=0.7, source="curated_exact")
+    executor = _BindingExecutor(
+        template,
+        binding_error=RuntimeError("no lazy route for request"),
+    )
+    session = session_factory(executor, template)
+    op = _TableOp("literal", curated={4: expected})
+
+    result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=4))
+
+    assert result is expected
+    assert len(executor.binding_inputs) == 1
+    assert executor.binding_inputs[0].protocol == template
+    assert executor.request_batches == []
+    assert len(op.curated_calls) == 1
+
+
+def test_operation_classifies_route_protocol_binding_failure_as_identity_mismatch(session_factory) -> None:
+    template = _protocol()
+    executor = _BindingExecutor(
+        template,
+        binding_error=ProtocolMismatchError("request protocol does not match resolved lazy route"),
+    )
+    session = session_factory(executor, template)
+    op = _TableOp("protocol_mismatch")
+
+    with pytest.raises(ResolutionFailed) as failure:
+        session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=8))
+
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.IDENTITY_MISMATCH]
+    assert [reason.operation for reason in failure.value.reasons] == ["protocol_mismatch"]
+    assert executor.request_batches == []
 
 
 def test_literal_curated_result_is_final_and_never_rescaled(session_factory) -> None:

@@ -26,7 +26,10 @@ from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Any, Protocol
 
-from aiconfigurator.collector.adapters import PreparedMeasurement
+from aiconfigurator.collector.adapters import (
+    PreparedMeasurement,
+    bind_request_protocol,
+)
 from aiconfigurator.collector.scheduler import HardwareAwareScheduler, UnschedulableRequest
 from aiconfigurator.collector.types import Assignment, CollectionJob, HardwareInventory
 from aiconfigurator.sdk.resolution.session import CancellationToken
@@ -34,6 +37,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementProtocol,
     MeasurementRecord,
     MeasurementRequest,
+    ProtocolMismatchError,
     RecordStatus,
     UnresolvedCode,
     canonical_json,
@@ -853,6 +857,15 @@ class PersistentMeasurementExecutor:
         self._lock = threading.RLock()
         self._closed = False
 
+    def bind_request(self, request: MeasurementRequest) -> MeasurementRequest:
+        """Bind a request's sampling template to its resolved route metadata."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("measurement executor is closed")
+            adapter = self._resolve_adapter(request)
+            return bind_request_protocol(request, adapter.lazy)
+
     def execute(
         self,
         requests: Sequence[MeasurementRequest],
@@ -952,6 +965,9 @@ class PersistentMeasurementExecutor:
                 continue
             try:
                 prepared = adapter.prepare(request)
+            except ProtocolMismatchError as error:
+                records[index] = self._failure(request, UnresolvedCode.IDENTITY_MISMATCH, str(error))
+                continue
             except ValueError as error:
                 records[index] = self._failure(request, UnresolvedCode.UNSUPPORTED_SHAPE, str(error))
                 continue

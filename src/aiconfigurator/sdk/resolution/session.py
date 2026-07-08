@@ -17,6 +17,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementRecord,
     MeasurementRequest,
     PerfKey,
+    ProtocolMismatchError,
     RecordStatus,
     ResolutionPolicy,
     UnresolvedCode,
@@ -176,19 +177,46 @@ class ResolutionSession:
         self._negative: dict[PerfKey, UnresolvedReason] = {}
         self._transient_attempts: dict[PerfKey, int] = {}
 
-    def lookup(self, key: PerfKey) -> MeasurementRecord | None:
-        record = self.overlay.lookup(key, self.protocol)
+    def bind_request(self, request: MeasurementRequest) -> MeasurementRequest:
+        """Apply executor-owned route identity while preserving sampling policy."""
+
+        binder = getattr(self.executor, "bind_request", None)
+        if binder is None:
+            return request
+        bound = binder(request)
+        if not isinstance(bound, MeasurementRequest):
+            raise TypeError("executor request binder must return MeasurementRequest")
+        if bound.key != request.key or bound.query != request.query or bound.environment != request.environment:
+            raise ProtocolMismatchError("executor request binder changed physical request identity")
+        if (
+            bound.protocol.warmups != request.protocol.warmups
+            or bound.protocol.samples != request.protocol.samples
+            or bound.protocol.statistic != request.protocol.statistic
+        ):
+            raise ProtocolMismatchError("executor request binder changed session sampling policy")
+        return bound
+
+    def lookup(
+        self,
+        key: PerfKey,
+        protocol: MeasurementProtocol | None = None,
+    ) -> MeasurementRecord | None:
+        record = self.overlay.lookup(key, protocol or self.protocol)
         if record is not None:
             self.report.overlay_hits += 1
         return record
 
     def record_miss(self, request: MeasurementRequest, consumer: str) -> None:
-        if request.protocol != self.protocol:
+        if (
+            request.protocol.warmups != self.protocol.warmups
+            or request.protocol.samples != self.protocol.samples
+            or request.protocol.statistic != self.protocol.statistic
+        ):
             self.record_unresolved(
                 UnresolvedReason(
                     UnresolvedCode.IDENTITY_MISMATCH,
                     consumer,
-                    "request protocol does not match resolution session",
+                    "request sampling policy does not match resolution session",
                 )
             )
             return
@@ -210,6 +238,14 @@ class ResolutionSession:
 
     def record_missing_adapter(self, operation: str, error: Exception) -> None:
         self.record_unresolved(UnresolvedReason(UnresolvedCode.MISSING_ADAPTER, operation, str(error)))
+
+    def record_binding_error(self, operation: str, error: Exception) -> None:
+        code = (
+            UnresolvedCode.IDENTITY_MISMATCH
+            if isinstance(error, ProtocolMismatchError)
+            else UnresolvedCode.MISSING_ADAPTER
+        )
+        self.record_unresolved(UnresolvedReason(code, operation, str(error)))
 
     def record_unresolved(self, reason: UnresolvedReason) -> None:
         self._unresolved.append(reason)
@@ -257,7 +293,7 @@ class ResolutionSession:
         newly_observed = {request.key for request in discovered} - self._observed_miss_keys
         self.report.unique_misses += len(newly_observed)
         self._observed_miss_keys.update(newly_observed)
-        requests = tuple(request for request in discovered if self.lookup(request.key) is None)
+        requests = tuple(request for request in discovered if self.lookup(request.key, request.protocol) is None)
         if not requests:
             return
 

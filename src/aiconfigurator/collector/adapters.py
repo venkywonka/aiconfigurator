@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Any
 
@@ -18,6 +18,7 @@ from aiconfigurator.collector.version_resolver import resolve_module
 from aiconfigurator.sdk.resolution.types import (
     MeasurementRecord,
     MeasurementRequest,
+    ProtocolMismatchError,
     RecordStatus,
 )
 
@@ -29,6 +30,26 @@ class PreparedMeasurement:
     request: MeasurementRequest
     case: Mapping[str, Any]
     contract: ResourceContract
+
+
+def bind_request_protocol(request: MeasurementRequest, lazy: LazyOpEntry) -> MeasurementRequest:
+    """Combine session-owned sampling policy with route-owned protocol identity."""
+
+    if not isinstance(request, MeasurementRequest):
+        raise TypeError("request must be a MeasurementRequest")
+    if not isinstance(lazy, LazyOpEntry):
+        raise TypeError("lazy must be a LazyOpEntry")
+    if request.protocol.statistic != "median":
+        raise ProtocolMismatchError(
+            f"request protocol statistic={request.protocol.statistic!r} is unsupported; adapters require 'median'"
+        )
+    protocol = replace(
+        request.protocol,
+        revision=lazy.protocol_revision,
+        timer=lazy.timer,
+        tuning_revision=lazy.tuning_revision,
+    )
+    return replace(request, protocol=protocol)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +75,11 @@ class ResolvedLazyAdapter:
             ("tuning_revision", protocol.tuning_revision, self.lazy.tuning_revision),
         ):
             if actual != expected:
-                raise ValueError(f"request protocol {field_name}={actual!r} does not match adapter {expected!r}")
+                raise ProtocolMismatchError(
+                    f"request protocol {field_name}={actual!r} does not match adapter {expected!r}"
+                )
         if protocol.statistic != "median":
-            raise ValueError(
+            raise ProtocolMismatchError(
                 f"request protocol statistic={protocol.statistic!r} is unsupported; adapters require 'median'"
             )
 
