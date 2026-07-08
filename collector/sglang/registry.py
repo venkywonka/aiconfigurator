@@ -8,6 +8,7 @@ No version forks exist yet. When SGLang API changes require a fork,
 add a ``versions`` tuple following the trtllm registry pattern.
 """
 
+from aiconfigurator.collector.sglang.registry import GEMM_LAZY_SPEC
 from collector.registry_types import OpEntry, PerfFile
 
 REGISTRY: list[OpEntry] = [
@@ -17,6 +18,7 @@ REGISTRY: list[OpEntry] = [
         get_func="get_gemm_test_cases",
         run_func="run_gemm",
         perf_filename=PerfFile.GEMM,
+        lazy=GEMM_LAZY_SPEC,
     ),
     OpEntry(
         op="compute_scale",

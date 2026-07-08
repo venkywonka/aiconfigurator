@@ -24,12 +24,14 @@ _LIGHTWEIGHT_MODULES = (
     "aiconfigurator.collector.trtllm.registry",
     "aiconfigurator.collector.trtllm.gemm_adapter",
     "aiconfigurator.collector.trtllm.gemm",
+    "aiconfigurator.collector.sglang.registry",
     "aiconfigurator.collector.network.registry",
     "aiconfigurator.collector.network.nccl_adapter",
     "aiconfigurator.collector.network.nccl",
 )
 _PACKAGED_REGISTRIES = (
     ("aiconfigurator.collector.trtllm.registry", "TRTLLM_LAZY_REGISTRY"),
+    ("aiconfigurator.collector.sglang.registry", "SGLANG_LAZY_REGISTRY"),
     ("aiconfigurator.collector.network.registry", "NETWORK_LAZY_REGISTRY"),
 )
 
@@ -58,6 +60,16 @@ def test_packaged_modules_import_from_src_only_without_heavy_or_legacy_dependenc
         sys.meta_path.insert(0, BlockedDependency())
         for module_name in {_LIGHTWEIGHT_MODULES!r}:
             importlib.import_module(module_name)
+
+        from aiconfigurator.collector.adapters import LazyAdapterIndex
+        from aiconfigurator.collector.sglang.registry import SGLANG_LAZY_REGISTRY
+        from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
+
+        routes = LazyAdapterIndex.from_registries({{"sglang": SGLANG_LAZY_REGISTRY}}).routes_for(
+            (GEMM_LAZY_SPEC.namespace, "sglang", "0.5.10")
+        )
+        assert len(routes) == 1
+        assert routes[0].collector_module == "aiconfigurator.collector.trtllm.gemm"
 
         loaded = sorted(
             name for name in sys.modules if name.partition(".")[0] in blocked_roots
@@ -107,6 +119,29 @@ def test_source_trtllm_registry_reuses_packaged_gemm_spec_by_identity() -> None:
     source_gemm = next(entry for entry in source_registry.REGISTRY if entry.op == "gemm")
 
     assert source_gemm.lazy is packaged_registry.GEMM_LAZY_SPEC
+
+
+def test_source_sglang_registry_reuses_packaged_gemm_spec_by_identity() -> None:
+    packaged_registry = importlib.import_module("aiconfigurator.collector.sglang.registry")
+    source_registry = importlib.import_module("collector.sglang.registry")
+
+    source_gemm = next(entry for entry in source_registry.REGISTRY if entry.op == "gemm")
+
+    assert source_gemm.lazy is packaged_registry.GEMM_LAZY_SPEC
+
+
+def test_packaged_sglang_registry_resolves_the_frozen_gemm_route() -> None:
+    from aiconfigurator.collector.adapters import LazyAdapterIndex
+    from aiconfigurator.collector.sglang.registry import SGLANG_LAZY_REGISTRY
+    from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
+
+    routes = LazyAdapterIndex.from_registries({"sglang": SGLANG_LAZY_REGISTRY}).routes_for(
+        (GEMM_LAZY_SPEC.namespace, "sglang", "0.5.10")
+    )
+
+    assert len(routes) == 1
+    assert routes[0].collector_module == "aiconfigurator.collector.trtllm.gemm"
+    assert routes[0].lazy is GEMM_LAZY_SPEC
 
 
 def test_raw_measurement_mapping_survives_pickle_round_trip() -> None:
