@@ -514,6 +514,13 @@ class PersistentNcclRankGroup:
                 process.terminate()
         for process in self._processes:
             process.join(self._shutdown_timeout_seconds)
+        survivors = [process for process in self._processes if process.is_alive()]
+        for process in survivors:
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+        for process in survivors:
+            process.join(self._shutdown_timeout_seconds)
         self._cleanup(forced=True)
 
     def close(self) -> None:

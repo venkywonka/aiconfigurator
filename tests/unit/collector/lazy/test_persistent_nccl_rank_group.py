@@ -73,21 +73,36 @@ class _Process:
     target: object
     args: tuple[object, ...]
     daemon: bool
+    rank: int
+    event_log: list[tuple[str, int]]
     start_calls: int = 0
     join_calls: int = 0
+    join_timeouts: list[float | None] = field(default_factory=list)
     terminate_calls: int = 0
+    kill_calls: int = 0
     alive: bool = True
+    finish_on_join: bool = True
+    finish_on_terminate: bool = True
 
     def start(self) -> None:
         self.start_calls += 1
 
     def join(self, timeout: float | None = None) -> None:
-        del timeout
+        self.event_log.append(("join", self.rank))
         self.join_calls += 1
-        self.alive = False
+        self.join_timeouts.append(timeout)
+        if self.finish_on_join:
+            self.alive = False
 
     def terminate(self) -> None:
+        self.event_log.append(("terminate", self.rank))
         self.terminate_calls += 1
+        if self.finish_on_terminate:
+            self.alive = False
+
+    def kill(self) -> None:
+        self.event_log.append(("kill", self.rank))
+        self.kill_calls += 1
         self.alive = False
 
     def is_alive(self) -> bool:
@@ -98,6 +113,7 @@ class _SpawnContext:
     def __init__(self) -> None:
         self.queues: list[_Queue] = []
         self.processes: list[_Process] = []
+        self.process_events: list[tuple[str, int]] = []
 
     def Queue(self) -> _Queue:  # noqa: N802 - mirrors multiprocessing
         queue = _Queue()
@@ -111,7 +127,13 @@ class _SpawnContext:
         args: tuple[object, ...],
         daemon: bool,
     ) -> _Process:
-        process = _Process(target=target, args=args, daemon=daemon)
+        process = _Process(
+            target=target,
+            args=args,
+            daemon=daemon,
+            rank=len(self.processes),
+            event_log=self.process_events,
+        )
         self.processes.append(process)
         return process
 
@@ -329,3 +351,50 @@ def test_rank_failure_poison_terminates_all_ranks_without_waiting_or_barrier() -
     assert backend.abort_calls == 1
     assert backend.destroy_calls == 0
     assert backend.barrier_calls == 0
+
+
+def test_rank_failure_poison_kills_survivors_after_bounded_whole_group_join() -> None:
+    api = _api()
+    context = _SpawnContext()
+    shutdown_timeout_seconds = 0.25
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+        shutdown_timeout_seconds=shutdown_timeout_seconds,
+    )
+    command_queues, reply_queue = _rank_queues(context)
+    for process in context.processes:
+        process.finish_on_join = False
+        process.finish_on_terminate = False
+
+    def failed_reply() -> object:
+        command = command_queues[0].puts[-1]
+        return api.NcclRankReply(
+            invocation_id=command.invocation_id,
+            rank=1,
+            error="rank 1 crashed",
+        )
+
+    reply_queue.get_factory = failed_reply
+
+    with pytest.raises(RuntimeError, match="rank 1 crashed"):
+        group.measure("half", "alltoall", 2048)
+
+    assert context.process_events == [
+        ("terminate", 0),
+        ("terminate", 1),
+        ("join", 0),
+        ("join", 1),
+        ("kill", 0),
+        ("kill", 1),
+        ("join", 0),
+        ("join", 1),
+    ]
+    assert [process.join_timeouts for process in context.processes] == [
+        [shutdown_timeout_seconds, shutdown_timeout_seconds],
+        [shutdown_timeout_seconds, shutdown_timeout_seconds],
+    ]
+    assert [process.kill_calls for process in context.processes] == [1, 1]
+    assert not any(process.is_alive() for process in context.processes)
