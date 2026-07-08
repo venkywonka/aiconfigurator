@@ -11,10 +11,10 @@
 aggregated SGLang DeepSeek-V4 profile while keeping pure prediction unchanged
 and keeping every resolver/runtime primitive model-agnostic.
 
-**Current baseline:** Hardware discovery is committed as `badd73c5`. The
-generic deterministic wave scheduler is the active milestone. The completed
-lazy-resolution core remains the substrate; V1.2-covered operations will
-converge their lookup and request construction onto one normalization path.
+**Current baseline:** Hardware discovery and deterministic scheduling are
+committed as `badd73c5` and `c7b2f010`. Actual-query/key convergence is
+committed as `fdce626b`; adapter/executor runtime and frozen-profile one-GPU
+coverage are the active milestone.
 
 ## Scope reconciliation
 
@@ -87,10 +87,14 @@ convergence so they consume the final identity and capability contracts.
 - [x] Pin the exact frozen-profile shape: a four-GPU NVLink collective owns the
   whole domain and cannot co-run with any one-GPU job; independent one-GPU jobs
   pack together.
-- [ ] Run the focused, lazy-collector, and complete collector suites; then use
+- [x] Run the focused, lazy-collector, and complete collector suites; then use
   one milestone Council and commit the exact reviewed patch.
 
 ## Milestone 1: Actual-query trace and key convergence
+
+Completed as `fdce626b` after strict TDD and one unanimous four-provider
+milestone Council. The reviewed eleven-file binary patch SHA-256 is
+`b74a96a96f43fad2d017899ea30529e9a51b7a5906dc42b459526bc070c2fab1`.
 
 ### 1A. Pin one normalization path
 
@@ -126,6 +130,25 @@ topology, and protocol/timer/tuning compatibility. Runtime tracing remains
 authoritative for the exact shape-local dependency set.
 
 ## Milestone 2: Adapter/executor runtime and frozen-profile one-GPU adapters
+
+### 2A0. Close source-contract seams before GPU work
+
+Write RED tests and land the smallest generic seams before building adapters or
+launching workers:
+
+- include model/profile artifact compatibility in `MeasurementEnvironment`
+  only for persisted module datasets whose schema cannot distinguish artifacts;
+- execute deterministic classifications without adapter lookup or GPU work,
+  including Embedding, ElementWise, and PP1 P2P;
+- route MoEDispatch's direct CustomAllReduce lookup through one physical
+  measured-leaf resolution seam so pre/post consumer semantics still dedupe to
+  one `PerfKey`;
+- make CSA curated and overlay records use the same top-k calibration boundary;
+  a raw full-module runner must not silently bypass the subtraction applied by
+  the ordinary query path.
+
+These seams remain model-agnostic at the resolver/preflight layer. Profile
+knowledge belongs in operation-local normalization and packaged adapters.
 
 ### 2A. Adapter reverse lookup
 
@@ -174,7 +197,8 @@ PerfKey -> case -> record -> identical PerfKey round-trip tests:
 |---|---|---|
 | GEMM | BF16 and `fp8_block` profile shapes | one GPU |
 | DeepSeekV4MHCModule | BF16 pre/post full-module keys | one GPU |
-| DSv4 CSA/HCA context/generation | four full-module namespaces, TP4 simulation, FP8 KV | one GPU |
+| DSv4 HCA context/generation | two full-module namespaces, TP4 simulation, FP8 KV | one GPU |
+| DSv4 CSA context/generation | two full-module namespaces, TP4 simulation, FP8 KV, curated/overlay calibration parity | one GPU |
 | MoE | `fp8_block`, TP1/EP4, `power_law_1.01` synthetic local-rank runner | one GPU |
 
 Embedding and ElementWise remain explicitly reviewed deterministic operations.
