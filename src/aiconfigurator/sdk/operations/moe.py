@@ -77,10 +77,16 @@ class _MoEDispatchResolutionDatabase:
                 )
                 self._session.record_missing_adapter(operation, error)
                 self._session.mark_tainted(operation)
-                return getattr(self._database, name)(*args, **kwargs)
+                return self._provisional_query(name, *args, **kwargs)
 
             return unsupported_child
         return getattr(self._database, name)
+
+    def _provisional_query(self, name: str, *args, **kwargs) -> PerformanceResult:
+        try:
+            return getattr(self._database, name)(*args, **kwargs)
+        except Exception:
+            return PerformanceResult(0.0, energy=0.0, source="unresolved")
 
     def query_custom_allreduce(
         self,
@@ -93,7 +99,7 @@ class _MoEDispatchResolutionDatabase:
             error = RuntimeError(f"{self._consumer}: resolving CustomAllReduce supports half, got {quant_mode}")
             self._session.record_missing_adapter(operation, error)
             self._session.mark_tainted(operation)
-            return self._database.query_custom_allreduce(quant_mode, tp_size, size)
+            return self._provisional_query("query_custom_allreduce", quant_mode, tp_size, size)
 
         from aiconfigurator.sdk.operations.communication import CustomAllReduce
 

@@ -311,6 +311,43 @@ def test_moe_dispatch_unsupported_selected_child_is_structured(tmp_path) -> None
     ]
 
 
+def test_moe_dispatch_throwing_provisional_child_remains_structured(tmp_path) -> None:
+    class _ThrowingDatabase(_UnsupportedMoEDatabase):
+        def query_nccl(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("legacy nccl exploded")
+
+    operation = MoEDispatch(
+        name="throwing_outside_profile",
+        scale_factor=1.0,
+        hidden_size=4096,
+        topk=8,
+        num_experts=256,
+        moe_tp_size=1,
+        moe_ep_size=4,
+        attention_dp_size=2,
+        pre_dispatch=True,
+        moe_backend=None,
+        is_context=True,
+        quant_mode=common.MoEQuantMode.fp8_block,
+    )
+    overlay = OverlayStore(tmp_path / "throwing-unsupported.sqlite")
+    session = ResolutionSession(
+        overlay,
+        _NoMeasurementExecutor(),
+        ResolutionBudget(max_new_keys=4, max_wall_seconds=5.0),
+        _protocol(),
+    )
+
+    try:
+        with pytest.raises(ResolutionFailed) as raised:
+            session.execute_callback(lambda: operation.query_with_resolution(_ThrowingDatabase(), session=session, x=8))
+    finally:
+        overlay.close()
+
+    assert {reason.code for reason in raised.value.reasons} == {UnresolvedCode.MISSING_ADAPTER}
+
+
 class _DSv4Database:
     system = "gb200"
     backend = "sglang"
