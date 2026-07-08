@@ -142,6 +142,11 @@ class Operation:
     # instrumentation or leaf-specific behavior) does not imply ownership.
     _OWNS_RESOLUTION_WALK: ClassVar[bool] = False
 
+    # Explicitly reviewed analytical operations bypass exact evidence lookup in
+    # resolving mode. Shape-dependent operations override
+    # ``is_resolution_deterministic`` instead of setting this class capability.
+    _RESOLUTION_DETERMINISTIC: ClassVar[bool] = False
+
     def __init__(self, name: str, scale_factor: float, *, seq_split: int = 1) -> None:
         if seq_split > 1 and not self._CP_AWARE:
             raise NotImplementedError(
@@ -168,6 +173,11 @@ class Operation:
         identity default preserves existing operations during migration.
         """
         return dict(kwargs)
+
+    def is_resolution_deterministic(self, **kwargs: object) -> bool:
+        """Whether this exact invocation is a reviewed analytical result."""
+        del kwargs
+        return self._RESOLUTION_DETERMINISTIC
 
     def _normalize_for_resolution(self, **kwargs: object) -> Mapping[str, object]:
         normalized_query = self.normalize_perf_query(**kwargs)
@@ -249,7 +259,7 @@ class Operation:
         **kwargs,
     ) -> PerformanceResult:
         """Query exact evidence and record a lazy miss when a session is supplied."""
-        if session is None:
+        if session is None or self.is_resolution_deterministic(**kwargs):
             return self.query(database, **kwargs)
 
         from aiconfigurator.sdk import common

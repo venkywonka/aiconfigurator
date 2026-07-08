@@ -27,6 +27,7 @@ class Embedding(Operation):
     """
 
     _CP_AWARE = True  # query divides x (token count) by self._seq_split
+    _RESOLUTION_DETERMINISTIC = True
 
     def __init__(
         self,

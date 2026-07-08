@@ -1233,10 +1233,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             if compress_ratio == 4 and _TOPK_CORRECTION_ENABLED:
                 calib = _get_dsv4_topk_calib(database)
                 delta = _dsv4_topk_delta_ms(calib, int(prefix), int(s), int(b))
-                corrected_latency = max(0.0, latency - delta)
-                if latency > 0.0 and energy:
-                    energy *= corrected_latency / latency
-                latency = corrected_latency
+                latency, energy = _apply_dsv4_topk_calibration(latency, energy, delta)
             return database._interp_pr(latency, energy=energy)
 
         return database._query_silicon_or_hybrid(
@@ -1594,10 +1591,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 calib = _get_dsv4_topk_calib(database)
                 decode_prefix = max(int(s) - 1, 0)
                 delta = _dsv4_topk_delta_ms(calib, decode_prefix, 1, int(b))
-                corrected_latency = max(0.0, latency - delta)
-                if latency > 0.0 and energy:
-                    energy *= corrected_latency / latency
-                latency = corrected_latency
+                latency, energy = _apply_dsv4_topk_calibration(latency, energy, delta)
             return database._interp_pr(latency, energy=energy)
 
         return database._query_silicon_or_hybrid(
@@ -1956,6 +1950,19 @@ def _dsv4_normalize_dtype(name: str) -> str:
 # Gate: AIC_DSV4_TOPK_CORRECTION (default on; set "0" to disable).
 # ───────────────────────────────────────────────────────────────────────
 _TOPK_CORRECTION_ENABLED = os.environ.get("AIC_DSV4_TOPK_CORRECTION", "1") != "0"
+
+
+def _apply_dsv4_topk_calibration(
+    latency_ms: float,
+    energy_wms: float,
+    delta_ms: float,
+) -> tuple[float, float]:
+    """Apply the existing CSA top-k delta to one raw module measurement."""
+    corrected_latency = max(0.0, float(latency_ms) - max(0.0, float(delta_ms)))
+    corrected_energy = float(energy_wms)
+    if latency_ms > 0.0 and corrected_energy:
+        corrected_energy *= corrected_latency / float(latency_ms)
+    return corrected_latency, corrected_energy
 
 
 def _build_topk_calib_from_rows(by_mode):

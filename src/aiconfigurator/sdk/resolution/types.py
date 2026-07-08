@@ -193,6 +193,7 @@ class MeasurementEnvironment:
     runtime_versions: Mapping[str, str]
     topology_schema: str | None = None
     topology_fingerprint: str | None = None
+    profile_compatibility: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -200,20 +201,30 @@ class MeasurementEnvironment:
             "runtime_versions",
             _immutable_json_mapping(self.runtime_versions, field_name="runtime_versions"),
         )
+        if self.profile_compatibility is not None:
+            object.__setattr__(
+                self,
+                "profile_compatibility",
+                _immutable_json_mapping(
+                    self.profile_compatibility,
+                    field_name="profile_compatibility",
+                ),
+            )
 
     @property
     def canonical(self) -> str:
-        return canonical_json(
-            {
-                "system": self.system,
-                "backend": self.backend,
-                "backend_version": self.backend_version,
-                "gpu_class": self.gpu_class,
-                "runtime_versions": self.runtime_versions,
-                "topology_schema": self.topology_schema,
-                "topology_fingerprint": self.topology_fingerprint,
-            }
-        )
+        identity = {
+            "system": self.system,
+            "backend": self.backend,
+            "backend_version": self.backend_version,
+            "gpu_class": self.gpu_class,
+            "runtime_versions": self.runtime_versions,
+            "topology_schema": self.topology_schema,
+            "topology_fingerprint": self.topology_fingerprint,
+        }
+        if self.profile_compatibility is not None:
+            identity["profile_compatibility"] = self.profile_compatibility
+        return canonical_json(identity)
 
 
 @dataclass(frozen=True, slots=True)

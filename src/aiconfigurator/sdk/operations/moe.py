@@ -59,6 +59,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _MoEDispatchResolutionDatabase:
+    """Trace direct physical database leaves selected by ``MoEDispatch``."""
+
+    def __init__(self, database: PerfDatabase, session: object, consumer: str) -> None:
+        self._database = database
+        self._session = session
+        self._consumer = consumer
+
+    def __getattr__(self, name: str):
+        if name.startswith("query_"):
+            raise RuntimeError(f"{self._consumer}: resolving MoEDispatch selected unsupported physical child {name}")
+        return getattr(self._database, name)
+
+    def query_custom_allreduce(
+        self,
+        quant_mode: common.CommQuantMode,
+        tp_size: int,
+        size: int,
+    ) -> PerformanceResult:
+        if quant_mode is not common.CommQuantMode.half:
+            raise RuntimeError(f"{self._consumer}: resolving CustomAllReduce supports half, got {quant_mode}")
+
+        from aiconfigurator.sdk.operations.communication import CustomAllReduce
+
+        child = CustomAllReduce(
+            f"{self._consumer}.custom_allreduce",
+            1.0,
+            h=1,
+            tp_size=tp_size,
+        )
+        return child.query_with_resolution(
+            self._database,
+            session=self._session,
+            x=size,
+        )
+
+
 def _cache_key(database: PerfDatabase) -> tuple:
     """Shared cache key — same shape as every other migrated op family."""
     return (
@@ -1001,6 +1038,7 @@ class MoEDispatch(Operation):
 
     _normal_data_cache: ClassVar[dict] = {}
     _ll_data_cache: ClassVar[dict] = {}
+    _OWNS_RESOLUTION_WALK: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1460,6 +1498,18 @@ class MoEDispatch(Operation):
             energy=getattr(scaled, "energy", 0.0),
             source=getattr(scaled, "source", "empirical"),
         )
+
+    def query_with_resolution(
+        self,
+        database: PerfDatabase,
+        *,
+        session=None,
+        **kwargs,
+    ) -> PerformanceResult:
+        if session is None:
+            return self.query(database, **kwargs)
+        traced_database = _MoEDispatchResolutionDatabase(database, session, self._name)
+        return self.query(traced_database, **kwargs)
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor

@@ -540,6 +540,11 @@ class P2P(Operation):
 
     _CP_AWARE: ClassVar[bool] = True  # query divides x by self._seq_split (smaller per-rank payload)
 
+    def is_resolution_deterministic(self, **kwargs: object) -> bool:
+        """PP1 is the frozen profile's reviewed deterministic no-op."""
+        del kwargs
+        return self._pp_size == 1
+
     def __init__(self, name: str, scale_factor: float, h: int, pp_size: int, *, seq_split: int = 1) -> None:
         super().__init__(name, scale_factor, seq_split=seq_split)
         self._h = h
