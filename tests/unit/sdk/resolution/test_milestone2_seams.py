@@ -17,6 +17,13 @@ from aiconfigurator.sdk.operations.embedding import Embedding
 from aiconfigurator.sdk.operations.moe import MoEDispatch
 from aiconfigurator.sdk.perf_database import PerformanceResult
 from aiconfigurator.sdk.resolution import MeasurementEnvironment, MeasurementProtocol, PerfKey
+from aiconfigurator.sdk.resolution.overlay import OverlayStore
+from aiconfigurator.sdk.resolution.session import (
+    ResolutionBudget,
+    ResolutionFailed,
+    ResolutionSession,
+)
+from aiconfigurator.sdk.resolution.types import UnresolvedCode
 
 pytestmark = pytest.mark.unit
 
@@ -216,6 +223,64 @@ def test_moe_dispatch_without_session_preserves_direct_database_query() -> None:
 
     assert float(result) == 1.25
     assert database.custom_allreduce_queries == [(common.CommQuantMode.half, 4, 32768)]
+
+
+class _UnsupportedMoEDatabase(_MoEDatabase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.nccl_queries: list[tuple[common.CommQuantMode, int, str, int]] = []
+
+    def query_nccl(
+        self,
+        quant_mode: common.CommQuantMode,
+        num_gpus: int,
+        operation: str,
+        size: int,
+    ) -> PerformanceResult:
+        self.nccl_queries.append((quant_mode, num_gpus, operation, size))
+        return PerformanceResult(2.0, energy=0.0, source="silicon")
+
+
+class _NoMeasurementExecutor:
+    def execute(self, *args, **kwargs):
+        raise AssertionError(f"unsupported composition reached measurement executor: {args}, {kwargs}")
+
+
+def test_moe_dispatch_unsupported_selected_child_is_structured(tmp_path) -> None:
+    database = _UnsupportedMoEDatabase()
+    operation = MoEDispatch(
+        name="outside_frozen_profile",
+        scale_factor=1.0,
+        hidden_size=4096,
+        topk=8,
+        num_experts=256,
+        moe_tp_size=1,
+        moe_ep_size=4,
+        attention_dp_size=2,
+        pre_dispatch=True,
+        moe_backend=None,
+        is_context=True,
+        quant_mode=common.MoEQuantMode.fp8_block,
+    )
+    overlay = OverlayStore(tmp_path / "unsupported.sqlite")
+    session = ResolutionSession(
+        overlay,
+        _NoMeasurementExecutor(),
+        ResolutionBudget(max_new_keys=4, max_wall_seconds=5.0),
+        _protocol(),
+    )
+
+    try:
+        with pytest.raises(ResolutionFailed) as raised:
+            session.execute_callback(lambda: operation.query_with_resolution(database, session=session, x=8))
+    finally:
+        overlay.close()
+
+    assert {reason.code for reason in raised.value.reasons} == {UnresolvedCode.MISSING_ADAPTER}
+    assert database.nccl_queries == [
+        (common.CommQuantMode.half, 2, "reduce_scatter", 32768),
+        (common.CommQuantMode.half, 4, "all_gather", 65536),
+    ]
 
 
 class _DSv4Database:

@@ -69,7 +69,17 @@ class _MoEDispatchResolutionDatabase:
 
     def __getattr__(self, name: str):
         if name.startswith("query_"):
-            raise RuntimeError(f"{self._consumer}: resolving MoEDispatch selected unsupported physical child {name}")
+            operation = f"{self._consumer}.{name}"
+
+            def unsupported_child(*args, **kwargs):
+                error = RuntimeError(
+                    f"{self._consumer}: resolving MoEDispatch selected unsupported physical child {name}"
+                )
+                self._session.record_missing_adapter(operation, error)
+                self._session.mark_tainted(operation)
+                return getattr(self._database, name)(*args, **kwargs)
+
+            return unsupported_child
         return getattr(self._database, name)
 
     def query_custom_allreduce(
