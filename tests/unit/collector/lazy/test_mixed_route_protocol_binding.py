@@ -16,10 +16,10 @@ from aiconfigurator.collector.executor import PersistentMeasurementExecutor
 from aiconfigurator.collector.scheduler import HardwareAwareScheduler
 from aiconfigurator.collector.sglang.registry import (
     DSV4_CSA_CONTEXT_LAZY_SPEC,
+    GEMM_LAZY_SPEC,
     MHC_LAZY_SPEC,
     SGLANG_LAZY_REGISTRY,
 )
-from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
 from aiconfigurator.collector.types import (
     FabricRequirement,
     GpuDevice,
@@ -36,6 +36,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementRecord,
     MeasurementRequest,
     PerfKey,
+    ProtocolMismatchError,
     UnresolvedCode,
 )
 
@@ -165,6 +166,14 @@ def test_central_binding_rejects_unsupported_statistic_before_overlay_reuse() ->
     request = _request(MHC_LAZY_SPEC, 0, template)
 
     with pytest.raises(ValueError, match="statistic"):
+        adapter_api.bind_request_protocol(request, MHC_LAZY_SPEC)
+
+
+def test_central_binding_rejects_too_few_samples_before_overlay_reuse() -> None:
+    template = replace(_template(), samples=2)
+    request = _request(MHC_LAZY_SPEC, 0, template)
+
+    with pytest.raises(ProtocolMismatchError, match=r"samples.*at least three"):
         adapter_api.bind_request_protocol(request, MHC_LAZY_SPEC)
 
 

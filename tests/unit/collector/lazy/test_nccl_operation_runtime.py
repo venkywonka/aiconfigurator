@@ -443,6 +443,30 @@ def test_persistent_nccl_runtime_closes_rank_group_once() -> None:
         runtime.measure("half", "all_reduce", 640)
 
 
+def test_persistent_nccl_runtime_retries_a_failed_close_callback() -> None:
+    close_calls = 0
+
+    def close_fails_once() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise RuntimeError("persistent rank survived forced shutdown")
+
+    runtime = PersistentNcclRuntime(close=close_fails_once, protocol=_protocol())
+
+    with pytest.raises(RuntimeError, match="survived forced shutdown"):
+        runtime.close()
+    with pytest.raises(RuntimeError, match="shutdown is incomplete"):
+        runtime.measure("half", "all_reduce", 640)
+
+    runtime.close()
+    runtime.close()
+
+    assert close_calls == 2
+    with pytest.raises(RuntimeError, match="closed"):
+        runtime.measure("half", "all_reduce", 640)
+
+
 def test_persistent_nccl_runtime_fault_closes_and_poison_rank_group() -> None:
     group = _FakePersistentRankGroup(fail=True)
     runtime = _persistent_runtime(group)

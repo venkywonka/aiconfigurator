@@ -9,9 +9,12 @@ import contextlib
 import copy
 import errno
 import gc
+import inspect
 import json
+import logging
 import math
 import os
+import shutil
 import socket
 import statistics
 import tempfile
@@ -22,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from aiconfigurator.collector.benchmark import benchmark_with_power
+from aiconfigurator.collector.sglang.dsv4_runtime_contract import validate_deepseek_v4_runtime_contract
 from aiconfigurator.collector.types import RawMeasurement
 from aiconfigurator.sdk.resolution.types import MeasurementProtocol
 
@@ -32,9 +36,13 @@ _ATTN_KIND_TO_COMPRESS_RATIO = {"csa": 4, "hca": 128}
 _CANONICAL_NUM_HEADS = 16
 _PADDED_NUM_HEADS = 64
 _TP_SIZE = 4
+_SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _PROPER_INIT_STD = 0.05
 _PROPER_INIT_SEED = 1234
 _INPUT_SEED = 0
+_TEMPORARY_MODEL_DIRS: set[Path] = set()
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,8 +116,13 @@ def _patched_model_dir(model_id: str, attn_kind: str, compress_ratio: int) -> st
     config["n_routed_experts"] = min(int(config.get("n_routed_experts", 8)), 8)
     config["num_experts_per_tok"] = min(int(config.get("num_experts_per_tok", 2)), 2)
 
-    temp_dir = Path(tempfile.gettempdir()) / f"aic_dsv4_attn_{attn_kind}_{os.getpid()}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"aic_dsv4_attn_{attn_kind}_{os.getpid()}_",
+            dir=tempfile.gettempdir(),
+        )
+    )
+    _TEMPORARY_MODEL_DIRS.add(temp_dir)
     with (temp_dir / "config.json").open("w") as config_stream:
         json.dump(config, config_stream)
 
@@ -171,6 +184,36 @@ def _tp_load_model_patch(tp_size: int) -> Iterator[None]:
         ModelRunner.load_model = original_load
 
 
+@contextlib.contextmanager
+def _attention_only_dsv4_moe(deepseek_v2_module: Any) -> Iterator[None]:
+    """Adapt eager DSv4 model construction without enabling an MoE measurement."""
+
+    original_moe_type = deepseek_v2_module.DeepseekV2MoE
+    supports_dsv4_flag = "is_deepseek_v4" in inspect.signature(original_moe_type.__init__).parameters
+
+    class AttentionOnlyDeepseekV2MoE(original_moe_type):
+        def __init__(
+            self,
+            *args,
+            is_deepseek_v4: bool = False,
+            **kwargs,
+        ) -> None:
+            if is_deepseek_v4 is not True:
+                raise ValueError("attention-only DSv4 MoE compatibility requires is_deepseek_v4=True")
+            if supports_dsv4_flag:
+                kwargs["is_deepseek_v4"] = True
+            super().__init__(*args, **kwargs)
+
+        def forward(self, *args, **kwargs):
+            raise RuntimeError("attention-only DSv4 setup must not execute the MoE path")
+
+    deepseek_v2_module.DeepseekV2MoE = AttentionOnlyDeepseekV2MoE
+    try:
+        yield
+    finally:
+        deepseek_v2_module.DeepseekV2MoE = original_moe_type
+
+
 def _free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
         port_socket.bind(("127.0.0.1", 0))
@@ -188,6 +231,7 @@ def _construct_model_runner(
     model_runner_factory: Callable[..., Any],
     model_runner_kwargs: dict[str, Any],
     *,
+    cleanup_failed_attempt: Callable[[], None],
     port_factory: Callable[[], int] = _free_tcp_port,
     max_attempts: int = 3,
 ):
@@ -201,6 +245,7 @@ def _construct_model_runner(
         except (OSError, RuntimeError) as error:
             if not _is_address_in_use(error) or attempt + 1 == max_attempts:
                 raise
+            cleanup_failed_attempt()
     raise AssertionError("unreachable")
 
 
@@ -226,6 +271,49 @@ def _proper_initialize_model_runner(model_runner, *, torch_module) -> None:
                 parameter.normal_(0.0, std)
 
 
+def _full_tokens_for_swa_capacity(
+    *,
+    logical_tokens: int,
+    page_size: int,
+    swa_full_tokens_ratio: float,
+) -> int:
+    """Return the page-aligned full pool needed for one exact DSv4 request."""
+
+    if isinstance(logical_tokens, bool) or not isinstance(logical_tokens, int) or logical_tokens <= 0:
+        raise ValueError("logical token count must be a positive integer")
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
+        raise ValueError("page size must be a positive integer")
+    if (
+        isinstance(swa_full_tokens_ratio, bool)
+        or not isinstance(swa_full_tokens_ratio, (int, float))
+        or not math.isfinite(float(swa_full_tokens_ratio))
+        or not 0.0 < float(swa_full_tokens_ratio) <= 1.0
+    ):
+        raise ValueError("SWA/full token ratio must be finite and in (0, 1]")
+
+    required_swa_pages = math.ceil(logical_tokens / page_size)
+    required_full_pages = math.ceil(required_swa_pages / float(swa_full_tokens_ratio))
+    return required_full_pages * page_size
+
+
+def _page_rounded_swa_capacity_tokens(
+    *,
+    batch_size: int,
+    tokens_per_request: int,
+    page_size: int,
+) -> int:
+    """Return SWA capacity after page-rounding every request independently."""
+
+    for field_name, value in (
+        ("batch size", batch_size),
+        ("tokens per request", tokens_per_request),
+        ("page size", page_size),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{field_name} must be a positive integer")
+    return batch_size * math.ceil(tokens_per_request / page_size) * page_size
+
+
 def _load_model_runner(
     model_path: str,
     *,
@@ -236,8 +324,10 @@ def _load_model_runner(
     tp_size: int,
     batch_size: int,
     max_total_tokens: int,
+    required_swa_tokens: int,
     device: str,
     torch_module,
+    cleanup_failed_attempt: Callable[[], None],
 ):
     """Port the legacy one-layer load and TP4 single-GPU simulation."""
 
@@ -248,9 +338,11 @@ def _load_model_runner(
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.models import deepseek_v2
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
 
+    validate_deepseek_v4_runtime_contract()
     suppress_other_loggers()
 
     torch_device = torch_module.device(device)
@@ -271,11 +363,24 @@ def _load_model_runner(
         max_total_tokens=max_total_tokens,
     )
     server_args.quantization = "fp8" if gemm_type == "fp8_block" else None
+    server_args.disable_piecewise_cuda_graph = True
     server_args.enable_piecewise_cuda_graph = False
-    server_args.attention_backend = "dsv4"
+    server_args.attention_backend = "compressed"
+    server_args.page_size = 256
     _set_envs_and_config(server_args)
+    server_args.max_total_tokens = max(
+        max_total_tokens,
+        _full_tokens_for_swa_capacity(
+            logical_tokens=required_swa_tokens,
+            page_size=server_args.page_size,
+            swa_full_tokens_ratio=server_args.swa_full_tokens_ratio,
+        ),
+    )
     model_config = ModelConfig.from_server_args(server_args)
-    with _tp_load_model_patch(tp_size):
+    with (
+        _tp_load_model_patch(tp_size),
+        _attention_only_dsv4_moe(deepseek_v2),
+    ):
         model_runner = _construct_model_runner(
             ModelRunner,
             {
@@ -290,6 +395,7 @@ def _load_model_runner(
                 "moe_ep_size": 1,
                 "server_args": server_args,
             },
+            cleanup_failed_attempt=cleanup_failed_attempt,
         )
     _proper_initialize_model_runner(model_runner, torch_module=torch_module)
     return model_runner
@@ -554,6 +660,105 @@ def _make_inputs(
     return hidden_states, positions
 
 
+def _cleanup_distributed_runtime(
+    *,
+    torch_module,
+    cleanup_distributed: Callable[[], None],
+    collect_garbage: Callable[[], Any] = gc.collect,
+) -> None:
+    """Release SGLang/Torch distributed state, including failed construction."""
+
+    cleanup_errors: list[Exception] = []
+    for cleanup in (
+        cleanup_distributed,
+        torch_module.cuda.empty_cache,
+        collect_garbage,
+        _cleanup_temporary_model_dirs,
+    ):
+        try:
+            cleanup()
+        except Exception as error:
+            cleanup_errors.append(error)
+    if torch_module.distributed.is_initialized():
+        cleanup_errors.append(
+            RuntimeError("SGLang distributed state remained initialized after DSv4 attention cleanup")
+        )
+    if cleanup_errors:
+        for secondary in cleanup_errors[1:]:
+            logger.error(
+                "secondary DSv4 attention cleanup failure; preserving the first cleanup error: %s",
+                secondary,
+            )
+        raise cleanup_errors[0]
+
+
+def _cleanup_temporary_model_dirs() -> None:
+    """Remove worker-local patched model configs after each exact case."""
+
+    cleanup_errors: list[OSError] = []
+    for model_dir in tuple(_TEMPORARY_MODEL_DIRS):
+        try:
+            shutil.rmtree(model_dir)
+        except FileNotFoundError:
+            _TEMPORARY_MODEL_DIRS.discard(model_dir)
+        except OSError as error:
+            cleanup_errors.append(error)
+        else:
+            _TEMPORARY_MODEL_DIRS.discard(model_dir)
+    if cleanup_errors:
+        for secondary in cleanup_errors[1:]:
+            logger.error(
+                "secondary DSv4 attention temporary-directory cleanup failure; preserving the first error: %s",
+                secondary,
+            )
+        raise cleanup_errors[0]
+
+
+def _preserve_primary_failure(cleanup: Callable[[], None], *, context: str) -> None:
+    """Attempt teardown without replacing the exception that triggered it."""
+
+    try:
+        cleanup()
+    except Exception:
+        logger.exception("%s; preserving the primary DSv4 attention failure", context)
+
+
+def _cleanup_model_runner(
+    model_runner,
+    *,
+    torch_module,
+    cleanup_distributed: Callable[[], None],
+    collect_garbage: Callable[[], Any] = gc.collect,
+) -> None:
+    """Release one exact runner completely so its worker can serve another case."""
+
+    pool_errors: list[Exception] = []
+    for pool_name in ("req_to_token_pool", "token_to_kv_pool_allocator"):
+        try:
+            pool = getattr(model_runner, pool_name)
+            pool.clear()
+        except Exception as error:
+            pool_errors.append(error)
+    cleanup_errors = list(pool_errors)
+    try:
+        _cleanup_distributed_runtime(
+            torch_module=torch_module,
+            cleanup_distributed=cleanup_distributed,
+            collect_garbage=collect_garbage,
+        )
+    except Exception as error:
+        cleanup_errors.append(error)
+    if pool_errors:
+        for secondary in cleanup_errors[1:]:
+            logger.error(
+                "secondary DSv4 attention runner cleanup failure; preserving the first model-pool error: %s",
+                secondary,
+            )
+        raise RuntimeError("DSv4 attention model-pool cleanup failed") from cleanup_errors[0]
+    if cleanup_errors:
+        raise cleanup_errors[0]
+
+
 def _prepare_dsv4_attn_case(
     *,
     mode: str,
@@ -575,103 +780,139 @@ def _prepare_dsv4_attn_case(
     """Import Torch/SGLang after GPU binding and prepare exactly one case."""
 
     import torch
+    from sglang.srt.distributed import parallel_state
+
+    def cleanup_distributed() -> None:
+        parallel_state.destroy_model_parallel()
+        parallel_state.destroy_distributed_environment()
+
+    def cleanup_failed_attempt() -> None:
+        _cleanup_distributed_runtime(
+            torch_module=torch,
+            cleanup_distributed=cleanup_distributed,
+        )
 
     is_prefill = mode == "context"
     sequence_length = int(isl) if is_prefill else int(s_total) - 1
     prefix_length = int(prefix or 0) if is_prefill else 0
-    total_tokens = batch_size * (sequence_length + prefix_length + (0 if is_prefill else 1))
+    tokens_per_request = sequence_length + prefix_length + (0 if is_prefill else 1)
+    total_tokens = batch_size * tokens_per_request
     max_total_tokens = max(4096, math.ceil(total_tokens * 1.05))
-    with _forced_proper_init():
-        model_runner = _load_model_runner(
-            model_path,
-            attn_kind=attn_kind,
-            compress_ratio=compress_ratio,
-            kv_cache_dtype=kv_cache_dtype,
-            gemm_type=gemm_type,
-            tp_size=tp_size,
-            batch_size=batch_size,
-            max_total_tokens=max_total_tokens,
+    required_swa_tokens = _page_rounded_swa_capacity_tokens(
+        batch_size=batch_size,
+        tokens_per_request=tokens_per_request,
+        page_size=256,
+    )
+    try:
+        with _forced_proper_init():
+            model_runner = _load_model_runner(
+                model_path,
+                attn_kind=attn_kind,
+                compress_ratio=compress_ratio,
+                kv_cache_dtype=kv_cache_dtype,
+                gemm_type=gemm_type,
+                tp_size=tp_size,
+                batch_size=batch_size,
+                max_total_tokens=max_total_tokens,
+                required_swa_tokens=required_swa_tokens,
+                device=device,
+                torch_module=torch,
+                cleanup_failed_attempt=cleanup_failed_attempt,
+            )
+    except BaseException:
+        _preserve_primary_failure(
+            lambda: _cleanup_distributed_runtime(
+                torch_module=torch,
+                cleanup_distributed=cleanup_distributed,
+            ),
+            context="distributed cleanup after model construction failed",
+        )
+        raise
+
+    try:
+        attention_module = model_runner.model.model.layers[0].self_attn
+        actual_ratio = int(getattr(attention_module, "compress_ratio", -1))
+        padded_num_heads = int(getattr(attention_module, "n_heads", -1))
+        architecture_values = getattr(model_runner.model.config, "architectures", None)
+        architecture = architecture_values[0] if architecture_values else None
+        if (
+            actual_ratio != compress_ratio
+            or padded_num_heads != num_heads
+            or padded_num_heads // tp_size != canonical_num_heads
+            or architecture != _ARCHITECTURE
+        ):
+            raise ValueError("loaded SGLang attention module does not match the frozen padded64/TP4 case")
+
+        forward_batch = _build_forward_batch(
+            model_runner,
+            batch_size,
+            sequence_length,
+            is_prefill=is_prefill,
+            prefix_len=prefix_length,
+            torch_module=torch,
+        )
+        hidden_states, positions = _make_inputs(
+            model_runner,
+            batch_size,
+            sequence_length,
+            is_prefill=is_prefill,
+            prefix_len=prefix_length,
             device=device,
             torch_module=torch,
         )
+        framework_version = get_version("sglang")
 
-    attention_module = model_runner.model.model.layers[0].self_attn
-    actual_ratio = int(getattr(attention_module, "compress_ratio", -1))
-    padded_num_heads = int(getattr(attention_module, "n_heads", -1))
-    architecture_values = getattr(model_runner.model.config, "architectures", None)
-    architecture = architecture_values[0] if architecture_values else None
-    if (
-        actual_ratio != compress_ratio
-        or padded_num_heads != num_heads
-        or padded_num_heads // tp_size != canonical_num_heads
-        or architecture != _ARCHITECTURE
-    ):
-        raise ValueError("loaded SGLang attention module does not match the frozen padded64/TP4 case")
+        def kernel_func():
+            with torch.no_grad():
+                if framework_version.startswith("0.5.13"):
+                    from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 
-    forward_batch = _build_forward_batch(
-        model_runner,
-        batch_size,
-        sequence_length,
-        is_prefill=is_prefill,
-        prefix_len=prefix_length,
-        torch_module=torch,
-    )
-    hidden_states, positions = _make_inputs(
-        model_runner,
-        batch_size,
-        sequence_length,
-        is_prefill=is_prefill,
-        prefix_len=prefix_length,
-        device=device,
-        torch_module=torch,
-    )
-    framework_version = get_version("sglang")
+                    forward_scope = forward_context(ForwardContext(attn_backend=model_runner.attn_backend))
+                else:
+                    forward_scope = contextlib.nullcontext()
+                with forward_scope:
+                    return attention_module(
+                        x=hidden_states,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                    )
 
-    def kernel_func():
-        with torch.no_grad():
-            if framework_version.startswith("0.5.13"):
-                from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+        def cleanup_func() -> None:
+            _cleanup_model_runner(
+                model_runner,
+                torch_module=torch,
+                cleanup_distributed=cleanup_distributed,
+            )
 
-                forward_scope = forward_context(ForwardContext(attn_backend=model_runner.attn_backend))
-            else:
-                forward_scope = contextlib.nullcontext()
-            with forward_scope:
-                return attention_module(
-                    x=hidden_states,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                )
-
-    def cleanup_func() -> None:
-        for cleanup in (
-            model_runner.req_to_token_pool.clear,
-            model_runner.token_to_kv_pool_allocator.clear,
-            torch.cuda.empty_cache,
-            gc.collect,
-        ):
-            try:
-                cleanup()
-            except Exception:
-                pass
-
-    return PreparedDsv4AttentionCase(
-        kernel_func=kernel_func,
-        framework_version=framework_version,
-        device_name=torch.cuda.get_device_name(torch.device(device)),
-        device=torch.device(device),
-        architecture=architecture,
-        model_artifact=model_path,
-        mode=mode,
-        attn_kind=attn_kind,
-        compress_ratio=actual_ratio,
-        tp_size=tp_size,
-        canonical_num_heads=canonical_num_heads,
-        padded_num_heads=padded_num_heads,
-        mla_dtype=mla_dtype,
-        kv_cache_dtype=kv_cache_dtype,
-        gemm_type=gemm_type,
-        cleanup_func=cleanup_func,
-    )
+        prepared = PreparedDsv4AttentionCase(
+            kernel_func=kernel_func,
+            framework_version=framework_version,
+            device_name=torch.cuda.get_device_name(torch.device(device)),
+            device=torch.device(device),
+            architecture=architecture,
+            model_artifact=model_path,
+            mode=mode,
+            attn_kind=attn_kind,
+            compress_ratio=actual_ratio,
+            tp_size=tp_size,
+            canonical_num_heads=canonical_num_heads,
+            padded_num_heads=padded_num_heads,
+            mla_dtype=mla_dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            gemm_type=gemm_type,
+            cleanup_func=cleanup_func,
+        )
+    except BaseException:
+        _preserve_primary_failure(
+            lambda: _cleanup_model_runner(
+                model_runner,
+                torch_module=torch,
+                cleanup_distributed=cleanup_distributed,
+            ),
+            context="model-runner cleanup after attention preparation failed",
+        )
+        raise
+    return prepared
 
 
 def get_dsv4_attn_test_cases() -> tuple[()]:
@@ -797,27 +1038,27 @@ def run_dsv4_attn_case(
         device=device,
         model_path=model_path,
     )
-    if (
-        prepared.framework_version != "0.5.10"
-        or " ".join(prepared.device_name.split()).casefold() != "nvidia gb200"
-        or prepared.architecture != _ARCHITECTURE
-        or prepared.model_artifact != _MODEL_ARTIFACT
-        or prepared.mode != mode
-        or prepared.attn_kind != attn_kind
-        or prepared.compress_ratio != compress_ratio
-        or prepared.tp_size != _TP_SIZE
-        or prepared.canonical_num_heads != _CANONICAL_NUM_HEADS
-        or prepared.padded_num_heads != _PADDED_NUM_HEADS
-        or prepared.mla_dtype != "bfloat16"
-        or prepared.kv_cache_dtype != "fp8"
-        or prepared.gemm_type != "fp8_block"
-        or prepared.model_weight_generator != "proper-normal-v1"
-        or prepared.model_weight_std != _PROPER_INIT_STD
-        or prepared.model_weight_seed != _PROPER_INIT_SEED
-    ):
-        raise ValueError("prepared DSv4 attention case does not match the frozen exact request")
-
     try:
+        if (
+            prepared.framework_version not in _SUPPORTED_SGLANG_VERSIONS
+            or " ".join(prepared.device_name.split()).casefold() != "nvidia gb200"
+            or prepared.architecture != _ARCHITECTURE
+            or prepared.model_artifact != _MODEL_ARTIFACT
+            or prepared.mode != mode
+            or prepared.attn_kind != attn_kind
+            or prepared.compress_ratio != compress_ratio
+            or prepared.tp_size != _TP_SIZE
+            or prepared.canonical_num_heads != _CANONICAL_NUM_HEADS
+            or prepared.padded_num_heads != _PADDED_NUM_HEADS
+            or prepared.mla_dtype != "bfloat16"
+            or prepared.kv_cache_dtype != "fp8"
+            or prepared.gemm_type != "fp8_block"
+            or prepared.model_weight_generator != "proper-normal-v1"
+            or prepared.model_weight_std != _PROPER_INIT_STD
+            or prepared.model_weight_seed != _PROPER_INIT_SEED
+        ):
+            raise ValueError("prepared DSv4 attention case does not match the frozen exact request")
+
         with benchmark_with_power(
             device=prepared.device,
             kernel_func=prepared.kernel_func,
@@ -839,7 +1080,14 @@ def run_dsv4_attn_case(
                 raise ValueError("DSv4 attention samples do not match the requested median protocol")
             power_stats = results.get("power_stats")
             throttled = bool(results.get("throttled", False))
-    finally:
+    except BaseException:
+        if prepared.cleanup_func is not None:
+            _preserve_primary_failure(
+                prepared.cleanup_func,
+                context="model-runner cleanup after attention measurement failed",
+            )
+        raise
+    else:
         if prepared.cleanup_func is not None:
             prepared.cleanup_func()
 

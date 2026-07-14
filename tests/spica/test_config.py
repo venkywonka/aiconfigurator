@@ -35,6 +35,148 @@ def test_defaults_fill_in():
     # goal/sweep default factories
     assert cfg.goal.target is OptimizationTarget.THROUGHPUT
     assert cfg.sweep.parallel_evals == 16
+    assert cfg.aic_resolution is None
+    assert cfg.measurement_gpu_groups is None
+
+
+@pytest.mark.parametrize("policy", ["observe_only", "measure_on_miss"])
+def test_aic_resolution_requires_absolute_overlay_path(policy):
+    with pytest.raises(ValidationError, match=r"overlay_path.*absolute"):
+        SmartSearchConfig(
+            search_space=_resolution_search_space(),
+            workload={"trace_path": "/tmp/t.jsonl"},
+            aic_resolution={"policy": policy, "overlay_path": "relative/overlay.sqlite"},
+        )
+
+
+def test_aic_resolution_defaults_and_restart_stable_paths(tmp_path):
+    overlay = tmp_path / "evidence.sqlite"
+    payload = {
+        "search_space": _resolution_search_space(),
+        "workload": {"trace_path": "/tmp/t.jsonl"},
+        "aic_resolution": {"policy": "measure_on_miss", "overlay_path": overlay},
+    }
+
+    first = SmartSearchConfig.model_validate(payload)
+    restarted = SmartSearchConfig.model_validate(payload)
+
+    assert first.aic_resolution.policy.value == "measure_on_miss"
+    assert first.aic_resolution.on_measurement_failure.value == "error"
+    assert first.aic_resolution.overlay_path == overlay.resolve()
+    assert first.aic_resolution.fallback_cache_dir == Path(f"{overlay.resolve()}.live-fallbacks")
+    assert first.aic_resolution.max_new_keys == 256
+    assert first.aic_resolution.max_wall_seconds == 3600.0
+    assert first.aic_resolution.max_block_seconds is None
+    assert first.aic_resolution.force_remeasure is False
+    assert restarted.aic_resolution == first.aic_resolution
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"max_new_keys": 0},
+        {"max_wall_seconds": 0},
+    ],
+)
+def test_aic_resolution_rejects_invalid_budgets(tmp_path, overrides):
+    with pytest.raises(ValidationError):
+        SmartSearchConfig(
+            search_space=_resolution_search_space(),
+            workload={"trace_path": "/tmp/t.jsonl"},
+            aic_resolution={
+                "policy": "measure_on_miss",
+                "overlay_path": tmp_path / "evidence.sqlite",
+                **overrides,
+            },
+        )
+
+
+@pytest.mark.parametrize("groups", [[], [[]], [[-1]], [[0, 0]], [[0, 1], [1, 2]]])
+def test_measurement_resource_pool_rejects_invalid_groups(tmp_path, groups):
+    with pytest.raises(ValidationError, match="measurement_gpu_groups"):
+        SmartSearchConfig(
+            search_space=_resolution_search_space(),
+            workload={"trace_path": "/tmp/t.jsonl"},
+            aic_resolution={
+                "policy": "measure_on_miss",
+                "overlay_path": tmp_path / "evidence.sqlite",
+            },
+            measurement_gpu_groups=groups,
+        )
+
+
+def test_measurement_pool_parallel_evals_require_enough_disjoint_groups(tmp_path):
+    with pytest.raises(ValidationError, match=r"measurement_gpu_groups.*parallel_evals"):
+        SmartSearchConfig(
+            search_space=_resolution_search_space(),
+            workload={"trace_path": "/tmp/t.jsonl"},
+            sweep={"parallel_evals": 3},
+            aic_resolution={
+                "policy": "measure_on_miss",
+                "overlay_path": tmp_path / "evidence.sqlite",
+            },
+            measurement_gpu_groups=[[0], [1]],
+        )
+
+
+@pytest.mark.parametrize(
+    ("candidates_per_round", "measurement_gpu_groups"),
+    [
+        (1, [[0, 1, 2, 3]]),
+        (2, [[0, 1, 2, 3], [4, 5, 6, 7]]),
+    ],
+)
+def test_measurement_gpu_groups_follow_effective_worker_count(
+    tmp_path,
+    candidates_per_round,
+    measurement_gpu_groups,
+):
+    cfg = SmartSearchConfig(
+        search_space=_resolution_search_space(),
+        workload={"trace_path": "/tmp/t.jsonl"},
+        sweep={"parallel_evals": 4, "candidates_per_round": candidates_per_round},
+        aic_resolution={
+            "policy": "measure_on_miss",
+            "overlay_path": tmp_path / "evidence.sqlite",
+        },
+        measurement_gpu_groups=measurement_gpu_groups,
+    )
+
+    assert cfg.sweep.parallel_evals == 4
+    assert cfg.sweep.candidates_per_round == candidates_per_round
+    assert cfg.aic_resolution is not None
+    assert cfg.measurement_gpu_groups is not None
+    assert cfg.measurement_gpu_groups.root == tuple(tuple(group) for group in measurement_gpu_groups)
+
+
+def test_measurement_pool_effective_worker_count_rejects_too_few_groups(tmp_path):
+    with pytest.raises(ValidationError, match=r"measurement_gpu_groups.*1 < 2"):
+        SmartSearchConfig(
+            search_space=_resolution_search_space(),
+            workload={"trace_path": "/tmp/t.jsonl"},
+            sweep={"parallel_evals": 4, "candidates_per_round": 2},
+            aic_resolution={
+                "policy": "measure_on_miss",
+                "overlay_path": tmp_path / "evidence.sqlite",
+            },
+            measurement_gpu_groups=[[0, 1, 2, 3]],
+        )
+
+
+def test_measure_on_miss_without_pool_is_valid_and_runtime_serialized(tmp_path):
+    cfg = SmartSearchConfig(
+        search_space=_resolution_search_space(),
+        workload={"trace_path": "/tmp/t.jsonl"},
+        sweep={"parallel_evals": 4},
+        aic_resolution={
+            "policy": "measure_on_miss",
+            "overlay_path": tmp_path / "evidence.sqlite",
+        },
+    )
+
+    assert cfg.sweep.parallel_evals == 4
+    assert cfg.aic_resolution is not None
+    assert cfg.measurement_gpu_groups is None
 
 
 def test_extra_field_forbidden():
@@ -81,6 +223,10 @@ def test_throughput_per_gpu_needs_no_sla():
 
 def _search_space(**overrides):
     return {"model_name": "m", "hardware_sku": "h200_sxm", **overrides}
+
+
+def _resolution_search_space(**overrides):
+    return _search_space(backend=["sglang"], deployment_mode=["agg"], **overrides)
 
 
 def test_subset_of_choices_is_accepted():

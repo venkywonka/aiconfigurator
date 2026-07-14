@@ -36,9 +36,24 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import dataclass
+from typing import Any
 
 from .config import OptimizationGoal, Workload
 from .deploy import DeploymentPlan
+
+
+@dataclass(frozen=True, slots=True)
+class UnscorableCandidate:
+    """Structured Replay rejection that must never become a scored candidate."""
+
+    code: str
+    operation: str
+    detail: str
+    report: object | None
+
+    def __str__(self) -> str:
+        return f"AIC resolution failed [{self.code}] for {self.operation}: {self.detail}"
 
 
 def _build_kv_router_config(payload: dict | None):
@@ -51,7 +66,7 @@ def _build_kv_router_config(payload: dict | None):
     return KvRouterConfig(**payload)
 
 
-def _unwrap(report) -> dict[str, float]:
+def _unwrap(report) -> dict[str, Any]:
     """Normalize a replay result to the flat ``trace_report`` dict: a static replay
     returns that dict directly; planner-in-the-loop returns a ``ReplayPlannerReport``
     whose ``.trace_report`` carries the identical shape. Preserve the planner tick
@@ -97,7 +112,7 @@ def _run_synthetic_trace_replay_compat(func, kwargs: dict):
     return func(**_replay_kwargs(func, kwargs))
 
 
-def _require_goodput_metric(report: dict[str, float], goal: OptimizationGoal) -> dict[str, float]:
+def _require_goodput_metric(report: dict[str, Any], goal: OptimizationGoal) -> dict[str, Any]:
     """Fail closed when a goodput objective cannot be measured per request.
 
     Aggregate mean latency cannot recover goodput: a mixed population may have the
@@ -161,22 +176,38 @@ class ReplayEvaluator:
             inter_turn_delay_ms=wl.inter_turn_delay_ms,
         )
 
-    def evaluate(self, plan: DeploymentPlan, *, concurrency_override: int | None = None) -> dict[str, float]:
-        """Run one replay and return its trace_report dict.
+    def evaluate(
+        self,
+        plan: DeploymentPlan,
+        *,
+        concurrency_override: int | None = None,
+    ) -> dict[str, Any] | UnscorableCandidate:
+        """Run one replay and return its trace report or typed unscorable result.
 
         ``concurrency_override`` is the per-trial in-flight cap derived from KV load; it
         overrides a fixed workload ``concurrency`` for both the closed-loop cap and the
         ``num_request_ratio``-derived request count. Trace workloads ignore it (they cap
-        via ``replay_concurrency``)."""
-        if self.workload.is_trace_based:
-            return _require_goodput_metric(self._evaluate_trace(plan), self.goal)
-        return _require_goodput_metric(
-            self._evaluate_synthetic(plan, concurrency_override=concurrency_override), self.goal
-        )
+        via ``replay_concurrency``). A Dynamo ``AicResolutionError`` is preserved as an
+        :class:`UnscorableCandidate`; every other exception retains its prior behavior."""
+        from dynamo._core import AicResolutionError
+
+        try:
+            if self.workload.is_trace_based:
+                return _require_goodput_metric(self._evaluate_trace(plan), self.goal)
+            return _require_goodput_metric(
+                self._evaluate_synthetic(plan, concurrency_override=concurrency_override), self.goal
+            )
+        except AicResolutionError as error:
+            return UnscorableCandidate(
+                code=error.code,
+                operation=error.operation,
+                detail=error.detail,
+                report=error.report,
+            )
 
     # -- trace workloads -------------------------------------------------------
 
-    def _evaluate_trace(self, plan: DeploymentPlan) -> dict[str, float]:
+    def _evaluate_trace(self, plan: DeploymentPlan) -> dict[str, Any]:
         from dynamo.mocker import MockEngineArgs
         from dynamo.replay.api import run_trace_replay
 
@@ -216,7 +247,7 @@ class ReplayEvaluator:
 
     # -- synthetic workloads ---------------------------------------------------
 
-    def _evaluate_synthetic(self, plan: DeploymentPlan, *, concurrency_override: int | None = None) -> dict[str, float]:
+    def _evaluate_synthetic(self, plan: DeploymentPlan, *, concurrency_override: int | None = None) -> dict[str, Any]:
         from dynamo.mocker import MockEngineArgs
         from dynamo.replay.api import run_synthetic_trace_replay
 

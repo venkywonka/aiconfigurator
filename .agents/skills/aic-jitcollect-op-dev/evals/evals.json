@@ -1,0 +1,23 @@
+{
+  "skill_name": "aic-jitcollect-op-dev",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Add measure-on-miss support to the existing AIC RMSNorm operation for SGLang 0.5.10. Preserve ordinary prediction and prove cold one-measurement, warm zero-measurement, and reopened-overlay reuse before proposing a GPU run.",
+      "expected_output": "A strict-TDD vertical-slice plan or implementation that classifies RMSNorm, traces its real consumer contract, defines one canonical normalization and PerfKey, adds an import-light exact adapter/runner/resource contract, and separates fake-executor ablations from physical validation.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Review this JIT collection patch for a module-level attention operation. It emits one module PerfKey but also recursively records GEMM children. Determine whether that is correct and design the tests that should catch any accounting problem.",
+      "expected_output": "The review identifies the measured-compound double-count risk, checks whether the module table is the physical boundary, and proposes exact composition, deduplication, and no-recursion tests without adding operation-specific branches to ResolutionSession.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "The new lazy GEMM adapter passes unit tests. Wire it into Replay/Spica and tell me what evidence is still needed before claiming end-to-end JIT collection support.",
+      "expected_output": "A Replay integration plan using only the five scheduled aggregate FPM fields, explicit Spica resolution configuration, no virtual-time advance on the tainted walk, typed unscorable failure, deterministic prefill/mixed/decode/repeated cold and reopened warm streams, and a clear distinction between package, operation-GPU, and full Replay evidence.",
+      "files": []
+    }
+  ]
+}

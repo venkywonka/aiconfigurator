@@ -21,6 +21,8 @@ from importlib.metadata import version as get_version
 
 import torch
 
+from aiconfigurator.collector.sglang.dsv4_runtime_contract import validate_deepseek_v4_runtime_contract
+
 os.environ.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
 os.environ.setdefault("SGLANG_OPT_DEEPGEMM_HC_PRENORM", "0")
 
@@ -177,6 +179,7 @@ def _load_one_layer_runner(
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
 
+    validate_deepseek_v4_runtime_contract()
     suppress_other_loggers()
     device_obj = torch.device(device)
     torch.cuda.set_device(device_obj)
@@ -198,8 +201,10 @@ def _load_one_layer_runner(
         max_running_requests=16,
         max_prefill_tokens=4096,
     )
+    server_args.disable_piecewise_cuda_graph = True
     server_args.enable_piecewise_cuda_graph = False
-    server_args.attention_backend = "dsv4"
+    server_args.attention_backend = "compressed"
+    server_args.page_size = 256
 
     print(f"[mhc-collector] model_path {model_path} -> {local_model_path}")
 

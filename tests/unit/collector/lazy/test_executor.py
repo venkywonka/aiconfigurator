@@ -38,6 +38,7 @@ from aiconfigurator.sdk.resolution.types import (
     PerfKey,
     RecordStatus,
     UnresolvedCode,
+    canonical_json,
 )
 
 pytestmark = pytest.mark.unit
@@ -363,8 +364,8 @@ def test_gpu_class_mismatch_fails_before_adapter_preparation_or_worker_creation(
     events: list[str] = []
     adapter = _Adapter(adapters.PreparedMeasurement, events)
     factory = _Factory(api, events)
-    executor = _executor(1, events, resolver=lambda request: adapter, factory=factory)
-    request = _request(1)
+    executor = _executor(4, events, resolver=lambda request: adapter, factory=factory)
+    request = _request(1, inventory_count=4)
     environment = replace(request.environment, gpu_class="NVIDIA H100")
     request = replace(
         request,
@@ -384,8 +385,8 @@ def test_parent_attaches_environment_assignment_and_invocation_provenance() -> N
     events: list[str] = []
     adapter = _Adapter(adapters.PreparedMeasurement, events)
     factory = _Factory(api, events)
-    executor = _executor(1, events, resolver=lambda request: adapter, factory=factory)
-    request = _request(1)
+    executor = _executor(4, events, resolver=lambda request: adapter, factory=factory)
+    request = _request(1, inventory_count=4)
 
     records = tuple(executor.execute((request,), deadline_monotonic=20.0, cancellation=_Cancellation()))
 
@@ -399,9 +400,113 @@ def test_parent_attaches_environment_assignment_and_invocation_provenance() -> N
     command = factory.channels[0].commands[0]
     assert record.provenance["invocation_id"] == command.invocation_id
     assert record.provenance["request_digest"] == request.key.digest
+    resolution_execution = json.loads(canonical_json(record.provenance["resolution_execution"]))
+    assert {
+        key: resolution_execution[key]
+        for key in ("registry_route", "resource", "wave", "assignment", "worker", "invocation")
+    } == {
+        "registry_route": {
+            "namespace": "gemm_perf.txt/v1",
+            "backend": "sglang",
+            "backend_version": "0.5.10",
+            "adapter_module": "aiconfigurator.collector.testing.fake_adapter",
+            "run_module": "aiconfigurator.collector.testing.fake_runner",
+            "run_func": "run_case",
+        },
+        "resource": {
+            "gpu_count": 1,
+            "fabric": "none",
+            "exclusive_devices": True,
+            "reserve_fabric_domain": False,
+        },
+        "wave": {
+            "execution_id": "execution-1",
+            "index": 0,
+            "request_digests": [request.key.digest],
+        },
+        "assignment": {
+            "gpu_ids": [0],
+            "device_uuids": ["GPU-0"],
+            "reserved_domains": ["gpu:0"],
+        },
+        "worker": {
+            "adapter_namespace": "gemm_perf.txt/v1",
+            "run_module": "aiconfigurator.collector.testing.fake_runner",
+            "run_func": "run_case",
+            "device_uuids": ["GPU-0"],
+            "local_ordinals": [0],
+        },
+        "invocation": {
+            "id": command.invocation_id,
+            "request_digest": request.key.digest,
+        },
+    }
+    inventory = resolution_execution["inventory"]
+    assert inventory["schema_revision"] == "executor-test-v1"
+    assert inventory["topology_fingerprint"] == request.environment.topology_fingerprint
+    assert inventory["devices"] == [
+        {
+            "gpu_id": index,
+            "uuid": f"GPU-{index}",
+            "name": "NVIDIA GB200",
+            "pci_bus_id": f"00000000:{index:02X}:00.0",
+            "fabric_domain": None,
+        }
+        for index in range(4)
+    ]
+    assert len(inventory["capabilities"]) == 12
+    assert all(
+        capability["link"] == "SYS" and capability["p2p_read"] is False and capability["p2p_write"] is False
+        for capability in inventory["capabilities"]
+    )
+    assert inventory["discovery_evidence"] == {
+        "raw_gpu_query": "synthetic query",
+        "raw_topology": "synthetic topology",
+        "raw_p2p_read": "synthetic reads",
+        "raw_p2p_write": "synthetic writes",
+        "p2p_errors": [],
+    }
+    assert resolution_execution["lease"] == {
+        "inventory_gpu_ids": [0, 1, 2, 3],
+        "selected_gpu_ids": [0],
+        "selected_device_uuids": ["GPU-0"],
+        "wave_occupied_gpu_ids": [0],
+        "remaining_compatible_gpu_ids": [1, 2, 3],
+        "unleased_compatible_gpu_ids": [1, 2, 3],
+        "reserved_domains": ["gpu:0"],
+    }
 
 
-def test_compatible_leases_reuse_but_protocol_adapter_and_uuid_tuples_isolate() -> None:
+def test_distinct_perf_keys_never_share_persistent_worker_process_state() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    factory = _Factory(api, events)
+    executor = _executor(1, events, resolver=lambda request: adapter, factory=factory)
+
+    first = tuple(
+        executor.execute(
+            (_request(1),),
+            deadline_monotonic=20.0,
+            cancellation=_Cancellation(),
+        )
+    )
+    second = tuple(
+        executor.execute(
+            (_request(2),),
+            deadline_monotonic=20.0,
+            cancellation=_Cancellation(),
+        )
+    )
+
+    assert first[0].status is second[0].status is RecordStatus.VALID
+    assert len(factory.channels) == 2
+    assert [len(channel.commands) for channel in factory.channels] == [1, 1]
+    assert [channel.close_calls for channel in factory.channels] == [1, 0]
+    assert [channel.join_calls for channel in factory.channels] == [1, 0]
+
+
+def test_exact_key_worker_identity_also_isolates_protocol_adapter_and_uuid_tuples() -> None:
     adapters, api = _apis()
     events: list[str] = []
     primary = _Adapter(adapters.PreparedMeasurement, events)
@@ -436,15 +541,17 @@ def test_compatible_leases_reuse_but_protocol_adapter_and_uuid_tuples_isolate() 
         cancellation=cancellation,
     )
 
-    assert len(factory.channels) == 4
+    assert len(factory.channels) == 5
     assert factory.channels[0].bootstrap.protocol_digest == _protocol().digest
     assert factory.channels[0].bootstrap.device_uuids == ("GPU-0",)
     assert factory.channels[-1].bootstrap.device_uuids == ("GPU-0", "GPU-1")
     assert factory.channels[-1].bootstrap.local_ordinals == (0, 1)
     assert factory.channels[-1].bootstrap.topology_fingerprint == _inventory(2).topology_fingerprint
+    assert [channel.close_calls for channel in factory.channels] == [1, 1, 1, 1, 0]
+    assert [channel.join_calls for channel in factory.channels] == [1, 1, 1, 1, 0]
 
 
-def test_distinct_lazy_namespaces_use_distinct_leases_and_bootstrap_identities() -> None:
+def test_distinct_namespaces_isolate_persistent_runner_process_state() -> None:
     adapters, api = _apis()
     events: list[str] = []
     primary = _Adapter(adapters.PreparedMeasurement, events)
@@ -473,9 +580,55 @@ def test_distinct_lazy_namespaces_use_distinct_leases_and_bootstrap_identities()
         "gemm_perf.txt/v1",
         "other_perf.txt/v1",
     ]
+    assert [len(channel.commands) for channel in factory.channels] == [1, 1]
+    assert [channel.close_calls for channel in factory.channels] == [1, 0]
+    assert [channel.join_calls for channel in factory.channels] == [1, 0]
 
 
-def test_duplicate_reply_is_rejected_as_stale_before_the_lease_can_be_reused_again() -> None:
+def test_overlapping_replacement_fails_closed_when_previous_worker_survives_join() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    primary = _Adapter(adapters.PreparedMeasurement, events)
+    alternate = _Adapter(adapters.PreparedMeasurement, events)
+    alternate.lazy = replace(
+        alternate.lazy,
+        namespace="other_perf.txt/v1",
+        run_module="aiconfigurator.collector.testing.other_runner",
+    )
+    primary_request = _request(1)
+    alternate_request = _request(2, op_id="alternate")
+    alternate_request = replace(
+        alternate_request,
+        key=PerfKey.build(alternate.lazy.namespace, alternate_request.query, alternate_request.environment),
+    )
+    factory = _Factory(api, events)
+    executor = _executor(
+        1,
+        events,
+        resolver=lambda request: alternate if request.op_id == "alternate" else primary,
+        factory=factory,
+    )
+
+    first = tuple(executor.execute((primary_request,), deadline_monotonic=20.0, cancellation=_Cancellation()))
+    assert first[0].status is RecordStatus.VALID
+    previous = factory.channels[0]
+
+    def surviving_join() -> None:
+        previous.join_calls += 1
+        events.append(f"join:{previous.label}")
+        raise RuntimeError("persistent worker survived forced kill")
+
+    previous.join = surviving_join
+    second = tuple(executor.execute((alternate_request,), deadline_monotonic=20.0, cancellation=_Cancellation()))
+
+    _assert_failure(second[0], UnresolvedCode.COLLECTOR_FAILED)
+    assert "persistent worker survived forced kill" in (second[0].failure_reason or "")
+    assert previous.close_calls == 1
+    assert previous.join_calls == 1
+    assert len(factory.channels) == 1
+
+
+def test_duplicate_reply_cannot_cross_an_exact_key_worker_boundary() -> None:
     adapters, api = _apis()
     events: list[str] = []
     adapter = _Adapter(adapters.PreparedMeasurement, events)
@@ -495,10 +648,41 @@ def test_duplicate_reply_is_rejected_as_stale_before_the_lease_can_be_reused_aga
     third = tuple(executor.execute((_request(3),), deadline_monotonic=20.0, cancellation=_Cancellation()))
 
     assert first[0].status is RecordStatus.VALID
-    _assert_failure(second[0], UnresolvedCode.IDENTITY_MISMATCH)
+    assert second[0].status is RecordStatus.VALID
     assert third[0].status is RecordStatus.VALID
-    assert factory.channels[0].close_calls == 1
-    assert len(factory.channels) == 2
+    assert [len(channel.commands) for channel in factory.channels] == [1, 1, 1]
+    assert [channel.close_calls for channel in factory.channels] == [1, 1, 0]
+    assert len(factory.channels) == 3
+
+
+def test_malformed_reply_with_unconfirmed_termination_poisons_same_key_retry() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    base_factory = _Factory(api, events, builders=(lambda command: object(),))
+
+    def factory(bootstrap: object) -> _Channel:
+        channel = base_factory(bootstrap)
+        original_join = channel.join
+
+        def surviving_join() -> None:
+            original_join()
+            raise RuntimeError("persistent worker survived forced kill")
+
+        channel.join = surviving_join
+        return channel
+
+    executor = _executor(1, events, resolver=lambda request: adapter, factory=factory)
+
+    first = tuple(executor.execute((_request(1),), deadline_monotonic=20.0, cancellation=_Cancellation()))
+    second = tuple(executor.execute((_request(2),), deadline_monotonic=20.0, cancellation=_Cancellation()))
+
+    _assert_failure(first[0], UnresolvedCode.INVALID_MEASUREMENT)
+    _assert_failure(second[0], UnresolvedCode.COLLECTOR_FAILED)
+    assert "persistent worker survived forced kill" in (second[0].failure_reason or "")
+    assert len(base_factory.channels) == 1
+    assert base_factory.channels[0].close_calls == 1
+    assert base_factory.channels[0].join_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -697,6 +881,39 @@ def test_mid_wave_cancellation_preserves_completed_sibling_and_launches_no_later
     assert sum(channel.close_calls for channel in factory.channels) == 1
 
 
+def test_readiness_wait_polls_to_observe_cancellation_before_distant_deadline() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    cancellation = _Cancellation()
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    factory = _Factory(api, events)
+    timeouts: list[float] = []
+
+    def wait_ready(channels: Sequence[_Channel], timeout_seconds: float) -> tuple[_Channel, ...]:
+        timeouts.append(timeout_seconds)
+        if len(timeouts) == 1:
+            return (channels[0],)
+        cancellation.value = True
+        return ()
+
+    executor = _executor(2, events, resolver=lambda request: adapter, factory=factory, waiter=wait_ready)
+    records = tuple(
+        executor.execute(
+            tuple(_request(m, inventory_count=2) for m in (1, 2, 3)),
+            deadline_monotonic=100.0,
+            cancellation=cancellation,
+        )
+    )
+
+    assert sum(record.status is RecordStatus.VALID for record in records) == 1
+    failures = [record for record in records if record.status is RecordStatus.FAILED]
+    assert len(failures) == 2
+    assert all(record.failure_code is UnresolvedCode.CANCELLED for record in failures)
+    assert timeouts and all(0.0 <= timeout <= 0.05 for timeout in timeouts)
+    assert sum(event.startswith("send:") for event in events) == 2
+    assert sum(channel.close_calls for channel in factory.channels) == 1
+
+
 def test_unschedulable_and_duplicate_work_fail_without_blocking_or_acquiring() -> None:
     adapters, api = _apis()
     events: list[str] = []
@@ -857,7 +1074,62 @@ def test_direct_execution_never_persists_but_session_keeps_valid_partial_result(
     with pytest.raises(ResolutionFailed):
         session.resolve_pending()
     assert overlay.lookup(successful.key, successful.protocol) is not None
+    report = session.report.to_dict()
+    assert report["registry_routes"] == [
+        {
+            "namespace": "gemm_perf.txt/v1",
+            "backend": "sglang",
+            "backend_version": "0.5.10",
+            "adapter_module": "aiconfigurator.collector.testing.fake_adapter",
+            "run_module": "aiconfigurator.collector.testing.fake_runner",
+            "run_func": "run_case",
+        }
+    ]
+    assert len(report["resources"]) == 1
+    assert report["resources"][0]["key_digest"] == successful.key.digest
+    assert len(report["waves"]) == 1
+    assert report["waves"][0]["execution_id"] == "execution-2"
+    assert set(report["waves"][0]["request_digests"]) == {successful.key.digest, failed.key.digest}
+    assert len(report["assignments"]) == 1
+    assert report["assignments"][0]["key_digest"] == successful.key.digest
+    assert len(report["workers"]) == 1
+    assert report["workers"][0]["key_digest"] == successful.key.digest
+    assert len(report["invocations"]) == 1
+    assert report["invocations"][0]["key_digest"] == successful.key.digest
+    assert [record["status"] for record in report["records"]] == ["valid", "failed"]
+    assert len(report["inventories"]) == 1
+    assert report["inventories"][0]["topology_fingerprint"] == successful.environment.topology_fingerprint
+    assert len(report["leases"]) == 1
+    valid_record = report["records"][0]
+    assert valid_record["samples_ms"] == [1.0]
+    assert valid_record["protocol"] == json.loads(successful.protocol.canonical)
+    assert valid_record["protocol"]["statistic"] == "median"
+    overlay_path = overlay.path
     overlay.close()
+
+    reopened_overlay = OverlayStore(overlay_path)
+    reopened_session = ResolutionSession(
+        reopened_overlay,
+        executor,
+        ResolutionBudget(max_new_keys=2, max_wall_seconds=10.0),
+        successful.protocol,
+        clock=_Clock(),
+    )
+    assert reopened_session.lookup(successful.key, successful.protocol) is not None
+    reopened_report = reopened_session.report.to_dict()
+    assert "resolution_execution" in reopened_report["records"][0]["provenance"]
+    for field in (
+        "registry_routes",
+        "resources",
+        "waves",
+        "assignments",
+        "workers",
+        "invocations",
+        "inventories",
+        "leases",
+    ):
+        assert reopened_report[field] == [], field
+    reopened_overlay.close()
 
 
 def test_uuid_binding_precedes_runner_import_and_exposes_only_local_ordinals(
@@ -886,6 +1158,67 @@ def test_uuid_binding_precedes_runner_import_and_exposes_only_local_ordinals(
     assert runner is sentinel
     assert events == ["import:aiconfigurator.collector.testing.fake_runner:GPU-A,GPU-B"]
     assert bootstrap.local_ordinals == (0, 1)
+
+
+def test_worker_reply_attests_child_observed_gpu_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, api = _apis()
+    observed: dict[str, object] = {}
+    protocol = _protocol()
+    bootstrap = api.WorkerBootstrap(
+        run_module="aiconfigurator.collector.testing.fake_runner",
+        run_func="run_case",
+        adapter_namespace="aiconfigurator.collector.testing.fake_adapter",
+        protocol_digest=protocol.digest,
+        device_uuids=("GPU-A",),
+        topology_fingerprint="topology-four-gpu",
+    )
+    command = api.WorkerCommand(
+        invocation_id="invocation",
+        request_digest="request",
+        payload=b'{"m": 1}',
+        protocol=protocol,
+    )
+
+    class Queue:
+        def __init__(self, values=()) -> None:
+            self.values = list(values)
+
+        def get(self):
+            return self.values.pop(0)
+
+        def put(self, value) -> None:
+            self.values.append(value)
+
+    def run_case(**case):
+        observed["cuda_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES")
+        observed["case"] = case
+        return {
+            "latency_ms": 1.0,
+            "samples_ms": [1.0],
+            "provenance": {"runner": "fake"},
+        }
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    command_queue = Queue((command, None))
+    reply_queue = Queue()
+    api.worker_process_main(
+        bootstrap,
+        command_queue,
+        reply_queue,
+        import_module=lambda _name: SimpleNamespace(run_case=run_case),
+    )
+
+    assert observed["cuda_visible_devices"] == "GPU-A"
+    reply = reply_queue.values[0]
+    assert reply.error is None
+    assert reply.raw_result["_worker_binding"] == {
+        "cuda_visible_devices": "GPU-A",
+        "device_uuids": ["GPU-A"],
+        "local_ordinals": [0],
+        "topology_fingerprint": "topology-four-gpu",
+    }
 
 
 def test_concurrent_execute_calls_serialize_and_close_is_idempotent() -> None:
@@ -922,9 +1255,65 @@ def test_concurrent_execute_calls_serialize_and_close_is_idempotent() -> None:
 
     executor.close()
     executor.close()
-    assert len(factory.channels) == 1
-    assert factory.channels[0].close_calls == 1
-    assert factory.channels[0].join_calls == 1
+    assert len(factory.channels) == 2
+    assert [channel.close_calls for channel in factory.channels] == [1, 1]
+    assert [channel.join_calls for channel in factory.channels] == [1, 1]
+
+
+def test_close_signals_every_worker_before_joining_any_worker() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    factory = _Factory(api, events)
+    executor = _executor(2, events, resolver=lambda request: adapter, factory=factory)
+    requests = tuple(_request(m, inventory_count=2) for m in (1, 2))
+
+    records = tuple(executor.execute(requests, deadline_monotonic=20.0, cancellation=_Cancellation()))
+    assert all(record.status is RecordStatus.VALID for record in records)
+
+    executor.close()
+
+    close_positions = [index for index, event in enumerate(events) if event.startswith("close:")]
+    join_positions = [index for index, event in enumerate(events) if event.startswith("join:")]
+    assert len(close_positions) == len(join_positions) == 2
+    assert max(close_positions) < min(join_positions)
+
+
+def test_close_retains_unterminated_lease_and_retries_after_partial_shutdown() -> None:
+    adapters, api = _apis()
+    events: list[str] = []
+    adapter = _Adapter(adapters.PreparedMeasurement, events)
+    factory = _Factory(api, events)
+    executor = _executor(2, events, resolver=lambda request: adapter, factory=factory)
+    requests = tuple(_request(m, inventory_count=2) for m in (1, 2))
+
+    records = tuple(executor.execute(requests, deadline_monotonic=20.0, cancellation=_Cancellation()))
+
+    assert all(record.status is RecordStatus.VALID for record in records)
+    assert len(factory.channels) == 2
+    survivor = factory.channels[1]
+    original_join = survivor.join
+
+    def join_fails_once() -> None:
+        if survivor.join_calls == 0:
+            survivor.join_calls += 1
+            events.append(f"join:{survivor.label}")
+            raise RuntimeError("persistent worker survived forced kill")
+        original_join()
+
+    survivor.join = join_fails_once
+
+    with pytest.raises(RuntimeError, match="persistent worker termination was not confirmed"):
+        executor.close()
+
+    assert [channel.close_calls for channel in factory.channels] == [1, 1]
+    assert [channel.join_calls for channel in factory.channels] == [1, 1]
+
+    executor.close()
+    executor.close()
+
+    assert [channel.close_calls for channel in factory.channels] == [1, 2]
+    assert [channel.join_calls for channel in factory.channels] == [1, 2]
 
 
 def test_reused_python_id_does_not_skip_cleanup_for_logically_new_channel(

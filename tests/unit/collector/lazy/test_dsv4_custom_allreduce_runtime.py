@@ -264,8 +264,54 @@ def test_rank_backend_binds_physical_visibility_before_torch_cuda_use(
     assert initializer_calls == [expected_kwargs]
 
 
+def test_rank_backend_destroy_releases_sglang_distributed_state_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    events: list[str] = []
+
+    parallel_state = ModuleType("sglang.srt.distributed.parallel_state")
+    parallel_state.destroy_model_parallel = lambda: events.append("destroy-model-parallel")  # type: ignore[attr-defined]
+    parallel_state.destroy_distributed_environment = lambda: events.append("destroy-distributed-environment")  # type: ignore[attr-defined]
+    distributed = ModuleType("sglang.srt.distributed")
+    distributed.__path__ = []  # type: ignore[attr-defined]
+    distributed.parallel_state = parallel_state  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed)
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed.parallel_state", parallel_state)
+
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            synchronize=lambda rank: events.append(f"synchronize:{rank}"),
+            empty_cache=lambda: events.append("empty-cache"),
+        )
+    )
+    backend = runner._SglangCustomAllReduceRankBackend(SimpleNamespace(rank=2))
+    backend._torch = torch
+    backend._dist = object()
+    backend._ca_comm = object()
+    backend._graph_capture = object()
+    backend._cases[("half", "all_reduce", 32768)] = object()
+
+    backend.destroy()
+    backend.destroy()
+
+    assert events == [
+        "synchronize:2",
+        "destroy-model-parallel",
+        "destroy-distributed-environment",
+        "empty-cache",
+    ]
+    assert backend._cases == {}
+    assert backend._torch is None
+    assert backend._dist is None
+    assert backend._ca_comm is None
+    assert backend._graph_capture is None
+
+
+@pytest.mark.parametrize("framework_version", ("0.5.10", "0.5.10rc0"))
 def test_lazy_custom_allreduce_reuses_and_closes_one_four_rank_group(
     monkeypatch: pytest.MonkeyPatch,
+    framework_version: str,
 ) -> None:
     from aiconfigurator.collector import executor
 
@@ -294,7 +340,7 @@ def test_lazy_custom_allreduce_reuses_and_closes_one_four_rank_group(
     runner.close_custom_allreduce_worker()
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b,GPU-c,GPU-d")
     monkeypatch.setattr(executor, "PersistentNcclRankGroup", _RankGroup)
-    monkeypatch.setattr(runner, "_runtime_metadata", lambda: ("0.5.10", "NVIDIA GB200"))
+    monkeypatch.setattr(runner, "_runtime_metadata", lambda: (framework_version, "NVIDIA GB200"))
 
     first = runner.run_custom_allreduce_case("half", 4, 32768, protocol=protocol)
     second = runner.run_custom_allreduce_case("half", 4, 65536, protocol=protocol)
@@ -315,7 +361,7 @@ def test_lazy_custom_allreduce_reuses_and_closes_one_four_rank_group(
     assert first.latency_ms == second.latency_ms == pytest.approx(1.25)
     assert first.perf_row == {
         "framework": "SGLang",
-        "version": "0.5.10",
+        "version": framework_version,
         "device": "NVIDIA GB200",
         "op_name": "all_reduce",
         "kernel_source": "SGLang_CustomAllReduce_graph",
@@ -328,7 +374,7 @@ def test_lazy_custom_allreduce_reuses_and_closes_one_four_rank_group(
     assert second.perf_row["message_size"] == 65536
     assert first.provenance == {
         "framework": "SGLang",
-        "framework_version": "0.5.10",
+        "framework_version": framework_version,
         "kernel_source": "SGLang_CustomAllReduce_graph",
         "device": "NVIDIA GB200",
         "runtime": "persistent_sglang_custom_allreduce",
@@ -339,6 +385,103 @@ def test_lazy_custom_allreduce_reuses_and_closes_one_four_rank_group(
         "model_artifact": "sgl-project/DeepSeek-V4-Flash-FP8",
         "physical_dtype": "bfloat16",
     }
+
+
+@pytest.mark.parametrize("framework_version", ("0.5.10rc1", "0.5.11"))
+def test_custom_allreduce_rejects_other_sglang_versions_before_rank_group_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+    framework_version: str,
+) -> None:
+    runner = _runner()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b,GPU-c,GPU-d")
+    monkeypatch.setattr(runner, "_runtime_metadata", lambda: (framework_version, "NVIDIA GB200"))
+    monkeypatch.setattr(
+        runner,
+        "_persistent_rank_group",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError(f"rank group acquired: {kwargs}")),
+    )
+
+    with pytest.raises(RuntimeError, match=r"requires SGLang"):
+        runner.run_custom_allreduce_case("half", 4, 32768, protocol=_protocol())
+
+
+@pytest.mark.parametrize("identity_change", ["device_uuids", "protocol"])
+def test_custom_allreduce_identity_change_closes_and_resets_rank_group(
+    monkeypatch: pytest.MonkeyPatch,
+    identity_change: str,
+) -> None:
+    from aiconfigurator.collector import executor
+
+    runner = _runner()
+    groups: list[Any] = []
+
+    class _RankGroup:
+        def __init__(self, *, device_uuids, protocol, worker_target, collect_all_rank_samples) -> None:
+            self.device_uuids = device_uuids
+            self.protocol_digest = protocol.digest
+            self.close_calls = 0
+            groups.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    runner.close_custom_allreduce_worker()
+    monkeypatch.setattr(executor, "PersistentNcclRankGroup", _RankGroup)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b,GPU-c,GPU-d")
+    protocol = _protocol()
+    first = runner._persistent_rank_group(world_size=4, protocol=protocol)
+
+    if identity_change == "device_uuids":
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-e,GPU-f,GPU-g,GPU-h")
+        changed_protocol = protocol
+    else:
+        changed_protocol = _protocol(samples=5)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        runner._persistent_rank_group(world_size=4, protocol=changed_protocol)
+
+    assert first.close_calls == 1
+    replacement = runner._persistent_rank_group(world_size=4, protocol=changed_protocol)
+    assert replacement is not first
+    assert len(groups) == 2
+    runner.close_custom_allreduce_worker()
+    assert replacement.close_calls == 1
+
+
+def test_custom_allreduce_replaces_poisoned_rank_group_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiconfigurator.collector import executor
+
+    runner = _runner()
+    groups: list[Any] = []
+
+    class _RankGroup:
+        def __init__(self, *, device_uuids, protocol, worker_target, collect_all_rank_samples) -> None:
+            del worker_target, collect_all_rank_samples
+            self.device_uuids = device_uuids
+            self.protocol_digest = protocol.digest
+            self.poisoned = False
+            self.close_calls = 0
+            groups.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    runner.close_custom_allreduce_worker()
+    monkeypatch.setattr(executor, "PersistentNcclRankGroup", _RankGroup)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b,GPU-c,GPU-d")
+    protocol = _protocol()
+    poisoned = runner._persistent_rank_group(world_size=4, protocol=protocol)
+    poisoned.poisoned = True
+
+    replacement = runner._persistent_rank_group(world_size=4, protocol=protocol)
+
+    assert replacement is not poisoned
+    assert poisoned.close_calls == 1
+    assert len(groups) == 2
+    runner.close_custom_allreduce_worker()
+    assert replacement.close_calls == 1
 
 
 def test_custom_allreduce_protocol_and_visibility_fail_before_rank_group_creation(

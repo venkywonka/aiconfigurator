@@ -23,6 +23,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementProtocol,
     MeasurementRequest,
     PerfKey,
+    ProtocolMismatchError,
 )
 
 pytestmark = pytest.mark.unit
@@ -52,13 +53,13 @@ _SEMANTIC_DESCRIPTOR = {
 }
 
 
-def _environment() -> MeasurementEnvironment:
+def _environment(sglang_version: str = "0.5.10") -> MeasurementEnvironment:
     return MeasurementEnvironment(
         system="gb200",
         backend="sglang",
-        backend_version="0.5.10",
+        backend_version=sglang_version,
         gpu_class="NVIDIA GB200",
-        runtime_versions=_RUNTIME_VERSIONS,
+        runtime_versions={**_RUNTIME_VERSIONS, "sglang": sglang_version},
         topology_schema="nvidia-smi-v1",
         topology_fingerprint="gb200-nvlink4",
         profile_compatibility=_PROFILE_COMPATIBILITY,
@@ -104,6 +105,14 @@ def _request(
     )
 
 
+def test_custom_allreduce_rejects_malformed_sampling_protocol_as_protocol_mismatch() -> None:
+    _, adapter = _custom_allreduce_modules()
+    request = replace(_request(), protocol=replace(_protocol(), samples=2))
+
+    with pytest.raises(ProtocolMismatchError, match="samples must be at least three"):
+        adapter.custom_allreduce_request_to_case(request)
+
+
 def _custom_allreduce_modules():
     runner = importlib.import_module("aiconfigurator.collector.sglang.custom_allreduce")
     adapter = importlib.import_module("aiconfigurator.collector.sglang.custom_allreduce_adapter")
@@ -112,6 +121,7 @@ def _custom_allreduce_modules():
 
 def _raw_result(request: MeasurementRequest) -> dict[str, object]:
     latency_ms = 1.25
+    framework_version = request.environment.backend_version
     return {
         "latency_ms": latency_ms,
         "energy_wms": 125.0,
@@ -120,7 +130,7 @@ def _raw_result(request: MeasurementRequest) -> dict[str, object]:
         "protocol_digest": request.protocol.digest,
         "perf_row": {
             "framework": "SGLang",
-            "version": "0.5.10",
+            "version": framework_version,
             "device": "NVIDIA GB200",
             "op_name": "all_reduce",
             "kernel_source": "SGLang_CustomAllReduce_graph",
@@ -132,7 +142,7 @@ def _raw_result(request: MeasurementRequest) -> dict[str, object]:
         },
         "provenance": {
             "framework": "SGLang",
-            "framework_version": "0.5.10",
+            "framework_version": framework_version,
             "kernel_source": "SGLang_CustomAllReduce_graph",
             "device": "NVIDIA GB200",
             "runtime": "persistent_sglang_custom_allreduce",
@@ -141,6 +151,7 @@ def _raw_result(request: MeasurementRequest) -> dict[str, object]:
             "world_size": 4,
             "rank_pids": [101, 102, 103, 104],
             "model_artifact": _MODEL_ARTIFACT,
+            "physical_dtype": "bfloat16",
         },
     }
 
@@ -188,6 +199,29 @@ def test_canonical_case_translation_and_world4_nvlink_resource_contract() -> Non
         fabric=FabricRequirement.NVLINK,
         reserve_fabric_domain=True,
     )
+
+
+@pytest.mark.parametrize("sglang_version", ["0.5.10", "0.5.10rc0"])
+def test_custom_allreduce_preserves_exact_supported_sglang_runtime_identity(
+    sglang_version: str,
+) -> None:
+    _, adapter = _custom_allreduce_modules()
+    request = _request(environment=_environment(sglang_version))
+
+    case = adapter.custom_allreduce_request_to_case(request)
+    record = adapter.custom_allreduce_result_to_record(request, case, _raw_result(request))
+
+    assert record.key == request.key
+    assert request.environment.backend_version == sglang_version
+    assert record.provenance["framework_version"] == sglang_version
+
+
+def test_custom_allreduce_rejects_unapproved_release_candidate_runtime() -> None:
+    _, adapter = _custom_allreduce_modules()
+    request = _request(environment=_environment("0.5.10rc1"))
+
+    with pytest.raises(ValueError, match="runtime capability"):
+        adapter.custom_allreduce_request_to_case(request)
 
 
 @pytest.mark.parametrize(
@@ -290,6 +324,8 @@ def test_result_samples_protocol_provenance_and_key_round_trip() -> None:
         (lambda raw: raw.__setitem__("protocol_digest", "wrong"), "protocol"),
         (lambda raw: raw["provenance"].__setitem__("used_cuda_graph", False), "CUDA Graph|graph"),
         (lambda raw: raw["provenance"].__setitem__("throttled", True), "throttled"),
+        (lambda raw: raw["provenance"].pop("physical_dtype"), "physical dtype"),
+        (lambda raw: raw["provenance"].__setitem__("physical_dtype", "float16"), "physical dtype"),
         (lambda raw: raw["perf_row"].__setitem__("num_gpus", 2), "identity|world|GPU"),
     ],
 )

@@ -11,9 +11,11 @@ import pytest
 
 pytest.importorskip("dynamo.mocker")
 
+import dynamo._core as dynamo_core
 import dynamo.mocker
 import dynamo.replay.api
 
+import spica.evaluator as evaluator_mod
 from spica.config import OptimizationGoal, OptimizationTarget, SLATarget, Workload
 from spica.deploy import DeploymentPlan
 from spica.evaluator import ReplayEvaluator
@@ -72,6 +74,99 @@ def test_static_agg_uses_plain_path(monkeypatch):
     assert report["output_throughput_tok_s"] == 42.0
     assert rec["num_workers"] == 2 and rec["trace_files"] == "/tmp/t.jsonl" and rec["router_mode"] == "round_robin"
     assert "sla_ttft_ms" not in rec  # no SLA on a throughput goal -> none threaded
+
+
+def test_successful_candidate_preserves_rich_resolution_report(monkeypatch):
+    monkeypatch.setattr(dynamo.mocker, "MockEngineArgs", _FakeArgs, raising=False)
+    rich = {
+        "callbacks": [
+            {
+                "collection": {"new_keys_delta": 1},
+                "final_evidence": [{"path": "/tmp/overlay.sqlite3", "sequence": 1}],
+            },
+            {
+                "collection": {"new_keys_delta": 0},
+                "final_evidence": [{"path": "/tmp/overlay.sqlite3", "sequence": 1}],
+            },
+        ]
+    }
+    monkeypatch.setattr(
+        dynamo.replay.api,
+        "run_trace_replay",
+        lambda **kw: {"output_throughput_tok_s": 42.0, "aic_resolution_report": rich},
+    )
+
+    report = ReplayEvaluator(_wl(), OptimizationGoal(target=OptimizationTarget.THROUGHPUT)).evaluate(
+        _agg_plan(static=True)
+    )
+
+    assert report["aic_resolution_report"] == rich
+    assert report["aic_resolution_report"]["callbacks"][0]["collection"]["new_keys_delta"] == 1
+    assert report["aic_resolution_report"]["callbacks"][1]["collection"]["new_keys_delta"] == 0
+
+
+def test_hybrid_degraded_success_remains_a_metric_report_with_visible_provenance(monkeypatch):
+    monkeypatch.setattr(dynamo.mocker, "MockEngineArgs", _FakeArgs, raising=False)
+    degraded = {
+        "final_source_counts": {"overlay": 1, "curated_exact": 0, "fallback": 1},
+        "hybrid_fallbacks": [
+            {
+                "key_digest": "attention-key",
+                "path": "/tmp/evidence.sqlite.live-fallbacks/attention-key.json",
+                "hybrid_provenance": {
+                    "source": "empirical",
+                    "prediction_revision": "aic-v1.3-test",
+                },
+                "measurement_failure": {
+                    "code": "timeout",
+                    "operation": "attention.context",
+                    "detail": "collector deadline expired",
+                },
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        dynamo.replay.api,
+        "run_trace_replay",
+        lambda **kwargs: {
+            "output_throughput_tok_s": 42.0,
+            "aic_resolution_report": degraded,
+        },
+    )
+
+    result = ReplayEvaluator(_wl(), OptimizationGoal(target=OptimizationTarget.THROUGHPUT)).evaluate(
+        _agg_plan(static=True)
+    )
+
+    assert not isinstance(result, evaluator_mod.UnscorableCandidate)
+    assert result["output_throughput_tok_s"] == 42.0
+    assert result["aic_resolution_report"] == degraded
+
+
+def test_typed_resolution_error_becomes_unscorable_candidate(monkeypatch):
+    monkeypatch.setattr(dynamo.mocker, "MockEngineArgs", _FakeArgs, raising=False)
+    report = {"status": "failed", "unresolved": [{"key": "gemm:abc"}]}
+    error = dynamo_core.AicResolutionError("exact AIC resolution failed")
+    error.code = "budget_exhausted"
+    error.operation = "gemm"
+    error.detail = "max_new_keys=1 exhausted"
+    error.report = report
+
+    def fail_resolution(**kwargs):
+        raise error
+
+    monkeypatch.setattr(dynamo.replay.api, "run_trace_replay", fail_resolution)
+
+    result = ReplayEvaluator(_wl(), OptimizationGoal(target=OptimizationTarget.THROUGHPUT)).evaluate(
+        _agg_plan(static=True)
+    )
+
+    assert result == evaluator_mod.UnscorableCandidate(
+        code="budget_exhausted",
+        operation="gemm",
+        detail="max_new_keys=1 exhausted",
+        report=report,
+    )
 
 
 def test_static_path_threads_goodput_sla(monkeypatch):
@@ -155,11 +250,15 @@ def test_scaling_agg_threads_planner_config_when_supported(monkeypatch):
 
 def test_scaling_report_preserves_planner_tick_count(monkeypatch):
     monkeypatch.setattr(dynamo.mocker, "MockEngineArgs", _FakeArgs, raising=False)
+    rich = {
+        "status": "resolved",
+        "callbacks": [{"operation": "gemm", "collection": {"new_keys_delta": 1}}],
+    }
     monkeypatch.setattr(
         dynamo.replay.api,
         "run_trace_replay",
         lambda **kw: SimpleNamespace(
-            trace_report={"output_throughput_tok_s": 42.0},
+            trace_report={"output_throughput_tok_s": 42.0, "aic_resolution_report": rich},
             total_ticks=3,
         ),
     )
@@ -167,6 +266,7 @@ def test_scaling_report_preserves_planner_tick_count(monkeypatch):
     report = ReplayEvaluator(_wl(), goal).evaluate(_agg_plan(static=False))
     assert report["output_throughput_tok_s"] == 42.0
     assert report["planner_total_ticks"] == 3.0
+    assert report["aic_resolution_report"] == rich
 
 
 def test_kv_router_config_is_built_and_passed(monkeypatch):

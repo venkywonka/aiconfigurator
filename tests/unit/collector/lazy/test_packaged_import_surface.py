@@ -25,6 +25,7 @@ _LIGHTWEIGHT_MODULES = (
     "aiconfigurator.collector.trtllm.gemm_adapter",
     "aiconfigurator.collector.trtllm.gemm",
     "aiconfigurator.collector.sglang.registry",
+    "aiconfigurator.collector.sglang.gemm",
     "aiconfigurator.collector.network.registry",
     "aiconfigurator.collector.network.nccl_adapter",
     "aiconfigurator.collector.network.nccl",
@@ -62,14 +63,13 @@ def test_packaged_modules_import_from_src_only_without_heavy_or_legacy_dependenc
             importlib.import_module(module_name)
 
         from aiconfigurator.collector.adapters import LazyAdapterIndex
-        from aiconfigurator.collector.sglang.registry import SGLANG_LAZY_REGISTRY
-        from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
+        from aiconfigurator.collector.sglang.registry import GEMM_LAZY_SPEC, SGLANG_LAZY_REGISTRY
 
         routes = LazyAdapterIndex.from_registries({{"sglang": SGLANG_LAZY_REGISTRY}}).routes_for(
             (GEMM_LAZY_SPEC.namespace, "sglang", "0.5.10")
         )
         assert len(routes) == 1
-        assert routes[0].collector_module == "aiconfigurator.collector.trtllm.gemm"
+        assert routes[0].collector_module == "aiconfigurator.collector.sglang.gemm"
 
         loaded = sorted(
             name for name in sys.modules if name.partition(".")[0] in blocked_roots
@@ -132,15 +132,14 @@ def test_source_sglang_registry_reuses_packaged_gemm_spec_by_identity() -> None:
 
 def test_packaged_sglang_registry_resolves_the_frozen_gemm_route() -> None:
     from aiconfigurator.collector.adapters import LazyAdapterIndex
-    from aiconfigurator.collector.sglang.registry import SGLANG_LAZY_REGISTRY
-    from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
+    from aiconfigurator.collector.sglang.registry import GEMM_LAZY_SPEC, SGLANG_LAZY_REGISTRY
 
     routes = LazyAdapterIndex.from_registries({"sglang": SGLANG_LAZY_REGISTRY}).routes_for(
         (GEMM_LAZY_SPEC.namespace, "sglang", "0.5.10")
     )
 
     assert len(routes) == 1
-    assert routes[0].collector_module == "aiconfigurator.collector.trtllm.gemm"
+    assert routes[0].collector_module == "aiconfigurator.collector.sglang.gemm"
     assert routes[0].lazy is GEMM_LAZY_SPEC
 
 

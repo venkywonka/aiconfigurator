@@ -340,6 +340,36 @@ def test_frozen_attention_request_has_exact_namespace_profile_and_key(
     assert request.semantic_descriptor == _SEMANTIC_DESCRIPTOR
 
 
+def test_coherent_release_candidate_request_keeps_exact_identity_over_stable_curated_profile(
+    dsv4_profile_model,
+) -> None:
+    operation = _operation(dsv4_profile_model, "context", 4)
+    database = _ProfileDatabase()
+    stable_request = operation.measurement_request(
+        database,
+        _protocol(),
+        **_runtime_inputs("context"),
+    )
+    database.measurement_environment = replace(
+        database.measurement_environment,
+        backend_version="0.5.10rc0",
+        runtime_versions={**_RUNTIME_VERSIONS, "sglang": "0.5.10rc0"},
+    )
+
+    request = operation.measurement_request(
+        database,
+        _protocol(),
+        **_runtime_inputs("context"),
+    )
+
+    assert request is not None
+    assert stable_request is not None
+    assert database.version == "0.5.10"
+    assert request.environment.backend_version == "0.5.10rc0"
+    assert request.environment.runtime_versions["sglang"] == "0.5.10rc0"
+    assert request.key != stable_request.key
+
+
 @pytest.mark.parametrize(("phase", "compress_ratio", "namespace"), _CASES)
 def test_attention_scale_and_consumer_identity_do_not_change_physical_key(
     dsv4_profile_model,

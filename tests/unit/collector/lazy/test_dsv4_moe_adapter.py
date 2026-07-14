@@ -26,6 +26,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementProtocol,
     MeasurementRequest,
     PerfKey,
+    ProtocolMismatchError,
 )
 
 pytestmark = pytest.mark.unit
@@ -139,8 +140,17 @@ def _request_with_profile_mismatch(field: str, value: object) -> MeasurementRequ
     )
 
 
+def test_moe_rejects_malformed_sampling_protocol_as_protocol_mismatch() -> None:
+    _, adapter = _moe_modules()
+    request = replace(_request(), protocol=replace(_protocol(), samples=2))
+
+    with pytest.raises(ProtocolMismatchError, match="samples must be at least three"):
+        adapter.moe_request_to_case(request)
+
+
 def _raw_result(request: MeasurementRequest) -> dict[str, object]:
     latency_ms = 1.25
+    framework_version = request.environment.backend_version
     return {
         "latency_ms": latency_ms,
         "energy_wms": 125.0,
@@ -149,7 +159,7 @@ def _raw_result(request: MeasurementRequest) -> dict[str, object]:
         "protocol_digest": request.protocol.digest,
         "perf_row": {
             "framework": "SGLang",
-            "version": "0.5.10",
+            "version": framework_version,
             "device": "NVIDIA GB200",
             "op_name": "moe",
             "kernel_source": "sglang_fused_moe_triton",
@@ -166,7 +176,7 @@ def _raw_result(request: MeasurementRequest) -> dict[str, object]:
         },
         "provenance": {
             "framework": "SGLang",
-            "framework_version": "0.5.10",
+            "framework_version": framework_version,
             "kernel_source": "sglang_fused_moe_triton",
             "device": "NVIDIA GB200",
             "used_cuda_graph": True,
@@ -228,6 +238,24 @@ def test_unseen_positive_token_count_is_an_in_domain_exact_case() -> None:
     assert adapter.moe_request_to_case(request) == _query(num_tokens=23)
 
 
+@pytest.mark.parametrize("sglang_version", ["0.5.10", "0.5.10rc0"])
+def test_moe_preserves_exact_supported_sglang_runtime_identity(sglang_version: str) -> None:
+    _, adapter = _moe_modules()
+    environment = replace(
+        _environment(),
+        backend_version=sglang_version,
+        runtime_versions={**_RUNTIME_VERSIONS, "sglang": sglang_version},
+    )
+    request = _request(environment=environment)
+
+    case = adapter.moe_request_to_case(request)
+    record = adapter.moe_result_to_record(request, case, _raw_result(request))
+
+    assert record.key == request.key
+    assert request.environment.backend_version == sglang_version
+    assert record.provenance["framework_version"] == sglang_version
+
+
 @pytest.mark.parametrize(
     ("mismatch", "request_factory"),
     [
@@ -239,8 +267,8 @@ def test_unseen_positive_token_count_is_an_in_domain_exact_case() -> None:
             lambda: _request(
                 environment=replace(
                     _environment(),
-                    backend_version="0.5.11",
-                    runtime_versions={**_RUNTIME_VERSIONS, "sglang": "0.5.11"},
+                    backend_version="0.5.10rc1",
+                    runtime_versions={**_RUNTIME_VERSIONS, "sglang": "0.5.10rc1"},
                 )
             ),
         ),

@@ -12,9 +12,9 @@ import pytest
 
 from aiconfigurator.collector.adapters import LazyAdapterIndex
 from aiconfigurator.collector.registry_types import PerfFile
-from aiconfigurator.collector.sglang.registry import SGLANG_LAZY_REGISTRY
+from aiconfigurator.collector.sglang.registry import GEMM_LAZY_SPEC, SGLANG_LAZY_REGISTRY
 from aiconfigurator.collector.trtllm import gemm_adapter
-from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
+from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC as TRTLLM_GEMM_LAZY_SPEC
 from aiconfigurator.collector.types import FabricRequirement, ResourceContract
 from aiconfigurator.sdk import common, config
 from aiconfigurator.sdk.models import get_model
@@ -34,7 +34,6 @@ _RUNTIME_VERSIONS = {
     "cuda": "13.0",
     "model_profile": "dsv4-v1.2",
     "sglang": "0.5.10",
-    "tensorrt_llm": "1.3.0rc10",
 }
 
 
@@ -67,7 +66,7 @@ def _protocol() -> MeasurementProtocol:
         samples=3,
         statistic="median",
         timer="cuda_event",
-        tuning_revision="trtllm-linear-v1",
+        tuning_revision="sglang-gemm-v1",
     )
 
 
@@ -112,9 +111,9 @@ def _request(
     return request
 
 
-def _sglang_route():
+def _sglang_route(backend_version: str = "0.5.10"):
     routes = LazyAdapterIndex.from_registries({"sglang": SGLANG_LAZY_REGISTRY}).routes_for(
-        (_NAMESPACE, "sglang", "0.5.10")
+        (_NAMESPACE, "sglang", backend_version)
     )
     assert len(routes) == 1
     return routes[0]
@@ -136,8 +135,8 @@ def _raw_result(request: MeasurementRequest, *, kernel_source: str) -> dict[str,
             "latency": latency_ms,
         },
         "provenance": {
-            "framework": "TRTLLM",
-            "framework_version": "1.3.0rc10",
+            "framework": "SGLang",
+            "framework_version": request.environment.backend_version,
             "kernel_source": kernel_source,
             "device": "NVIDIA GB200",
             "used_cuda_graph": True,
@@ -150,9 +149,10 @@ def test_sglang_registry_installs_one_packaged_gemm_route() -> None:
 
     assert gemm_entry.lazy is GEMM_LAZY_SPEC
     assert SGLANG_LAZY_REGISTRY[0].lazy is GEMM_LAZY_SPEC
+    assert GEMM_LAZY_SPEC is not TRTLLM_GEMM_LAZY_SPEC
     routes = LazyAdapterIndex.from_registries({"sglang": SGLANG_REGISTRY}).routes_for((_NAMESPACE, "sglang", "0.5.10"))
     assert len(routes) == 1
-    assert routes[0].lazy.run_module == "aiconfigurator.collector.trtllm.gemm"
+    assert routes[0].lazy.run_module == "aiconfigurator.collector.sglang.gemm"
 
 
 @pytest.mark.parametrize(
@@ -228,14 +228,64 @@ def test_dsv4_scale_and_consumer_identity_do_not_change_physical_key(dsv4_profil
     assert set(profile_request.query) == {"gemm_type", "m", "n", "k"}
 
 
+def test_rc0_runtime_uses_a_distinct_perf_key_over_the_stable_curated_profile(
+    dsv4_profile_model,
+) -> None:
+    operation = _profile_operation(dsv4_profile_model, "context_router_gemm")
+    stable_request = _request(operation)
+    rc_environment = replace(
+        _environment(),
+        backend_version="0.5.10rc0",
+        runtime_versions={**_RUNTIME_VERSIONS, "sglang": "0.5.10rc0"},
+    )
+    database = _ProfileDatabase(rc_environment)
+    database.version = "0.5.10"
+
+    rc_request = operation.measurement_request(database, _protocol(), x=37)
+
+    assert rc_request is not None
+    assert rc_request.environment.backend_version == "0.5.10rc0"
+    assert rc_request.environment.runtime_versions["sglang"] == "0.5.10rc0"
+    assert rc_request.key != stable_request.key
+    route = _sglang_route("0.5.10rc0")
+    prepared = route.prepare(rc_request)
+    record = route.record(prepared, _raw_result(rc_request, kernel_source="torch_flow"))
+    assert record.key == rc_request.key
+
+
+def test_unsupported_release_candidate_fails_before_resource_acquisition(
+    dsv4_profile_model,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operation = _profile_operation(dsv4_profile_model, "context_router_gemm")
+    environment = replace(
+        _environment(),
+        backend_version="0.5.10rc1",
+        runtime_versions={**_RUNTIME_VERSIONS, "sglang": "0.5.10rc1"},
+    )
+    database = _ProfileDatabase(environment)
+    database.version = "0.5.10"
+    request = operation.measurement_request(database, _protocol(), x=37)
+    assert request is not None
+    resource_calls: list[object] = []
+
+    def _resource(request, case):
+        resource_calls.append((request, case))
+        return ResourceContract(gpu_count=1, fabric=FabricRequirement.NONE)
+
+    monkeypatch.setattr(gemm_adapter, "gemm_resource_for_request", _resource)
+    with pytest.raises(ValueError, match=r"capability|version|runtime"):
+        _sglang_route("0.5.10rc1").prepare(request)
+    assert resource_calls == []
+
+
 @pytest.mark.parametrize(
     "mismatch",
     [
         "system",
         "gpu_class",
         "model_profile",
-        "collector_runtime",
-        "collector_runtime_version",
+        "cuda_runtime",
         "backend_version",
         "shape",
         "quantization",
@@ -257,15 +307,10 @@ def test_dsv4_capability_mismatches_fail_before_resource_acquisition(
             environment,
             runtime_versions={**_RUNTIME_VERSIONS, "model_profile": "other-profile"},
         )
-    elif mismatch == "collector_runtime":
+    elif mismatch == "cuda_runtime":
         environment = replace(
             environment,
-            runtime_versions={key: value for key, value in _RUNTIME_VERSIONS.items() if key != "tensorrt_llm"},
-        )
-    elif mismatch == "collector_runtime_version":
-        environment = replace(
-            environment,
-            runtime_versions={**_RUNTIME_VERSIONS, "tensorrt_llm": "1.3.0rc9"},
+            runtime_versions={**_RUNTIME_VERSIONS, "cuda": "12.9"},
         )
     elif mismatch == "backend_version":
         environment = replace(

@@ -54,6 +54,66 @@ def test_agg_static_disabled_uses_plain_path():
     assert ea["aic_moe_tp_size"] == 1 and ea["aic_moe_ep_size"] == 4  # MoE shape
     assert ea["max_num_seqs"] == 512 and ea["worker_type"] == "aggregated"
     assert "num_gpu_blocks" not in ea  # replay estimates it
+    assert "aic_resolution" not in ea  # pure/default replay remains collection-free
+
+
+def test_agg_resolution_payload_is_exact_and_restart_stable(tmp_path):
+    sample = unroll_sample(
+        search_space=_space(backend=["sglang"]),
+        selection=_agg_sel(backend="sglang"),
+        parallel_config=AGG_MOE,
+    )
+    resolution = {
+        "policy": "measure_on_miss",
+        "overlay_path": str((tmp_path / "evidence.sqlite").resolve()),
+        "max_new_keys": 32,
+        "max_wall_seconds": 90.0,
+        "gpu_ids": [0, 1, 2, 3],
+    }
+
+    first = build_deployment(sample, backend_version=BV, aic_resolution=resolution)
+    restarted = build_deployment(sample, backend_version=BV, aic_resolution=resolution)
+
+    assert first.agg_engine_args["aic_resolution"] == resolution
+    assert restarted.agg_engine_args["aic_resolution"] == resolution
+    assert first.agg_engine_args["aic_resolution"] is not resolution
+
+
+def test_disagg_resolution_is_rejected_before_payload_construction(tmp_path):
+    cfg = DisaggParallelConfig(
+        prefill=ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), 1),
+        decode=ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), 1),
+    )
+    selection = _agg_sel(
+        deployment_mode="disagg",
+        backend="sglang",
+        prefill_max_num_batched_tokens=32768,
+        prefill_max_num_seqs=4,
+        decode_max_num_batched_tokens=8192,
+        decode_max_num_seqs=1024,
+    )
+    sample = unroll_sample(search_space=_space(), selection=selection, parallel_config=cfg)
+    resolution = {
+        "policy": "observe_only",
+        "overlay_path": str((tmp_path / "evidence.sqlite").resolve()),
+        "max_new_keys": 256,
+        "max_wall_seconds": 600.0,
+        "gpu_ids": None,
+    }
+
+    with pytest.raises(ValueError, match=r"aic_resolution.*deployment_mode.*agg"):
+        build_deployment(sample, backend_version=BV, aic_resolution=resolution)
+
+
+def test_trtllm_resolution_is_rejected_before_payload_construction(tmp_path):
+    sample = unroll_sample(search_space=_space(), selection=_agg_sel(), parallel_config=AGG_MOE)
+    resolution = {
+        "policy": "measure_on_miss",
+        "overlay_path": str((tmp_path / "evidence.sqlite").resolve()),
+    }
+
+    with pytest.raises(ValueError, match=r"aic_resolution.*backend.*sglang"):
+        build_deployment(sample, backend_version=BV, aic_resolution=resolution)
 
 
 def test_agg_scaling_builds_planner_config():
@@ -130,6 +190,30 @@ def test_disagg_builds_both_roles():
     assert pc["prefill_engine_num_gpu"] == 8 and pc["decode_engine_num_gpu"] == 8
     assert "ttft_ms" not in pc and "itl_ms" not in pc  # non-sla target ignores the SLA
     assert "decode_scale_up_kv_rate" not in pc  # no load-target kv_rate plumbing anymore
+
+
+def test_resolution_rejects_attention_dp_above_one_for_aggregated_sglang(tmp_path):
+    dp_eight = ReplicaParallelConfig(ParallelShape(tp=1, dp=8, moe_tp=1, moe_ep=8), 1)
+    selection = _agg_sel(backend="sglang")
+    sample = unroll_sample(
+        search_space=_space(backend=["sglang"]),
+        selection=selection,
+        parallel_config=dp_eight,
+    )
+    resolution = {
+        "policy": "measure_on_miss",
+        "overlay_path": str((tmp_path / "evidence.sqlite").resolve()),
+        "max_new_keys": 256,
+        "max_wall_seconds": 600.0,
+        "gpu_ids": [0, 1, 2, 3],
+    }
+
+    # The same DP8 deployment remains valid in pure/default mode.
+    pure_plan = build_deployment(sample, backend_version=BV)
+    pure_args = pure_plan.agg_engine_args
+    assert pure_args["aic_attention_dp_size"] == 8
+    with pytest.raises(ValueError, match=r"aic_resolution.*role 'agg'.*attention_dp=8"):
+        build_deployment(sample, backend_version=BV, aic_resolution=resolution)
 
 
 def test_kv_router_emits_router_config():

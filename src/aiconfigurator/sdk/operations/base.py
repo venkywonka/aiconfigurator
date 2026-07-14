@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import os
 from collections import defaultdict
 from collections.abc import Mapping
@@ -38,7 +39,8 @@ from aiconfigurator.sdk.performance_result import PerformanceResult
 
 if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
-    from aiconfigurator.sdk.resolution.session import ResolutionSession
+    from aiconfigurator.sdk.resolution.fallback import FallbackRecord
+    from aiconfigurator.sdk.resolution.session import HybridFallbackValue, ResolutionSession
     from aiconfigurator.sdk.resolution.types import MeasurementProtocol, MeasurementRecord, MeasurementRequest
 
 logger = logging.getLogger(__name__)
@@ -154,6 +156,10 @@ class Operation:
     # ``is_resolution_deterministic`` instead of setting this class capability.
     _RESOLUTION_DETERMINISTIC: ClassVar[bool] = False
 
+    # Static namespace used by capability preflight. Runtime query tracing
+    # remains authoritative for the exact MeasurementRequest and shape.
+    _RESOLUTION_NAMESPACE: ClassVar[str | None] = None
+
     def __init__(self, name: str, scale_factor: float, *, seq_split: int = 1) -> None:
         if seq_split > 1 and not self._CP_AWARE:
             raise NotImplementedError(
@@ -185,6 +191,25 @@ class Operation:
         """Whether this exact invocation is a reviewed analytical result."""
         del kwargs
         return self._RESOLUTION_DETERMINISTIC
+
+    def resolution_capabilities(self):
+        """Classify this reachable op without executing or forecasting it."""
+        from aiconfigurator.collector.preflight import OperationCapability, OperationKind
+
+        operation = type(self).__name__
+        if self._RESOLUTION_NAMESPACE is not None:
+            kind = OperationKind.MEASURED
+            namespace = self._RESOLUTION_NAMESPACE
+        elif self.is_resolution_deterministic():
+            kind = OperationKind.DETERMINISTIC
+            namespace = None
+        elif self._OWNS_RESOLUTION_WALK:
+            kind = OperationKind.COMPOSITION_ONLY
+            namespace = None
+        else:
+            kind = OperationKind.UNSUPPORTED
+            namespace = None
+        return (OperationCapability(operation, kind, namespace),)
 
     def _normalize_for_resolution(self, **kwargs: object) -> Mapping[str, object]:
         normalized_query = self.normalize_perf_query(**kwargs)
@@ -258,6 +283,58 @@ class Operation:
         """Convert validated overlay evidence using this operation's scaling."""
         return record.performance_result(scale_factor=self._scale_factor)
 
+    def hybrid_fallback_value(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> HybridFallbackValue:
+        """Return one unscaled physical HYBRID value for durable per-key fallback."""
+
+        from aiconfigurator.sdk import common
+        from aiconfigurator.sdk.perf_database import _get_configured_database_view
+        from aiconfigurator.sdk.resolution.session import HybridFallbackValue
+
+        if not math.isfinite(self._scale_factor) or self._scale_factor <= 0:
+            raise ValueError("HYBRID fallback requires a finite positive operation scale factor")
+        hybrid_database = _get_configured_database_view(
+            database,
+            common.DatabaseMode.HYBRID,
+            getattr(database, "transfer_policy", None),
+        )
+        result = self.provisional_result(
+            hybrid_database,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
+        return HybridFallbackValue(
+            latency_ms=float(result) / self._scale_factor,
+            source=result.source,
+            provenance=dict(result.provenance),
+        )
+
+    def performance_from_fallback(self, record: FallbackRecord, **kwargs) -> PerformanceResult:
+        """Apply consumer scaling once to a durable unscaled HYBRID fallback."""
+
+        del kwargs
+        return PerformanceResult(
+            record.latency_ms * self._scale_factor,
+            energy=0.0,
+            source="hybrid",
+            provenance={
+                "fallback_identity": record.identity_digest,
+                "fallback_path": str(record.path),
+                "hybrid_source": record.hybrid_source,
+                "prediction_revision": record.prediction_revision,
+                "measurement_failure": {
+                    "code": record.measurement_failure.code.value,
+                    "operation": record.measurement_failure.operation,
+                    "detail": record.measurement_failure.detail,
+                },
+            },
+        )
+
     def query_with_resolution(
         self,
         database: PerfDatabase,
@@ -270,7 +347,10 @@ class Operation:
             return self.query(database, **kwargs)
 
         from aiconfigurator.sdk import common
-        from aiconfigurator.sdk.perf_database import _get_configured_database_view
+        from aiconfigurator.sdk.perf_database import (
+            _MISSING_SILICON_DATA_EXCEPTIONS,
+            _get_configured_database_view,
+        )
 
         exact_database = _get_configured_database_view(
             database,
@@ -291,7 +371,7 @@ class Operation:
             except Exception as error:
                 binding_error = error
             else:
-                record = session.lookup(request.key, request.protocol)
+                record = session.lookup(request.key, request.protocol, consumer=self._name)
                 if record is not None:
                     return self.performance_from_record(record, **kwargs)
 
@@ -301,7 +381,33 @@ class Operation:
             **kwargs,
         )
         if curated is not None:
+            if request is not None:
+                curated_evidence = {
+                    "latency_ms": float(curated),
+                    "energy_wms": float(curated.energy),
+                    "provenance": dict(curated.provenance),
+                }
+                try:
+                    session.record_curated_hit(request.key, self._name, evidence_link=curated_evidence)
+                except (TypeError, ValueError):
+                    # Evidence reporting must never change the float-compatible
+                    # curated query contract. Retain the exact value and mark an
+                    # opaque/non-finite provenance payload as unavailable.
+                    session.record_curated_hit(
+                        request.key,
+                        self._name,
+                        evidence_link={
+                            "latency_ms": float(curated),
+                            "energy_wms": float(curated.energy),
+                            "provenance": {"unavailable": "not_json_safe"},
+                        },
+                    )
             return curated
+
+        if request is not None and binding_error is None:
+            fallback = session.lookup_fallback(request.key, self._name)
+            if fallback is not None:
+                return self.performance_from_fallback(fallback, **kwargs)
 
         if request is None or binding_error is not None:
             if binding_error is not None:
@@ -312,13 +418,30 @@ class Operation:
                     RuntimeError("operation has no literal exact row or lazy adapter for this query"),
                 )
         else:
-            session.record_miss(request, self._name)
+            normalized_snapshot = dict(normalized_query)
+            kwargs_snapshot = dict(kwargs)
+
+            def resolve_hybrid() -> HybridFallbackValue:
+                return self.hybrid_fallback_value(
+                    database,
+                    normalized_query=normalized_snapshot,
+                    **kwargs_snapshot,
+                )
+
+            session.record_miss(
+                request,
+                self._name,
+                hybrid_resolver=resolve_hybrid,
+            )
         session.mark_tainted(self._name)
-        return self.provisional_result(
-            database,
-            normalized_query=normalized_query,
-            **kwargs,
-        )
+        try:
+            return self.provisional_result(
+                database,
+                normalized_query=normalized_query,
+                **kwargs,
+            )
+        except _MISSING_SILICON_DATA_EXCEPTIONS:
+            return PerformanceResult(0.0, energy=0.0, source="unresolved")
 
     def get_weights(self, **kwargs):
         raise NotImplementedError

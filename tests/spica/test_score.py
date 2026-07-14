@@ -33,6 +33,26 @@ REPORT = {
     "planner_total_ticks": 3.0,
 }
 
+RICH_RESOLUTION_REPORT = {
+    "final_source_counts": {"overlay": 1, "curated_exact": 0, "fallback": 1},
+    "callbacks": [
+        {
+            "operation": "gemm",
+            "collection": {"new_keys_delta": 1, "workers": [{"pid": 1234}]},
+        }
+    ],
+    "hybrid_fallbacks": [
+        {
+            "key_digest": "gemm-key",
+            "path": "/tmp/evidence.sqlite.live-fallbacks/gemm-key.json",
+            "hybrid_provenance": {
+                "source": "empirical",
+                "prediction_revision": "aic-v1.3-test",
+            },
+        }
+    ],
+}
+
 
 def test_objective_per_target():
     assert objective_value(REPORT, OptimizationTarget.THROUGHPUT) == 5000.0
@@ -170,6 +190,26 @@ def test_make_candidate_pareto_sets_objectives():
     assert c.objectives == {"throughput_per_gpu": 1250.0, "throughput_per_user": 50.0}
     assert c.score == 1250.0  # headline = first objective
     assert c.metrics["mean_output_token_throughput_per_user"] == 50.0
+
+
+@pytest.mark.parametrize("target", [OptimizationTarget.THROUGHPUT, OptimizationTarget.PARETO])
+def test_make_candidate_preserves_json_safe_resolution_report(target):
+    kwargs = {}
+    if target is OptimizationTarget.PARETO:
+        kwargs["pareto_objectives"] = [
+            OptimizationTarget.THROUGHPUT_PER_GPU,
+            OptimizationTarget.THROUGHPUT_PER_USER,
+        ]
+    candidate = make_candidate(
+        {"used_gpus": 8},
+        {**REPORT, "aic_resolution_report": RICH_RESOLUTION_REPORT},
+        target,
+        **kwargs,
+    )
+
+    assert candidate.aic_resolution_report == RICH_RESOLUTION_REPORT
+    assert candidate.model_dump(mode="json")["aic_resolution_report"] == RICH_RESOLUTION_REPORT
+    assert make_candidate({"used_gpus": 8}, REPORT, OptimizationTarget.THROUGHPUT).aic_resolution_report is None
 
 
 def test_make_candidate_pareto_requires_objectives():

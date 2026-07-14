@@ -9,7 +9,12 @@ from __future__ import annotations
 # jax/equinox/jaxopt import noise the Vizier GP-bandit pulls in. See spica._quiet.
 from . import _quiet as _quiet
 from .config import (
+    AicResolutionConfig,
+    AicResolutionPolicy,
     Candidate,
+    MeasurementFailurePolicy,
+    MeasurementLease,
+    MeasurementResourcePool,
     OptimizationGoal,
     OptimizationTarget,
     SearchSpace,
@@ -19,7 +24,7 @@ from .config import (
     Workload,
 )
 from .deploy import DeploymentPlan, build_deployment
-from .evaluator import ReplayEvaluator
+from .evaluator import ReplayEvaluator, UnscorableCandidate
 from .kv_estimate import (
     NoPerfDatabase,
     estimate_kv_tokens,
@@ -44,11 +49,16 @@ from .planner import FPM_SAMPLING, LOAD_SENSITIVITY, SCALING_POLICIES, ScalingPo
 from .sample import unroll_sample
 from .sampler import BranchSampler, Suggestion, make_branch_sampler
 from .score import is_feasible, make_candidate, objective_value, rank, score_report
-from .search import run_smart_search
+from .search import AllCandidatesUnscorableError, UnscorableReasonCount, run_smart_search
 from .search_space import BranchSpace, enumerate_branches
 
 __all__ = [
+    "AicResolutionConfig",
+    "AicResolutionPolicy",
     "Candidate",
+    "MeasurementFailurePolicy",
+    "MeasurementLease",
+    "MeasurementResourcePool",
     "OptimizationGoal",
     "OptimizationTarget",
     "SearchSpace",
@@ -57,6 +67,9 @@ __all__ = [
     "SweepConfig",
     "Workload",
     "run_smart_search",
+    "AllCandidatesUnscorableError",
+    "UnscorableCandidate",
+    "UnscorableReasonCount",
     # parallel-config enumeration
     "ParallelShape",
     "ReplicaParallelConfig",

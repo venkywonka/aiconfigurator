@@ -177,10 +177,15 @@ class LazyOpEntry:
     protocol_revision: str
     timer: str
     tuning_revision: str
+    preflight_resource: ResourceContract | None = None
 
     def __post_init__(self) -> None:
         for metadata_field in fields(self):
             value = getattr(self, metadata_field.name)
+            if metadata_field.name == "preflight_resource":
+                if value is not None and not isinstance(value, ResourceContract):
+                    raise TypeError("preflight_resource must be a ResourceContract or None")
+                continue
             if not isinstance(value, str):
                 raise TypeError(f"{metadata_field.name} must be a string")
             if not value or value != value.strip():

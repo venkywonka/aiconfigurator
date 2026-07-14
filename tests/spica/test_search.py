@@ -8,8 +8,9 @@ real replay."""
 
 import pytest
 
+import spica.evaluator as evaluator_mod
 import spica.search as search_mod
-from spica.config import SmartSearchConfig
+from spica.config import MeasurementLease, SmartSearchConfig
 from spica.kv_load import KVLoadResolution
 from spica.load_predictor_sweep import LoadPredictorResult
 from spica.parallel_enum import ParallelShape, ReplicaParallelConfig
@@ -18,12 +19,12 @@ from spica.search import run_smart_search
 from spica.search_space import BranchSpace
 
 
-def _config(gpu_budget=32):
+def _config(gpu_budget=32, *, backend="trtllm"):
     return SmartSearchConfig(
         search_space={
             "model_name": "deepseek-ai/DeepSeek-V3",
             "hardware_sku": "gb200",
-            "backend": ["trtllm"],
+            "backend": [backend],
             "deployment_mode": ["agg"],
             "gpu_budget": gpu_budget,
         },
@@ -36,6 +37,8 @@ def _config(gpu_budget=32):
 class _FakeSampler:
     """Suggests `count` agg candidates with increasing agg_max_num_seqs."""
 
+    backend = "trtllm"
+
     def __init__(self, branch, study_id, objectives=None):
         self.branch = branch
         self.objectives = objectives
@@ -46,7 +49,7 @@ class _FakeSampler:
         for i in range(count):
             sel = {
                 "deployment_mode": "agg",
-                "backend": "trtllm",
+                "backend": self.backend,
                 "router_mode": "round_robin",
                 "planner_scaling_policy": "disabled",
                 "planner_fpm_sampling": "default",
@@ -64,23 +67,31 @@ class _FakeSampler:
         self.scored.append(("infeasible", reason))
 
 
+class _SglangFakeSampler(_FakeSampler):
+    backend = "sglang"
+
+
 class _FakeEvaluator:
     """trace_report throughput == the plan's max_num_seqs (so higher seqs wins)."""
 
     def __init__(self):
         self.calls = 0
+        self.last_plan = None
+        self.plans = []
 
     def evaluate(self, plan, *, concurrency_override=None):
         self.calls += 1
+        self.last_plan = plan
+        self.plans.append(plan)
         return {"output_throughput_tok_s": float(plan.agg_engine_args["max_num_seqs"]), "gpu_hours": 1.0}
 
 
-def _branch(parallel_config):
+def _branch(parallel_config, *, backend="trtllm"):
     return BranchSpace(
         deployment_mode="agg",
         parallel_configs=(parallel_config,),
-        supported_backends={parallel_config: frozenset({"trtllm"})},
-        knob_choices={"backend": ["trtllm"]},
+        supported_backends={parallel_config: frozenset({backend})},
+        knob_choices={"backend": [backend]},
     )
 
 
@@ -88,6 +99,101 @@ def _stub(monkeypatch, branch):
     monkeypatch.setattr(search_mod, "enumerate_branches", lambda config, *, max_seq_len=None: [branch])
     monkeypatch.setattr(search_mod, "sweep_load_predictor", lambda config: LoadPredictorResult(reason="static"))
     monkeypatch.setattr(search_mod, "resolve_backend_version", lambda hw, be: "1.3.0rc10")
+
+
+def _aic_resolution_config(tmp_path, *, on_measurement_failure="hybrid", candidates_per_round=2):
+    base = _config(backend="sglang")
+    payload = base.model_dump(mode="python")
+    payload["sweep"]["candidates_per_round"] = candidates_per_round
+    payload["aic_resolution"] = {
+        "policy": "measure_on_miss",
+        "on_measurement_failure": on_measurement_failure,
+        "overlay_path": (tmp_path / "evidence.sqlite").resolve(),
+    }
+    return SmartSearchConfig.model_validate(payload)
+
+
+def _aic_success_report(source, *, gpu_ids=(0, 1, 2, 3)):
+    fallback_count = int(source == "fallback")
+    report = {
+        "final_source_counts": {
+            "overlay": int(source == "overlay"),
+            "curated_exact": int(source == "curated_exact"),
+            "fallback": fallback_count,
+        },
+        "callbacks": [
+            {
+                "outcome": "resolved",
+                "final_evidence": [
+                    {
+                        "key_digest": "physical-key",
+                        "source": source,
+                    }
+                ],
+            }
+        ],
+        # GPU ids belong to execution provenance. They do not change the
+        # physical key or whether the final evidence is exact.
+        "assignments": [{"gpu_ids": list(gpu_ids)}],
+        "hybrid_fallbacks": [],
+    }
+    if source == "fallback":
+        report["hybrid_fallbacks"] = [
+            {
+                "key_digest": "physical-key",
+                "latency_ms": 4.25,
+                "path": "/tmp/evidence.sqlite.live-fallbacks/physical-key.json",
+                "hybrid_provenance": {
+                    "source": "empirical",
+                    "prediction_revision": "aic-v1.3-test",
+                },
+                "measurement_failure": {
+                    "code": "timeout",
+                    "operation": "attention.context",
+                    "detail": "collector deadline expired",
+                },
+            }
+        ]
+    return report
+
+
+class _DuplicateSglangSampler(_SglangFakeSampler):
+    """Return two identical trials once, then stop replacement asks."""
+
+    def __init__(self, branch, study_id, objectives=None):
+        super().__init__(branch, study_id, objectives)
+        self.ask_count = 0
+        self.observed = []
+        self.rejected = []
+
+    def suggest(self, count):
+        self.ask_count += 1
+        if self.ask_count > 1:
+            return []
+        selection = {
+            "deployment_mode": "agg",
+            "backend": "sglang",
+            "router_mode": "round_robin",
+            "planner_scaling_policy": "disabled",
+            "planner_fpm_sampling": "default",
+            "planner_load_sensitivity": "default",
+            "agg_max_num_batched_tokens": 8192,
+            "agg_max_num_seqs": 256,
+        }
+        return [
+            Suggestion(
+                selection=dict(selection),
+                parallel_config=self.branch.parallel_configs[0],
+                handle=index,
+            )
+            for index in range(min(count, 2))
+        ]
+
+    def observe(self, suggestion, metrics):
+        self.observed.append((suggestion.handle, metrics))
+
+    def observe_infeasible(self, suggestion, reason):
+        self.rejected.append((suggestion.handle, reason))
 
 
 def test_ranks_feasible_best_first(monkeypatch):
@@ -98,6 +204,464 @@ def test_ranks_feasible_best_first(monkeypatch):
     assert all(c.used_gpus == 8 for c in cands)
     assert all(c.config["backend_version"] == "1.3.0rc10" for c in cands)
     assert cands[0].metrics["gpu_hours"] == 1.0
+
+
+def test_ranked_candidates_preserve_replay_resolution_report(monkeypatch):
+    branch = _branch(ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2))
+    _stub(monkeypatch, branch)
+    rich_report = {
+        "status": "resolved",
+        "callbacks": [{"operation": "gemm", "collection": {"new_keys_delta": 1}}],
+    }
+
+    class ResolutionReportEvaluator(_FakeEvaluator):
+        def evaluate(self, plan, *, concurrency_override=None):
+            report = super().evaluate(plan, concurrency_override=concurrency_override)
+            report["aic_resolution_report"] = rich_report
+            return report
+
+    candidates = run_smart_search(
+        _config(),
+        evaluator=ResolutionReportEvaluator(),
+        sampler_factory=_FakeSampler,
+        show_progress=False,
+    )
+
+    assert len(candidates) == 3
+    assert all(candidate.aic_resolution_report == rich_report for candidate in candidates)
+
+
+def test_hybrid_degraded_candidate_remains_scorable_and_visible(monkeypatch, tmp_path):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    config = _aic_resolution_config(tmp_path, candidates_per_round=1)
+    degraded = _aic_success_report("fallback", gpu_ids=(6,))
+
+    class DegradedEvaluator:
+        def evaluate(self, plan, *, concurrency_override=None):
+            return {
+                "output_throughput_tok_s": 123.0,
+                "aic_resolution_report": degraded,
+            }
+
+    candidates = run_smart_search(
+        config,
+        evaluator=DegradedEvaluator(),
+        sampler_factory=_SglangFakeSampler,
+        show_progress=False,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].score == 123.0
+    assert candidates[0].aic_resolution_report == degraded
+    assert candidates[0].aic_resolution_report["hybrid_fallbacks"][0]["measurement_failure"]["code"] == "timeout"
+
+
+def test_hybrid_degraded_duplicate_reenters_replay_and_late_exact_replaces_it(monkeypatch, tmp_path):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    config = _aic_resolution_config(tmp_path)
+    degraded = _aic_success_report("fallback", gpu_ids=(0,))
+    exact = _aic_success_report("overlay", gpu_ids=(7,))
+    seen = {}
+
+    class DegradedThenExactEvaluator:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, plan, *, concurrency_override=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "output_throughput_tok_s": 100.0,
+                    "aic_resolution_report": degraded,
+                }
+            return {
+                "output_throughput_tok_s": 125.0,
+                "aic_resolution_report": exact,
+            }
+
+    def factory(branch, study_id, objectives=None):
+        sampler = _DuplicateSglangSampler(branch, study_id, objectives)
+        seen["sampler"] = sampler
+        return sampler
+
+    evaluator = DegradedThenExactEvaluator()
+    candidates = run_smart_search(
+        config,
+        evaluator=evaluator,
+        sampler_factory=factory,
+        show_progress=False,
+    )
+
+    assert evaluator.calls == 2
+    assert [metrics["objective"] for _, metrics in seen["sampler"].observed] == [100.0, 125.0]
+    assert seen["sampler"].rejected == []
+    assert len(candidates) == 1
+    assert candidates[0].score == 125.0
+    assert candidates[0].aic_resolution_report == exact
+
+
+def test_fully_exact_resolving_duplicate_uses_cache_even_with_gpu_provenance(monkeypatch, tmp_path):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    config = _aic_resolution_config(tmp_path)
+    exact = _aic_success_report("overlay", gpu_ids=(5,))
+    seen = {}
+
+    class ExactEvaluator:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, plan, *, concurrency_override=None):
+            self.calls += 1
+            return {
+                "output_throughput_tok_s": 125.0,
+                "aic_resolution_report": exact,
+            }
+
+    def factory(branch, study_id, objectives=None):
+        sampler = _DuplicateSglangSampler(branch, study_id, objectives)
+        seen["sampler"] = sampler
+        return sampler
+
+    evaluator = ExactEvaluator()
+    candidates = run_smart_search(
+        config,
+        evaluator=evaluator,
+        sampler_factory=factory,
+        show_progress=False,
+    )
+
+    assert evaluator.calls == 1
+    assert len(seen["sampler"].observed) == 2
+    assert len(candidates) == 1
+    assert candidates[0].aic_resolution_report == exact
+
+
+@pytest.mark.parametrize("failure_policy", ["error", "hybrid"])
+def test_resolution_failure_excludes_only_affected_duplicate_and_never_invents_metric(
+    monkeypatch,
+    tmp_path,
+    failure_policy,
+):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    config = _aic_resolution_config(tmp_path, on_measurement_failure=failure_policy)
+    exact = _aic_success_report("overlay")
+    seen = {}
+    failure = evaluator_mod.UnscorableCandidate(
+        code="collector_failed",
+        operation="attention.context",
+        detail=(
+            "HYBRID fallback failed after collector_failed"
+            if failure_policy == "hybrid"
+            else "collector returned no valid samples"
+        ),
+        report={
+            "callbacks": [{"outcome": "failed"}],
+            "unresolved": [{"code": "collector_failed", "operation": "attention.context"}],
+        },
+    )
+
+    class FailureThenExactEvaluator:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, plan, *, concurrency_override=None):
+            self.calls += 1
+            if self.calls == 1:
+                return failure
+            return {
+                "output_throughput_tok_s": 125.0,
+                "aic_resolution_report": exact,
+            }
+
+    def factory(branch, study_id, objectives=None):
+        sampler = _DuplicateSglangSampler(branch, study_id, objectives)
+        seen["sampler"] = sampler
+        return sampler
+
+    evaluator = FailureThenExactEvaluator()
+    candidates = run_smart_search(
+        config,
+        evaluator=evaluator,
+        sampler_factory=factory,
+        show_progress=False,
+    )
+
+    assert evaluator.calls == 2
+    assert seen["sampler"].rejected == [(0, str(failure))]
+    assert seen["sampler"].observed == [(1, {"objective": 125.0})]
+    assert [candidate.score for candidate in candidates] == [125.0]
+
+
+def test_measure_on_miss_without_measurement_pool_forces_sequential_evaluation(monkeypatch, tmp_path, capsys):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    base = _config(backend="sglang")
+    cfg = base.model_copy(
+        update={
+            "sweep": base.sweep.model_copy(update={"parallel_evals": 2, "candidates_per_round": 2}),
+            "aic_resolution": {
+                "policy": "measure_on_miss",
+                "overlay_path": (tmp_path / "evidence.sqlite").resolve(),
+            },
+        }
+    )
+    cfg = SmartSearchConfig.model_validate(cfg.model_dump())
+
+    def forbidden_pool(*args, **kwargs):
+        raise AssertionError("measure-on-miss without disjoint groups must not create a process pool")
+
+    monkeypatch.setattr(search_mod, "ProcessPoolExecutor", forbidden_pool)
+    evaluator = _FakeEvaluator()
+
+    candidates = run_smart_search(cfg, evaluator=evaluator, sampler_factory=_SglangFakeSampler, show_progress=True)
+
+    assert len(candidates) == 2
+    assert evaluator.calls == 2
+    assert "sequential candidate evaluation" in capsys.readouterr().out
+
+
+def test_resolution_payload_uses_concrete_measurement_lease(monkeypatch, tmp_path):
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    cfg = _config(backend="sglang").model_copy(
+        update={
+            "aic_resolution": {
+                "policy": "measure_on_miss",
+                "overlay_path": (tmp_path / "evidence.sqlite").resolve(),
+                "max_new_keys": 17,
+                "max_wall_seconds": 45.0,
+            },
+            "measurement_gpu_groups": [[4, 5, 6, 7]],
+        }
+    )
+    cfg = SmartSearchConfig.model_validate(cfg.model_dump())
+    evaluator = _FakeEvaluator()
+
+    result = search_mod._evaluate_one(
+        _SglangFakeSampler(branch, "test").suggest(1)[0].selection,
+        branch.parallel_configs[0],
+        config=cfg,
+        goal=cfg.goal,
+        load_predictor=LoadPredictorResult(reason="static"),
+        evaluator=evaluator,
+        measurement_lease=MeasurementLease(gpu_ids=(4, 5, 6, 7)),
+    )
+
+    assert result[2] == "feasible"
+    # The fake evaluator reports from the built plan, proving the exact payload reached Replay args.
+    plan_payload = evaluator.last_plan.agg_engine_args["aic_resolution"]
+    assert plan_payload == {
+        "policy": "measure_on_miss",
+        "on_measurement_failure": "error",
+        "overlay_path": str((tmp_path / "evidence.sqlite").resolve()),
+        "fallback_cache_dir": f"{(tmp_path / 'evidence.sqlite').resolve()}.live-fallbacks",
+        "max_new_keys": 17,
+        "max_wall_seconds": 45.0,
+        "force_remeasure": False,
+        "gpu_ids": [4, 5, 6, 7],
+    }
+
+
+def test_parallel_resolution_uses_one_single_worker_pool_per_disjoint_group(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    base = _config(backend="sglang")
+    cfg = base.model_copy(
+        update={
+            "sweep": base.sweep.model_copy(update={"parallel_evals": 2, "candidates_per_round": 2}),
+            "aic_resolution": {
+                "policy": "measure_on_miss",
+                "overlay_path": (tmp_path / "evidence.sqlite").resolve(),
+            },
+            "measurement_gpu_groups": [[0, 1, 2, 3], [4, 5, 6, 7]],
+        }
+    )
+    cfg = SmartSearchConfig.model_validate(cfg.model_dump())
+    created = []
+
+    class ImmediatePool:
+        def __init__(self, *, max_workers, mp_context, initializer, initargs):
+            self.max_workers = max_workers
+            self.initializer = initializer
+            self.initargs = initargs
+            self._processes = {}
+            created.append(self)
+
+        def submit(self, fn, selection, parallel_config):
+            worker_config, goal, load_predictor, evaluator, lease = self.initargs
+            future = Future()
+            future.set_result(
+                search_mod._evaluate_one(
+                    selection,
+                    parallel_config,
+                    config=worker_config,
+                    goal=goal,
+                    load_predictor=load_predictor,
+                    evaluator=evaluator,
+                    measurement_lease=lease,
+                )
+            )
+            return future
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    monkeypatch.setattr(search_mod, "ProcessPoolExecutor", ImmediatePool)
+    evaluator = _FakeEvaluator()
+
+    candidates = run_smart_search(cfg, evaluator=evaluator, sampler_factory=_SglangFakeSampler, show_progress=False)
+
+    assert len(candidates) == 2
+    assert [pool.max_workers for pool in created] == [1, 1]
+    assert [pool.initargs[-1].gpu_ids for pool in created] == [(0, 1, 2, 3), (4, 5, 6, 7)]
+    assert [plan.agg_engine_args["aic_resolution"]["gpu_ids"] for plan in evaluator.plans] == [
+        [0, 1, 2, 3],
+        [4, 5, 6, 7],
+    ]
+
+
+def test_timed_out_worker_pool_replacement_preserves_its_concrete_measurement_lease(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+
+    branch = _branch(
+        ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2),
+        backend="sglang",
+    )
+    _stub(monkeypatch, branch)
+    base = _aic_resolution_config(tmp_path)
+    payload = base.model_dump(mode="python")
+    payload["sweep"].update(
+        {
+            "parallel_evals": 2,
+            "candidates_per_round": 2,
+            "max_eval_seconds": 0.01,
+        }
+    )
+    payload["measurement_gpu_groups"] = [[0, 1, 2, 3], [4, 5, 6, 7]]
+    config = SmartSearchConfig.model_validate(payload)
+    created = []
+
+    class ProcessStub:
+        def terminate(self):
+            return None
+
+    class LeasePool:
+        def __init__(self, *, max_workers, mp_context, initializer, initargs):
+            self.initargs = initargs
+            self.creation_index = len(created)
+            self._processes = {0: ProcessStub()}
+            created.append(self)
+
+        def submit(self, fn, selection, parallel_config):
+            # The original worker bound to group zero hangs. Its successor must
+            # be recreated with the same lease and completes normally.
+            if self.creation_index == 0:
+                return Future()
+            worker_config, goal, load_predictor, evaluator, lease = self.initargs
+            future = Future()
+            future.set_result(
+                search_mod._evaluate_one(
+                    selection,
+                    parallel_config,
+                    config=worker_config,
+                    goal=goal,
+                    load_predictor=load_predictor,
+                    evaluator=evaluator,
+                    measurement_lease=lease,
+                )
+            )
+            return future
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    def ready_only(futures, timeout=None, return_when=None):
+        done = {future for future in futures if future.done()}
+        return done, set(futures) - done
+
+    class ReplacementSampler(_SglangFakeSampler):
+        def __init__(self, branch, study_id, objectives=None):
+            super().__init__(branch, study_id, objectives)
+            self.ask_count = 0
+
+        def suggest(self, count):
+            self.ask_count += 1
+            seqs = [256, 512] if self.ask_count == 1 else [256]
+            return [
+                Suggestion(
+                    selection={
+                        "deployment_mode": "agg",
+                        "backend": "sglang",
+                        "router_mode": "round_robin",
+                        "planner_scaling_policy": "disabled",
+                        "planner_fpm_sampling": "default",
+                        "planner_load_sensitivity": "default",
+                        "agg_max_num_batched_tokens": 8192,
+                        "agg_max_num_seqs": seqs_value,
+                    },
+                    parallel_config=self.branch.parallel_configs[0],
+                    handle=seqs_value,
+                )
+                for seqs_value in seqs[:count]
+            ]
+
+    class LeaseEvidenceEvaluator:
+        def __init__(self):
+            self.gpu_ids = []
+
+        def evaluate(self, plan, *, concurrency_override=None):
+            gpu_ids = tuple(plan.agg_engine_args["aic_resolution"]["gpu_ids"])
+            self.gpu_ids.append(gpu_ids)
+            return {
+                "output_throughput_tok_s": float(plan.agg_engine_args["max_num_seqs"]),
+                "aic_resolution_report": _aic_success_report("overlay", gpu_ids=gpu_ids),
+            }
+
+    monkeypatch.setattr(search_mod, "ProcessPoolExecutor", LeasePool)
+    monkeypatch.setattr(search_mod, "wait", ready_only)
+    evaluator = LeaseEvidenceEvaluator()
+
+    candidates = run_smart_search(
+        config,
+        evaluator=evaluator,
+        sampler_factory=ReplacementSampler,
+        show_progress=False,
+    )
+
+    assert [pool.initargs[-1].gpu_ids for pool in created] == [
+        (0, 1, 2, 3),
+        (4, 5, 6, 7),
+        (0, 1, 2, 3),
+    ]
+    assert evaluator.gpu_ids == [(4, 5, 6, 7), (0, 1, 2, 3)]
+    assert {candidate.config["agg_max_num_seqs"] for candidate in candidates} == {256, 512}
 
 
 def test_over_budget_candidates_dropped(monkeypatch):
@@ -140,6 +704,113 @@ def test_eval_failure_marked_infeasible(monkeypatch):
     cands = run_smart_search(_config(), evaluator=_Boom(), sampler_factory=factory)
     assert cands == []
     assert all(isinstance(x, tuple) and x[0] == "infeasible" for x in sampler_seen["s"].scored)
+
+
+def test_resolution_failure_does_not_score_candidate(monkeypatch):
+    branch = _branch(ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2))
+    _stub(monkeypatch, branch)
+    seen = {}
+    failure = evaluator_mod.UnscorableCandidate(
+        code="measurement_failed",
+        operation="gemm",
+        detail="collector returned no valid samples",
+        report={"status": "failed", "failed_keys": ["gemm:abc"]},
+    )
+
+    class OneResolutionFailureSampler(_FakeSampler):
+        def __init__(self, branch, study_id, objectives=None):
+            super().__init__(branch, study_id, objectives)
+            self.next_seqs = 256
+            self.observed = []
+            self.unscorable = []
+
+        def suggest(self, count):
+            suggestions = []
+            for _ in range(count):
+                selection = {
+                    "deployment_mode": "agg",
+                    "backend": "trtllm",
+                    "router_mode": "round_robin",
+                    "planner_scaling_policy": "disabled",
+                    "planner_fpm_sampling": "default",
+                    "planner_load_sensitivity": "default",
+                    "agg_max_num_batched_tokens": 8192,
+                    "agg_max_num_seqs": self.next_seqs,
+                }
+                self.next_seqs += 256
+                suggestions.append(
+                    Suggestion(
+                        selection=selection,
+                        parallel_config=self.branch.parallel_configs[0],
+                        handle=selection,
+                    )
+                )
+            return suggestions
+
+        def observe(self, suggestion, metrics):
+            self.observed.append((suggestion.selection["agg_max_num_seqs"], metrics))
+
+        def observe_infeasible(self, suggestion, reason):
+            self.unscorable.append((suggestion.selection["agg_max_num_seqs"], reason))
+
+    class OneResolutionFailureEvaluator(_FakeEvaluator):
+        def evaluate(self, plan, *, concurrency_override=None):
+            if plan.agg_engine_args["max_num_seqs"] == 256:
+                return failure
+            return super().evaluate(plan, concurrency_override=concurrency_override)
+
+    def factory(branch, study_id, objectives=None):
+        sampler = OneResolutionFailureSampler(branch, study_id, objectives)
+        seen["sampler"] = sampler
+        return sampler
+
+    candidates = run_smart_search(
+        _config(),
+        evaluator=OneResolutionFailureEvaluator(),
+        sampler_factory=factory,
+        show_progress=False,
+    )
+
+    assert [candidate.score for candidate in candidates] == [1024.0, 768.0, 512.0]
+    assert [seqs for seqs, _ in seen["sampler"].observed] == [512, 768, 1024]
+    assert seen["sampler"].unscorable == [(256, str(failure))]
+
+
+def test_all_resolution_failures_raise_reason_summary(monkeypatch):
+    branch = _branch(ReplicaParallelConfig(ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=4), replicas=2))
+    _stub(monkeypatch, branch)
+    failure = evaluator_mod.UnscorableCandidate(
+        code="budget_exhausted",
+        operation="attention",
+        detail="max_new_keys=2 exhausted",
+        report={"status": "failed", "unresolved_count": 3},
+    )
+
+    class AlwaysUnscorable:
+        def evaluate(self, plan, *, concurrency_override=None):
+            return failure
+
+    config = _config().model_copy(update={"sweep": _config().sweep.model_copy(update={"candidates_per_round": 1})})
+
+    with pytest.raises(search_mod.AllCandidatesUnscorableError) as raised:
+        run_smart_search(
+            config,
+            evaluator=AlwaysUnscorable(),
+            sampler_factory=_FakeSampler,
+            show_progress=False,
+        )
+
+    assert raised.value.total_count == 11
+    assert raised.value.reasons == (
+        search_mod.UnscorableReasonCount(
+            code="budget_exhausted",
+            operation="attention",
+            detail="max_new_keys=2 exhausted",
+            report={"status": "failed", "unresolved_count": 3},
+            count=11,
+        ),
+    )
+    assert "all 11 evaluated candidates were unscorable" in str(raised.value)
 
 
 def test_unsupported_backend_config_pair_marked_unsupported(monkeypatch):

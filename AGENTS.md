@@ -30,6 +30,19 @@ MUST read and follow:
 New operations MUST complete that skill's consumer-contract, case-identity,
 deduplication, and validation gates before they are treated as supported.
 
+## Required JIT Resolution First Step
+
+Before adding, reviewing, or changing online JIT/measure-on-miss support for an
+existing AIC operation—including operation normalization and resolution hooks,
+lazy adapters/runners, `PerfKey` or `MeasurementRequest` construction,
+`ResolutionSession` behavior, cold/warm/reopened-overlay gates, or Replay/Spica
+callback wiring—MUST read and follow:
+
+- `.agents/skills/aic-jitcollect-op-dev/SKILL.md`
+
+If the same task also changes offline Collector case population or curated perf
+data, both this skill and `aic-collector-op-development` apply.
+
 ## Cursor Cloud specific instructions
 
 ### Project overview

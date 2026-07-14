@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -144,6 +145,26 @@ def test_mhc_scale_and_consumer_identity_are_not_physical_identity() -> None:
     assert first_request.key == second_request.key
 
 
+def test_mhc_stable_curated_profile_and_rc0_measurement_use_distinct_keys() -> None:
+    database = _Database()
+    operation = _operation()
+    stable_request = operation.measurement_request(database, _protocol(), x=17)
+    stable_environment = database.measurement_environment
+    database.measurement_environment = replace(
+        stable_environment,
+        backend_version="0.5.10rc0",
+        runtime_versions={**stable_environment.runtime_versions, "sglang": "0.5.10rc0"},
+    )
+
+    rc0_request = operation.measurement_request(database, _protocol(), x=17)
+
+    assert database.version == "0.5.10"
+    assert stable_request is not None and rc0_request is not None
+    assert stable_request.key != rc0_request.key
+    assert stable_request.environment.backend_version == "0.5.10"
+    assert rc0_request.environment.backend_version == "0.5.10rc0"
+
+
 @pytest.mark.parametrize("x", [True, 0, -1, 1.5, "17", None])
 def test_mhc_normalization_rejects_non_positive_integer_tokens(x: object) -> None:
     with pytest.raises((TypeError, ValueError), match="mHC x"):
@@ -191,6 +212,33 @@ def test_mhc_literal_curated_row_hits_but_unmeasured_point_misses(monkeypatch: p
     assert exact.source == "curated_exact"
     assert absent is None
     assert cp_sharded is None
+
+
+@pytest.mark.parametrize(
+    ("runtime_name", "incompatible_version"),
+    [
+        ("cuda", "12.9"),
+        ("model_profile", "other-profile"),
+        ("sglang", None),
+    ],
+)
+def test_mhc_literal_curated_row_rejects_frozen_runtime_version_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_name: str,
+    incompatible_version: str | None,
+) -> None:
+    database = _Database()
+    database._mhc_module_data = {"pre": {4: {4096: {17: {"latency": 1.25, "energy": 12.5}}}}}
+    environment = database.measurement_environment
+    runtime_versions = dict(environment.runtime_versions)
+    if incompatible_version is None:
+        runtime_versions.pop(runtime_name)
+    else:
+        runtime_versions[runtime_name] = incompatible_version
+    database.measurement_environment = replace(environment, runtime_versions=runtime_versions)
+    monkeypatch.setattr(DeepSeekV4MHCModule, "load_data", classmethod(lambda cls, database: None))
+
+    assert _operation().curated_exact_result(database, x=17) is None
 
 
 def test_mhc_missing_curated_dataset_is_an_exact_miss(monkeypatch: pytest.MonkeyPatch) -> None:

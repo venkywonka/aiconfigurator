@@ -4,9 +4,22 @@
 """Packaged lazy registrations for the frozen SGLang profile."""
 
 from aiconfigurator.collector.registry_types import OpEntry, PerfFile
-from aiconfigurator.collector.trtllm.registry import GEMM_LAZY_SPEC
-from aiconfigurator.collector.types import LazyOpEntry
+from aiconfigurator.collector.types import FabricRequirement, LazyOpEntry, ResourceContract
 from aiconfigurator.sdk.perf_namespace import perf_namespace
+
+GEMM_LAZY_SPEC = LazyOpEntry(
+    namespace=perf_namespace(str(PerfFile.GEMM)),
+    run_module="aiconfigurator.collector.sglang.gemm",
+    run_func="run_gemm_case",
+    adapter_module="aiconfigurator.collector.trtllm.gemm_adapter",
+    case_func="gemm_request_to_case",
+    result_func="gemm_result_to_record",
+    resource_func="gemm_resource_for_request",
+    protocol_revision="cuda-event-samples-v1",
+    timer="cuda_event",
+    tuning_revision="sglang-gemm-v1",
+    preflight_resource=ResourceContract(gpu_count=1, fabric=FabricRequirement.NONE),
+)
 
 MHC_LAZY_SPEC = LazyOpEntry(
     namespace=perf_namespace(str(PerfFile.MHC_MODULE)),
@@ -19,6 +32,7 @@ MHC_LAZY_SPEC = LazyOpEntry(
     protocol_revision="cuda-event-samples-v1",
     timer="cuda_event",
     tuning_revision="sglang-mhc-v1",
+    preflight_resource=ResourceContract(gpu_count=1, fabric=FabricRequirement.NONE),
 )
 
 MOE_LAZY_SPEC = LazyOpEntry(
@@ -32,6 +46,7 @@ MOE_LAZY_SPEC = LazyOpEntry(
     protocol_revision="cuda-event-samples-v1",
     timer="cuda_event",
     tuning_revision="sglang-moe-v1",
+    preflight_resource=ResourceContract(gpu_count=1, fabric=FabricRequirement.NONE),
 )
 
 CUSTOM_ALLREDUCE_LAZY_SPEC = LazyOpEntry(
@@ -45,6 +60,11 @@ CUSTOM_ALLREDUCE_LAZY_SPEC = LazyOpEntry(
     protocol_revision="cuda-event-samples-v1",
     timer="cuda_event",
     tuning_revision="sglang-custom-allreduce-v1",
+    preflight_resource=ResourceContract(
+        gpu_count=4,
+        fabric=FabricRequirement.NVLINK,
+        reserve_fabric_domain=True,
+    ),
 )
 
 
@@ -60,6 +80,7 @@ def _dsv4_attention_lazy_spec(perf_file: PerfFile) -> LazyOpEntry:
         protocol_revision="cuda-event-samples-v1",
         timer="cuda_event",
         tuning_revision="sglang-dsv4-attn-v1",
+        preflight_resource=ResourceContract(gpu_count=1, fabric=FabricRequirement.NONE),
     )
 
 
@@ -71,7 +92,7 @@ DSV4_HCA_GENERATION_LAZY_SPEC = _dsv4_attention_lazy_spec(PerfFile.DSV4_HCA_GENE
 SGLANG_LAZY_REGISTRY = (
     OpEntry(
         op="gemm",
-        module="aiconfigurator.collector.trtllm.gemm",
+        module="aiconfigurator.collector.sglang.gemm",
         get_func="get_gemm_test_cases",
         run_func="run_gemm_case",
         perf_filename=PerfFile.GEMM,

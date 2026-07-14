@@ -77,6 +77,12 @@ class FallbackOp(Operation):
         self._primary = primary
         self._fallback = fallback
 
+    def resolution_capabilities(self):
+        capabilities = list(super().resolution_capabilities())
+        for operation in (self._primary, *self._fallback):
+            capabilities.extend(operation.resolution_capabilities())
+        return tuple(capabilities)
+
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError, _get_configured_database_view
 
@@ -223,6 +229,12 @@ class OverlapOp(Operation):
         super().__init__(name, 1.0, seq_split=seq_split)  # scale_factor handled by inner ops
         self._group_a = group_a
         self._group_b = group_b
+
+    def resolution_capabilities(self):
+        capabilities = list(super().resolution_capabilities())
+        for operation in (*self._group_a, *self._group_b):
+            capabilities.extend(operation.resolution_capabilities())
+        return tuple(capabilities)
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """

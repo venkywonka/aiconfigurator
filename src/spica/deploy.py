@@ -75,13 +75,23 @@ def _role_prefix(role: str) -> str:
     return "" if role == "agg" else f"{role}_"
 
 
-def _engine_args_payload(sample: dict, role: str, *, backend_version: str) -> dict[str, Any]:
+def _engine_args_payload(
+    sample: dict,
+    role: str,
+    *,
+    backend_version: str,
+    aic_resolution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """MockEngineArgs JSON for one role, from the sample's AIC parallelism."""
     p = _role_prefix(role)
     tp = int(sample[f"{p}tp"])
     attention_dp = int(sample[f"{p}attention_dp"])
     moe_tp = int(sample[f"{p}moe_tp"])
     moe_ep = int(sample[f"{p}moe_ep"])
+    if aic_resolution is not None and attention_dp != 1:
+        raise ValueError(
+            f"aic_resolution requires attention_dp=1 in V1.3; role {role!r} has attention_dp={attention_dp}"
+        )
     payload: dict[str, Any] = {
         "worker_type": "aggregated" if role == "agg" else role,
         # the simulated scheduler backend; mirrors the swept aic_backend so the
@@ -112,6 +122,11 @@ def _engine_args_payload(sample: dict, role: str, *, backend_version: str) -> di
         payload["aic_nextn"] = int(sample["aic_nextn"])
     if sample.get("startup_time") is not None:
         payload["startup_time"] = float(sample["startup_time"])
+    if aic_resolution is not None:
+        resolution = dict(aic_resolution)
+        if resolution.get("gpu_ids") is not None:
+            resolution["gpu_ids"] = list(resolution["gpu_ids"])
+        payload["aic_resolution"] = resolution
     # KVBM is disabled when G2 has no blocks. When enabled it runs on aggregate or
     # prefill workers only; disaggregated decode workers use the transfer connector
     # and must not be scored with a second local offload tier.
@@ -212,6 +227,7 @@ def build_deployment(
     backend_version: str,
     optimization_target: str = "sla",
     planner_sla: SLATarget | None = None,
+    aic_resolution: dict[str, Any] | None = None,
 ) -> DeploymentPlan:
     """Translate one unrolled sample into a :class:`DeploymentPlan`.
 
@@ -219,6 +235,14 @@ def build_deployment(
     via ``OptimizationTarget.planner_optimization_target``); it is only used when the
     candidate has a planner (a non-disabled scaling policy)."""
     mode = sample["deployment_mode"]
+    if aic_resolution is not None:
+        backend = sample["backend"]
+        if backend != "sglang":
+            raise ValueError(f"aic_resolution supports only backend='sglang' in V1.3; candidate backend={backend!r}")
+        if mode != "agg":
+            raise ValueError(
+                f"aic_resolution supports only deployment_mode='agg' in V1.3; candidate deployment_mode={mode!r}"
+            )
     planner_config = _planner_config_payload(sample, optimization_target=optimization_target, planner_sla=planner_sla)
     router_mode = sample.get("router_mode", "round_robin")
     common = dict(
@@ -230,7 +254,12 @@ def build_deployment(
     )
     if mode == "agg":
         return DeploymentPlan(
-            agg_engine_args=_engine_args_payload(sample, "agg", backend_version=backend_version),
+            agg_engine_args=_engine_args_payload(
+                sample,
+                "agg",
+                backend_version=backend_version,
+                aic_resolution=aic_resolution,
+            ),
             prefill_engine_args=None,
             decode_engine_args=None,
             num_workers=int(sample["replicas"]),
@@ -240,8 +269,18 @@ def build_deployment(
         )
     return DeploymentPlan(
         agg_engine_args=None,
-        prefill_engine_args=_engine_args_payload(sample, "prefill", backend_version=backend_version),
-        decode_engine_args=_engine_args_payload(sample, "decode", backend_version=backend_version),
+        prefill_engine_args=_engine_args_payload(
+            sample,
+            "prefill",
+            backend_version=backend_version,
+            aic_resolution=aic_resolution,
+        ),
+        decode_engine_args=_engine_args_payload(
+            sample,
+            "decode",
+            backend_version=backend_version,
+            aic_resolution=aic_resolution,
+        ),
         num_workers=0,
         num_prefill_workers=int(sample["prefill_replicas"]),
         num_decode_workers=int(sample["decode_replicas"]),

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import gc
 import importlib
 import inspect
 import os
@@ -17,6 +18,7 @@ from aiconfigurator.collector.types import RawMeasurement
 from aiconfigurator.sdk.resolution.types import MeasurementProtocol
 
 _MODEL_ARTIFACT = "sgl-project/DeepSeek-V4-Flash-FP8"
+_SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _REPEATS_PER_GRAPH = 5
 _PHYSICAL_BYTES_PER_ELEMENT = 2
 _MAX_CUSTOM_ALLREDUCE_BYTES = 8 * 1024 * 1024
@@ -168,6 +170,7 @@ class _SglangCustomAllReduceRankBackend:
         self._ca_comm: Any = None
         self._graph_capture: Any = None
         self._cases: dict[tuple[str, str, int], PreparedCustomAllReduceCase] = {}
+        self._destroyed = False
 
     def initialize(self) -> None:
         _bind_rank_process_physical_visibility(self._bootstrap)
@@ -261,8 +264,45 @@ class _SglangCustomAllReduceRankBackend:
         return float(start.elapsed_time(end)) / _REPEATS_PER_GRAPH
 
     def destroy(self) -> None:
-        if self._torch is not None:
-            self._torch.cuda.synchronize(self._bootstrap.rank)
+        if self._destroyed:
+            return
+        self._destroyed = True
+        torch = self._torch
+        cleanup_errors: list[Exception] = []
+        if torch is not None:
+            try:
+                torch.cuda.synchronize(self._bootstrap.rank)
+            except Exception as error:
+                cleanup_errors.append(error)
+
+        self._cases.clear()
+        self._ca_comm = None
+        self._graph_capture = None
+        try:
+            from sglang.srt.distributed import parallel_state
+
+            for cleanup in (
+                parallel_state.destroy_model_parallel,
+                parallel_state.destroy_distributed_environment,
+            ):
+                try:
+                    cleanup()
+                except Exception as error:
+                    cleanup_errors.append(error)
+        finally:
+            self._dist = None
+            self._torch = None
+            try:
+                gc.collect()
+            except Exception as error:
+                cleanup_errors.append(error)
+            if torch is not None:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception as error:
+                    cleanup_errors.append(error)
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     def abort(self) -> None:
         # The parent poisons and terminates the entire four-rank lease.
@@ -297,6 +337,8 @@ def _persistent_rank_group(*, world_size: int, protocol: MeasurementProtocol) ->
     global _PERSISTENT_DEVICE_UUIDS, _PERSISTENT_RANK_GROUP
 
     visible = _visible_device_uuids(world_size)
+    if _PERSISTENT_RANK_GROUP is not None and bool(getattr(_PERSISTENT_RANK_GROUP, "poisoned", False)):
+        close_custom_allreduce_worker()
     if _PERSISTENT_RANK_GROUP is None:
         from aiconfigurator.collector.executor import PersistentNcclRankGroup
 
@@ -308,6 +350,7 @@ def _persistent_rank_group(*, world_size: int, protocol: MeasurementProtocol) ->
         )
         _PERSISTENT_DEVICE_UUIDS = visible
     elif visible != _PERSISTENT_DEVICE_UUIDS or _PERSISTENT_RANK_GROUP.protocol_digest != protocol.digest:
+        close_custom_allreduce_worker()
         raise RuntimeError("persistent CustomAllReduce worker lease identity changed")
     return _PERSISTENT_RANK_GROUP
 
@@ -351,8 +394,11 @@ def run_custom_allreduce_case(
     _validate_protocol(protocol)
     _visible_device_uuids(world_size)
     framework_version, device_name = _runtime_metadata()
-    if framework_version != "0.5.10":
-        raise RuntimeError(f"CustomAllReduce requires SGLang 0.5.10, got {framework_version!r}")
+    if framework_version not in _SUPPORTED_SGLANG_VERSIONS:
+        raise RuntimeError(
+            "CustomAllReduce requires SGLang 0.5.10 or the exact 0.5.10rc0 measurement runtime, "
+            f"got {framework_version!r}"
+        )
     if " ".join(device_name.split()).casefold() != "nvidia gb200":
         raise RuntimeError(f"CustomAllReduce requires NVIDIA GB200 devices, got {device_name!r}")
 

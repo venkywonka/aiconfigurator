@@ -191,6 +191,26 @@ def test_custom_allreduce_runtime_input_feeds_one_physical_query_and_request() -
     assert request.semantic_descriptor == _SEMANTIC_DESCRIPTOR
 
 
+def test_custom_allreduce_stable_profile_and_rc0_measurement_use_distinct_keys() -> None:
+    database = _ProfileDatabase()
+    operation = CustomAllReduce("context_custom_allreduce", 1.0, h=4096, tp_size=4)
+    stable_request = operation.measurement_request(database, _protocol(), x=8)
+    stable_environment = database.measurement_environment
+    database.measurement_environment = replace(
+        stable_environment,
+        backend_version="0.5.10rc0",
+        runtime_versions={**stable_environment.runtime_versions, "sglang": "0.5.10rc0"},
+    )
+
+    rc0_request = operation.measurement_request(database, _protocol(), x=8)
+
+    assert database.version == "0.5.10"
+    assert stable_request is not None and rc0_request is not None
+    assert stable_request.key != rc0_request.key
+    assert stable_request.environment.backend_version == "0.5.10"
+    assert rc0_request.environment.backend_version == "0.5.10rc0"
+
+
 def test_direct_dispatch_shape_phase_scale_and_consumer_converge_to_one_physical_key() -> None:
     database = _ProfileDatabase()
     context = CustomAllReduce("context_dispatch.custom_allreduce", 43.0, h=4096, tp_size=4)

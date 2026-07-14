@@ -27,6 +27,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementProtocol,
     MeasurementRequest,
     PerfKey,
+    ProtocolMismatchError,
 )
 
 pytestmark = pytest.mark.unit
@@ -113,6 +114,13 @@ def _request(
         semantic_descriptor=semantic_descriptor or _SEMANTIC_DESCRIPTOR,
         protocol=_protocol(),
     )
+
+
+def test_mhc_rejects_malformed_sampling_protocol_as_protocol_mismatch() -> None:
+    request = replace(_request(), protocol=replace(_protocol(), samples=2))
+
+    with pytest.raises(ProtocolMismatchError, match="samples must be at least three"):
+        mhc_adapter.mhc_request_to_case(request)
 
 
 def _raw_result(request: MeasurementRequest) -> dict[str, object]:
@@ -217,6 +225,27 @@ def test_mhc_capability_allows_unrelated_runtime_inventory_entries() -> None:
     request = _request(environment=environment)
 
     assert mhc_adapter.mhc_request_to_case(request) == _query()
+
+
+@pytest.mark.parametrize("sglang_version", ["0.5.10", "0.5.10rc0"])
+def test_mhc_preserves_exact_supported_sglang_runtime_identity(
+    sglang_version: str,
+) -> None:
+    environment = replace(
+        _environment(),
+        backend_version=sglang_version,
+        runtime_versions={**_RUNTIME_VERSIONS, "sglang": sglang_version},
+    )
+    request = _request(environment=environment)
+    raw_result = _raw_result(request)
+    raw_result["provenance"]["framework_version"] = sglang_version
+
+    case = mhc_adapter.mhc_request_to_case(request)
+    record = mhc_adapter.mhc_result_to_record(request, case, raw_result)
+
+    assert record.key == request.key
+    assert request.environment.backend_version == sglang_version
+    assert record.provenance["framework_version"] == sglang_version
 
 
 @pytest.mark.parametrize(
@@ -401,6 +430,7 @@ def test_exact_mhc_runner_returns_one_raw_full_module_row_without_logging(monkey
             hc_mult=4,
             sinkhorn_iters=20,
             quant_mode="bfloat16",
+            cleanup=lambda: calls.append(("cleanup",)),
         )
 
     @contextmanager
@@ -458,7 +488,95 @@ def test_exact_mhc_runner_returns_one_raw_full_module_row_without_logging(monkey
     assert benchmark_kwargs["return_samples"] is True
     assert benchmark_kwargs["allow_graph_fail"] is False
     assert benchmark_kwargs["use_cuda_graph"] is True
+    assert calls[-1] == ("cleanup",)
     assert not tuple(tmp_path.iterdir())
+
+
+def test_mhc_runner_preserves_benchmark_failure_when_cleanup_also_fails(monkeypatch) -> None:
+    def _prepare(*_args, **_kwargs):
+        def _cleanup() -> None:
+            raise RuntimeError("cleanup boom")
+
+        return mhc.PreparedMhcCase(
+            kernel_func=lambda: None,
+            framework_version="0.5.10rc0",
+            device_name="NVIDIA GB200",
+            device=object(),
+            architecture="DeepseekV4ForCausalLM",
+            model_artifact=_MODEL_ARTIFACT,
+            num_sites=2,
+            hidden_size=4096,
+            hc_mult=4,
+            sinkhorn_iters=20,
+            quant_mode="bfloat16",
+            cleanup=_cleanup,
+        )
+
+    @contextmanager
+    def _benchmark(**_kwargs):
+        raise RuntimeError("benchmark boom")
+        yield
+
+    monkeypatch.setattr(mhc, "_prepare_mhc_case", _prepare)
+    monkeypatch.setattr(mhc, "benchmark_with_power", _benchmark)
+
+    with pytest.raises(RuntimeError, match="benchmark boom"):
+        mhc.run_mhc_case("pre", 19, 4096, 4, 20, "bfloat16", protocol=_protocol())
+
+
+def test_mhc_patched_model_dirs_are_unique_and_removed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        mhc,
+        "_read_model_config",
+        lambda _model_id: {"expert_dtype": "fp8", "num_hidden_layers": 8},
+    )
+    real_mkdtemp = mhc.tempfile.mkdtemp
+    monkeypatch.setattr(
+        mhc.tempfile,
+        "mkdtemp",
+        lambda **kwargs: real_mkdtemp(dir=tmp_path, **kwargs),
+    )
+
+    first = Path(mhc._patched_model_dir(_MODEL_ARTIFACT))
+    second = Path(mhc._patched_model_dir(_MODEL_ARTIFACT))
+    assert first != second
+    assert first.is_dir() and second.is_dir()
+
+    mhc._cleanup_temporary_model_dirs()
+    assert not first.exists()
+    assert not second.exists()
+
+
+def test_mhc_temp_cleanup_attempts_remaining_dirs_after_one_oserror(monkeypatch, tmp_path) -> None:
+    blocked = tmp_path / "blocked"
+    removable = tmp_path / "removable"
+    blocked.mkdir()
+    removable.mkdir()
+
+    class OrderedDirs(list[Path]):
+        def discard(self, item: Path) -> None:
+            if item in self:
+                self.remove(item)
+
+    tracked = OrderedDirs([blocked, removable])
+    calls: list[Path] = []
+
+    def remove_tree(path: Path) -> None:
+        calls.append(path)
+        if path == blocked:
+            raise PermissionError("blocked temp directory")
+        path.rmdir()
+
+    monkeypatch.setattr(mhc, "_TEMPORARY_MODEL_DIRS", tracked)
+    monkeypatch.setattr(mhc.shutil, "rmtree", remove_tree)
+
+    with pytest.raises(PermissionError, match="blocked temp directory"):
+        mhc._cleanup_temporary_model_dirs()
+
+    assert calls == [blocked, removable]
+    assert tracked == [blocked]
+    assert blocked.is_dir()
+    assert not removable.exists()
 
 
 def test_mhc_runner_is_exact_only_import_light_and_has_no_offline_output_api(monkeypatch) -> None:

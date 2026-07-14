@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -18,15 +20,20 @@ from aiconfigurator.sdk.operations.base import Operation
 from aiconfigurator.sdk.operations.overlap import FallbackOp, OverlapOp
 from aiconfigurator.sdk.perf_database import _cached_configured_database_view
 from aiconfigurator.sdk.performance_result import PerformanceResult
+from aiconfigurator.sdk.resolution.coordinator import OnlineResolutionCoordinator
+from aiconfigurator.sdk.resolution.fallback import FallbackStore
 from aiconfigurator.sdk.resolution.overlay import OverlayStore
 from aiconfigurator.sdk.resolution.session import ResolutionBudget, ResolutionFailed, ResolutionSession
 from aiconfigurator.sdk.resolution.types import (
     MeasurementEnvironment,
+    MeasurementFailureKind,
     MeasurementProtocol,
     MeasurementRecord,
     MeasurementRequest,
     PerfKey,
+    RecordStatus,
     UnresolvedCode,
+    UnresolvedReason,
 )
 
 pytestmark = pytest.mark.unit
@@ -81,6 +88,14 @@ def _record(
         perf_row={"latency": latency_ms, "energy": energy_wms},
         provenance={"collector_revision": "test-v1"},
     )
+
+
+def _reopened_lookup(path, key: PerfKey, protocol: MeasurementProtocol):
+    overlay = OverlayStore(path)
+    try:
+        return overlay.lookup(key, protocol)
+    finally:
+        overlay.close()
 
 
 class _RootDatabase:
@@ -138,6 +153,88 @@ class _BindingExecutor(_Executor):
         return replace(request, protocol=self.bound_protocol)
 
 
+class _TypedFailureExecutor(_Executor):
+    def __init__(
+        self,
+        failed_operation: str,
+        code: UnresolvedCode,
+        *,
+        kind: MeasurementFailureKind = MeasurementFailureKind.OPERATIONAL,
+    ) -> None:
+        super().__init__()
+        self.failed_operation = failed_operation
+        self.code = code
+        self.kind = kind
+
+    def execute(
+        self,
+        requests: Sequence[MeasurementRequest],
+        *,
+        deadline_monotonic: float,
+        cancellation: object,
+    ) -> Sequence[MeasurementRecord]:
+        del deadline_monotonic, cancellation
+        batch = tuple(requests)
+        self.request_batches.append(batch)
+        records = []
+        for request in batch:
+            if request.op_id == self.failed_operation:
+                records.append(
+                    MeasurementRecord(
+                        key=request.key,
+                        status=RecordStatus.FAILED,
+                        latency_ms=None,
+                        energy_wms=0.0,
+                        samples_ms=(),
+                        protocol=request.protocol,
+                        perf_row={},
+                        provenance={"collector_revision": "test-v1"},
+                        failure_code=self.code,
+                        failure_reason=f"injected {self.code.value}",
+                        failure_kind=self.kind,
+                    )
+                )
+            else:
+                records.append(_record(request, 1.25))
+        return tuple(records)
+
+
+class _BlockingExactExecutor(_Executor):
+    def __init__(self, entered: threading.Event, release: threading.Event) -> None:
+        super().__init__()
+        self.entered = entered
+        self.release = release
+
+    def execute(
+        self,
+        requests: Sequence[MeasurementRequest],
+        *,
+        deadline_monotonic: float,
+        cancellation: object,
+    ) -> Sequence[MeasurementRecord]:
+        del deadline_monotonic, cancellation
+        batch = tuple(requests)
+        self.request_batches.append(batch)
+        self.entered.set()
+        assert self.release.wait(timeout=5.0)
+        return tuple(_record(request, 1.25) for request in batch)
+
+
+class _DuplicateRecordExecutor(_Executor):
+    def execute(
+        self,
+        requests: Sequence[MeasurementRequest],
+        *,
+        deadline_monotonic: float,
+        cancellation: object,
+    ) -> Sequence[MeasurementRecord]:
+        del deadline_monotonic, cancellation
+        batch = tuple(requests)
+        self.request_batches.append(batch)
+        record = _record(batch[0], 1.25)
+        return (record, record)
+
+
 class _TableOp(Operation):
     def __init__(
         self,
@@ -173,6 +270,26 @@ class _TableOp(Operation):
         x = kwargs["x"]
         self.curated_calls.append((database, x))
         return self.curated.get(x)
+
+
+class _HybridTrackingTableOp(_TableOp):
+    def __init__(self, name: str, **kwargs) -> None:
+        super().__init__(name, **kwargs)
+        self.hybrid_resolver_calls = 0
+
+    def hybrid_fallback_value(self, database, *, normalized_query, **kwargs):
+        self.hybrid_resolver_calls += 1
+        return super().hybrid_fallback_value(
+            database,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
+
+
+class _RaisingHybridOp(_HybridTrackingTableOp):
+    def hybrid_fallback_value(self, database, *, normalized_query, **kwargs):
+        self.hybrid_resolver_calls += 1
+        raise RuntimeError("injected HYBRID query failure")
 
 
 class _NormalizedTableOp(_TableOp):
@@ -224,6 +341,12 @@ class _MissingSiliconTableOp(_TableOp):
     def query(self, database, **kwargs) -> PerformanceResult:
         self.query_calls.append((database, kwargs))
         raise PerfDataNotAvailableError(f"{self._name} has no silicon point")
+
+
+class _MissingSiliconOverriddenProvisionalTableOp(_TableOp):
+    def provisional_result(self, database, *, normalized_query, **kwargs) -> PerformanceResult:
+        del database, normalized_query, kwargs
+        raise PerfDataNotAvailableError(f"{self._name} has no provisional silicon point")
 
 
 class _MissingSiliconNoAdapterOp(Operation):
@@ -432,7 +555,8 @@ def test_overlay_precedes_curated_and_scales_the_measurement(session_factory) ->
         scale_factor=2.5,
         curated={8: PerformanceResult(99.0, energy=99.0, source="curated_exact")},
     )
-    session.overlay.append(_record(_request("scaled", 8, protocol), 0.1, 0.2))
+    request = _request("scaled", 8, protocol)
+    session.overlay.append(_record(request, 0.1, 0.2))
 
     result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=8))
 
@@ -442,6 +566,9 @@ def test_overlay_precedes_curated_and_scales_the_measurement(session_factory) ->
     assert executor.request_batches == []
     assert op.curated_calls == []
     assert op.query_calls == []
+    report = session.report.to_dict()
+    assert report["consumer_counts"] == {request.key.digest: 1}
+    assert report["callbacks"][0]["final_exact_sources"] == {request.key.digest: "overlay"}
 
 
 def test_operation_binds_template_request_before_overlay_lookup_and_miss(session_factory) -> None:
@@ -508,10 +635,20 @@ def test_operation_classifies_route_protocol_binding_failure_as_identity_mismatc
 
 
 def test_literal_curated_result_is_final_and_never_rescaled(session_factory) -> None:
-    expected = PerformanceResult(0.4, energy=0.7, source="curated_exact")
+    expected = PerformanceResult(
+        0.4,
+        energy=0.7,
+        source="curated_exact",
+        provenance={
+            "dataset": "gemm_perf.txt/v1",
+            "row": 7,
+            "source_revision": "curated-r3",
+        },
+    )
     executor = _Executor()
     session = session_factory(executor)
     op = _TableOp("literal", scale_factor=9.0, curated={4: expected})
+    request = _request("literal", 4, session.protocol)
 
     result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=4))
 
@@ -520,6 +657,41 @@ def test_literal_curated_result_is_final_and_never_rescaled(session_factory) -> 
     assert executor.request_batches == []
     assert op.query_calls == []
     assert len(op.curated_calls) == 1
+    report = session.report.to_dict()
+    assert report["consumer_counts"] == {request.key.digest: 1}
+    assert report["exact_source_counts"]["curated_exact"] == 1
+    assert report["callbacks"][0]["final_exact_sources"] == {request.key.digest: "curated_exact"}
+    expected_evidence = {
+        "key_digest": request.key.digest,
+        "source": "curated_exact",
+        "latency_ms": 0.4,
+        "energy_wms": 0.7,
+        "provenance": {
+            "dataset": "gemm_perf.txt/v1",
+            "row": 7,
+            "source_revision": "curated-r3",
+        },
+    }
+    assert report["evidence_links"] == [expected_evidence]
+    assert report["callbacks"][0]["final_evidence"] == [expected_evidence]
+
+
+def test_literal_curated_result_ignores_non_json_provenance_without_changing_query(session_factory) -> None:
+    expected = PerformanceResult(
+        0.4,
+        energy=0.7,
+        source="curated_exact",
+        provenance={"opaque": object()},
+    )
+    session = session_factory(_Executor())
+    op = _TableOp("literal", curated={4: expected})
+
+    result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=4))
+
+    assert result is expected
+    assert session.report.to_dict()["callbacks"][0]["final_evidence"][0]["provenance"] == {
+        "unavailable": "not_json_safe"
+    }
 
 
 def test_off_grid_shape_collects_exact_evidence_instead_of_interpolating(session_factory) -> None:
@@ -581,6 +753,20 @@ def test_missing_silicon_provisional_does_not_abort_collection_before_replay(ses
     assert result.source == "overlay"
     assert len(op.query_calls) == 1
     assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["measured_only"]]
+
+
+def test_overridden_missing_silicon_provisional_does_not_abort_collection_before_replay(
+    session_factory,
+) -> None:
+    executor = _Executor({"measured_only_override": (0.75, 7.5)})
+    session = session_factory(executor)
+    op = _MissingSiliconOverriddenProvisionalTableOp("measured_only_override")
+
+    result = session.execute_callback(lambda: op.query_with_resolution(_RootDatabase(), session=session, x=17))
+
+    assert float(result) == pytest.approx(0.75)
+    assert result.source == "overlay"
+    assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["measured_only_override"]]
 
 
 def test_missing_silicon_without_adapter_fails_structured_instead_of_leaking_query_error(session_factory) -> None:
@@ -860,6 +1046,572 @@ def test_overlap_replays_duplicate_child_key_at_every_consumer_position(session_
     assert [[request.op_id for request in batch] for batch in executor.request_batches] == [["shared"]]
     assert session.report.unique_misses == 1
     assert session.report.consumer_misses == 2
+
+
+def test_typed_timeout_publishes_only_failed_keys_unscaled_hybrid_and_replays_once(
+    tmp_path,
+    caplog,
+) -> None:
+    caplog.set_level(logging.INFO, logger="aiconfigurator.sdk.resolution.session")
+    protocol = _protocol()
+    executor = _TypedFailureExecutor("b", UnresolvedCode.TIMEOUT)
+    overlay = OverlayStore(tmp_path / "overlay.sqlite")
+    session = ResolutionSession(
+        overlay,
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    exact = _HybridTrackingTableOp("a", ordinary=PerformanceResult(100.0, source="empirical"))
+    degraded = _HybridTrackingTableOp(
+        "b",
+        scale_factor=2.0,
+        ordinary=PerformanceResult(8.0, source="empirical"),
+    )
+    database = _RootDatabase()
+    calls = 0
+
+    def query() -> PerformanceResult:
+        nonlocal calls
+        calls += 1
+        return exact.query_with_resolution(database, session=session, x=8) + degraded.query_with_resolution(
+            database,
+            session=session,
+            x=16,
+        )
+
+    try:
+        result = coordinator.execute_callback(query)
+    finally:
+        coordinator.close()
+
+    request_a = _request("a", 8, protocol)
+    request_b = _request("b", 16, protocol)
+    persisted_fallback = fallback_store.lookup(
+        request_b.key,
+        prediction_revision="prediction-r1",
+    )
+    assert float(result) == pytest.approx(9.25)
+    assert result.source == "mixed"
+    assert calls == 2
+    assert exact.hybrid_resolver_calls == 0
+    assert degraded.hybrid_resolver_calls == 1
+    assert _reopened_lookup(overlay.path, request_a.key, protocol) is not None
+    assert _reopened_lookup(overlay.path, request_b.key, protocol) is None
+    assert persisted_fallback is not None
+    assert persisted_fallback.latency_ms == pytest.approx(4.0)
+    assert persisted_fallback.hybrid_source == "empirical"
+    assert persisted_fallback.measurement_failure.code is UnresolvedCode.TIMEOUT
+    assert session.report.to_dict()["hybrid_fallbacks"] == [
+        {
+            "key_digest": request_b.key.digest,
+            "latency_ms": 4.0,
+            "latency_units": "ms",
+            "path": str(persisted_fallback.path),
+            "hybrid_provenance": {
+                "source": "empirical",
+                "prediction_revision": "prediction-r1",
+                "metadata": {},
+            },
+            "measurement_failure": {
+                "code": "timeout",
+                "operation": "b",
+                "detail": "injected timeout",
+            },
+        }
+    ]
+    assert len(tuple(fallback_store.directory.glob("*.json"))) == 1
+    assert executor.request_batches == [(_request("a", 8, protocol), _request("b", 16, protocol))]
+    publications = [
+        record for record in caplog.records if getattr(record, "event", None) == "aic_hybrid_fallback_published"
+    ]
+    assert len(publications) == 1
+    assert publications[0].levelno == logging.WARNING
+    assert publications[0].key_digest == request_b.key.digest
+    assert publications[0].failure_code == "timeout"
+    assert publications[0].hybrid_source == "empirical"
+    assert publications[0].sidecar_path == str(persisted_fallback.path)
+
+
+def test_sidecar_warm_reopen_exact_precedence_and_force_remeasure(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="aiconfigurator.sdk.resolution.session")
+    protocol = _protocol()
+    request = _request("warm", 8, protocol)
+    fallback_directory = tmp_path / "fallback"
+    store = FallbackStore(fallback_directory)
+    sidecar = store.publish(
+        request.key,
+        prediction_revision="prediction-r1",
+        latency_ms=4.0,
+        hybrid_source="empirical",
+        measurement_failure=UnresolvedReason(
+            UnresolvedCode.TIMEOUT,
+            request.op_id,
+            "injected timeout",
+            key=request.key,
+            failure_kind=MeasurementFailureKind.OPERATIONAL,
+        ),
+    )
+
+    def run(
+        *,
+        overlay: OverlayStore,
+        executor: _Executor,
+        operation: _TableOp,
+        reopened_store: FallbackStore,
+        force_remeasure: bool = False,
+    ):
+        session = ResolutionSession(
+            overlay,
+            executor,
+            ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+            protocol,
+        )
+        coordinator = OnlineResolutionCoordinator(
+            session,
+            fallback_store=reopened_store,
+            prediction_revision="prediction-r1",
+            on_measurement_failure="hybrid",
+            force_remeasure=force_remeasure,
+        )
+        try:
+            result = coordinator.execute_callback(
+                lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8)
+            )
+        finally:
+            coordinator.close()
+        return result, session
+
+    warm_executor = _Executor()
+    warm_result, warm_session = run(
+        overlay=OverlayStore(tmp_path / "warm-overlay.sqlite"),
+        executor=warm_executor,
+        operation=_TableOp("warm", scale_factor=2.0),
+        reopened_store=store,
+    )
+    assert float(warm_result) == pytest.approx(8.0)
+    assert warm_executor.request_batches == []
+    assert warm_session.report.fallback_hits == 1
+
+    reopen_executor = _Executor()
+    reopen_result, reopen_session = run(
+        overlay=OverlayStore(tmp_path / "reopen-overlay.sqlite"),
+        executor=reopen_executor,
+        operation=_TableOp("warm", scale_factor=2.0),
+        reopened_store=FallbackStore(fallback_directory),
+    )
+    assert float(reopen_result) == pytest.approx(8.0)
+    assert reopen_executor.request_batches == []
+    assert reopen_session.report.fallback_hits == 1
+
+    exact_overlay = OverlayStore(tmp_path / "exact-overlay.sqlite")
+    exact_overlay.append(_record(request, 1.5))
+    exact_executor = _Executor()
+    exact_result, exact_session = run(
+        overlay=exact_overlay,
+        executor=exact_executor,
+        operation=_TableOp("warm", scale_factor=2.0),
+        reopened_store=FallbackStore(fallback_directory),
+    )
+    assert float(exact_result) == pytest.approx(3.0)
+    assert exact_executor.request_batches == []
+    assert exact_session.report.fallback_hits == 0
+
+    curated_executor = _Executor()
+    curated_result, curated_session = run(
+        overlay=OverlayStore(tmp_path / "curated-overlay.sqlite"),
+        executor=curated_executor,
+        operation=_TableOp(
+            "warm",
+            scale_factor=2.0,
+            curated={8: PerformanceResult(3.0, source="curated_exact")},
+        ),
+        reopened_store=FallbackStore(fallback_directory),
+    )
+    assert float(curated_result) == pytest.approx(3.0)
+    assert curated_executor.request_batches == []
+    assert curated_session.report.fallback_hits == 0
+
+    force_executor = _Executor({"warm": (1.25, 0.0)})
+    force_overlay = OverlayStore(tmp_path / "force-overlay.sqlite")
+    force_result, force_session = run(
+        overlay=force_overlay,
+        executor=force_executor,
+        operation=_TableOp("warm", scale_factor=2.0),
+        reopened_store=FallbackStore(fallback_directory),
+        force_remeasure=True,
+    )
+    assert float(force_result) == pytest.approx(2.5)
+    assert force_executor.request_batches == [(request,)]
+    assert force_session.report.fallback_hits == 0
+    assert _reopened_lookup(force_overlay.path, request.key, protocol) is not None
+    assert sidecar.path.exists()
+    hits = [record for record in caplog.records if getattr(record, "event", None) == "aic_hybrid_fallback_hit"]
+    assert len(hits) == 2
+    assert all(record.levelno == logging.INFO for record in hits)
+    assert all(record.key_digest == request.key.digest for record in hits)
+
+
+def test_existing_first_writer_does_not_emit_hybrid_publication_warning(tmp_path, caplog) -> None:
+    protocol = _protocol()
+    request = _request("race", 8, protocol)
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    winner = fallback_store.publish(
+        request.key,
+        prediction_revision="prediction-r1",
+        latency_ms=4.0,
+        hybrid_source="empirical",
+        measurement_failure=UnresolvedReason(
+            UnresolvedCode.TIMEOUT,
+            request.op_id,
+            "first writer",
+            key=request.key,
+            failure_kind=MeasurementFailureKind.OPERATIONAL,
+        ),
+    )
+    caplog.set_level(logging.INFO, logger="aiconfigurator.sdk.resolution.session")
+    executor = _TypedFailureExecutor("race", UnresolvedCode.TIMEOUT)
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+        force_remeasure=True,
+    )
+    operation = _HybridTrackingTableOp(
+        "race",
+        ordinary=PerformanceResult(6.0, source="empirical"),
+    )
+
+    try:
+        result = coordinator.execute_callback(
+            lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8)
+        )
+    finally:
+        coordinator.close()
+
+    assert float(result) == pytest.approx(4.0)
+    persisted_winner = fallback_store.lookup(request.key, prediction_revision="prediction-r1")
+    assert persisted_winner is not None
+    assert persisted_winner.path == winner.path
+    assert persisted_winner.latency_ms == pytest.approx(winner.latency_ms)
+    payload = session.report.to_dict()
+    assert payload["hybrid_publications"] == 0
+    assert payload["fallback_hits"] == 1
+    assert payload["hybrid_fallbacks"][0]["latency_ms"] == pytest.approx(4.0)
+    assert payload["hybrid_fallbacks"][0]["measurement_failure"]["detail"] == "first writer"
+    assert not [
+        record for record in caplog.records if getattr(record, "event", None) == "aic_hybrid_fallback_published"
+    ]
+    reuses = [record for record in caplog.records if getattr(record, "event", None) == "aic_hybrid_fallback_reused"]
+    assert len(reuses) == 1
+    assert reuses[0].levelno == logging.INFO
+    assert reuses[0].sidecar_path == str(winner.path)
+
+
+def test_callback_block_timeout_is_operational_and_activates_hybrid(tmp_path) -> None:
+    protocol = _protocol()
+    entered = threading.Event()
+    release = threading.Event()
+    executor = _BlockingExactExecutor(entered, release)
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+
+    def expire_callback_deadline(futures, *, deadline_monotonic):
+        del deadline_monotonic
+        assert futures
+        assert entered.wait(timeout=5.0)
+        return set()
+
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        max_block_seconds=1.0,
+        wait_for_futures=expire_callback_deadline,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    operation = _HybridTrackingTableOp(
+        "deadline",
+        ordinary=PerformanceResult(4.0, source="empirical"),
+    )
+
+    try:
+        result = coordinator.execute_callback(
+            lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8)
+        )
+    finally:
+        release.set()
+        coordinator.close()
+
+    request = _request("deadline", 8, protocol)
+    persisted = fallback_store.lookup(request.key, prediction_revision="prediction-r1")
+    assert float(result) == pytest.approx(4.0)
+    assert operation.hybrid_resolver_calls == 1
+    assert persisted is not None
+    assert persisted.measurement_failure.code is UnresolvedCode.TIMEOUT
+    assert session.report.callbacks[0]["collection"]["deadline_source"] == "callback_block"
+
+
+@pytest.mark.parametrize(
+    ("code", "kind"),
+    [
+        (UnresolvedCode.MISSING_ADAPTER, MeasurementFailureKind.OPERATIONAL),
+        (UnresolvedCode.UNSUPPORTED_SHAPE, MeasurementFailureKind.OPERATIONAL),
+        (UnresolvedCode.RESOURCE_UNAVAILABLE, MeasurementFailureKind.OPERATIONAL),
+        (UnresolvedCode.COLLECTOR_FAILED, MeasurementFailureKind.OPERATIONAL),
+        (UnresolvedCode.TIMEOUT, MeasurementFailureKind.OPERATIONAL),
+        (UnresolvedCode.INVALID_MEASUREMENT, MeasurementFailureKind.OPERATIONAL),
+        (UnresolvedCode.BUDGET_EXHAUSTED, MeasurementFailureKind.BUDGET),
+        (UnresolvedCode.RETRY_EXHAUSTED, MeasurementFailureKind.OPERATIONAL),
+        (UnresolvedCode.REQUERY_STILL_MISSING, MeasurementFailureKind.OPERATIONAL),
+    ],
+)
+def test_typed_eligible_measurement_failures_activate_hybrid(tmp_path, code, kind) -> None:
+    protocol = _protocol()
+    executor = _TypedFailureExecutor("eligible", code, kind=kind)
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    operation = _HybridTrackingTableOp(
+        "eligible",
+        ordinary=PerformanceResult(4.0, source="empirical"),
+    )
+
+    try:
+        result = coordinator.execute_callback(
+            lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8)
+        )
+    finally:
+        coordinator.close()
+
+    request = _request("eligible", 8, protocol)
+    persisted = fallback_store.lookup(request.key, prediction_revision="prediction-r1")
+    assert float(result) == pytest.approx(4.0)
+    assert operation.hybrid_resolver_calls == 1
+    assert persisted is not None
+    assert persisted.measurement_failure.code is code
+
+
+@pytest.mark.parametrize(
+    ("code", "kind"),
+    [
+        (UnresolvedCode.IDENTITY_MISMATCH, MeasurementFailureKind.INVARIANT),
+        (UnresolvedCode.TOPOLOGY_MISMATCH, MeasurementFailureKind.INVARIANT),
+        (UnresolvedCode.CANCELLED, MeasurementFailureKind.CANCELLATION),
+        (UnresolvedCode.OBSERVE_ONLY, MeasurementFailureKind.OBSERVATION),
+        (UnresolvedCode.COLLECTOR_FAILED, MeasurementFailureKind.INVARIANT),
+        (UnresolvedCode.INVALID_MEASUREMENT, MeasurementFailureKind.INVARIANT),
+        (UnresolvedCode.TIMEOUT, MeasurementFailureKind.CANCELLATION),
+        (UnresolvedCode.MISSING_ADAPTER, MeasurementFailureKind.INVARIANT),
+    ],
+)
+def test_structural_and_non_measurement_failures_never_activate_hybrid(tmp_path, code, kind) -> None:
+    protocol = _protocol()
+    executor = _TypedFailureExecutor("ineligible", code, kind=kind)
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    operation = _HybridTrackingTableOp(
+        "ineligible",
+        ordinary=PerformanceResult(4.0, source="empirical"),
+    )
+
+    try:
+        with pytest.raises(ResolutionFailed) as failure:
+            coordinator.execute_callback(lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8))
+    finally:
+        coordinator.close()
+
+    assert [reason.code for reason in failure.value.reasons] == [code]
+    assert operation.hybrid_resolver_calls == 0
+    assert not fallback_store.directory.exists()
+
+
+def test_missing_adapter_without_validated_key_never_activates_hybrid(tmp_path) -> None:
+    protocol = _protocol()
+    executor = _Executor()
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    operation = _BareOp("missing", 4.0)
+
+    try:
+        with pytest.raises(ResolutionFailed) as failure:
+            coordinator.execute_callback(lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8))
+    finally:
+        coordinator.close()
+
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.MISSING_ADAPTER]
+    assert failure.value.reasons[0].key is None
+    assert executor.request_batches == []
+    assert not fallback_store.directory.exists()
+
+
+@pytest.mark.parametrize("failure_mode", ["raises", "non_finite", "missing_source"])
+def test_hybrid_query_failure_is_structured_and_never_publishes_sidecar(
+    tmp_path,
+    failure_mode,
+) -> None:
+    protocol = _protocol()
+    executor = _TypedFailureExecutor("broken", UnresolvedCode.TIMEOUT)
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    if failure_mode == "raises":
+        operation = _RaisingHybridOp("broken")
+    else:
+        ordinary = PerformanceResult(
+            float("nan") if failure_mode == "non_finite" else 4.0,
+            source="empirical" if failure_mode == "non_finite" else "",
+        )
+        operation = _HybridTrackingTableOp("broken", ordinary=ordinary)
+
+    try:
+        with pytest.raises(ResolutionFailed) as failure:
+            coordinator.execute_callback(lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8))
+    finally:
+        coordinator.close()
+
+    request = _request("broken", 8, protocol)
+    assert [reason.code for reason in failure.value.reasons] == [
+        UnresolvedCode.TIMEOUT,
+        UnresolvedCode.INVALID_MEASUREMENT,
+    ]
+    assert [reason.key for reason in failure.value.reasons] == [request.key, request.key]
+    assert [reason.failure_kind for reason in failure.value.reasons] == [
+        MeasurementFailureKind.OPERATIONAL,
+        MeasurementFailureKind.INVARIANT,
+    ]
+    assert "HYBRID fallback failed after timeout" in failure.value.reasons[1].detail
+    assert operation.hybrid_resolver_calls == 1
+    assert not fallback_store.directory.exists()
+
+
+def test_same_operation_two_shapes_route_hybrid_failures_by_physical_key(tmp_path) -> None:
+    protocol = _protocol()
+    executor = _TypedFailureExecutor("shared", UnresolvedCode.TIMEOUT)
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    first = _HybridTrackingTableOp("shared", ordinary=PerformanceResult(4.0, source="empirical"))
+    second = _HybridTrackingTableOp("shared", ordinary=PerformanceResult(6.0, source="empirical"))
+    database = _RootDatabase()
+
+    try:
+        result = coordinator.execute_callback(
+            lambda: (
+                first.query_with_resolution(database, session=session, x=8)
+                + second.query_with_resolution(database, session=session, x=16)
+            )
+        )
+    finally:
+        coordinator.close()
+
+    first_request = _request("shared", 8, protocol)
+    second_request = _request("shared", 16, protocol)
+    assert float(result) == pytest.approx(10.0)
+    assert first.hybrid_resolver_calls == second.hybrid_resolver_calls == 1
+    assert fallback_store.lookup(first_request.key, prediction_revision="prediction-r1") is not None
+    assert fallback_store.lookup(second_request.key, prediction_revision="prediction-r1") is not None
+    assert len(tuple(fallback_store.directory.glob("*.json"))) == 2
+
+
+def test_duplicate_executor_records_are_invariant_failure_not_hybrid(tmp_path) -> None:
+    protocol = _protocol()
+    executor = _DuplicateRecordExecutor()
+    session = ResolutionSession(
+        OverlayStore(tmp_path / "overlay.sqlite"),
+        executor,
+        ResolutionBudget(max_new_keys=8, max_wall_seconds=30.0),
+        protocol,
+    )
+    fallback_store = FallbackStore(tmp_path / "fallback")
+    coordinator = OnlineResolutionCoordinator(
+        session,
+        fallback_store=fallback_store,
+        prediction_revision="prediction-r1",
+        on_measurement_failure="hybrid",
+    )
+    operation = _HybridTrackingTableOp("malformed", ordinary=PerformanceResult(4.0, source="empirical"))
+
+    try:
+        with pytest.raises(ResolutionFailed) as failure:
+            coordinator.execute_callback(lambda: operation.query_with_resolution(_RootDatabase(), session=session, x=8))
+    finally:
+        coordinator.close()
+
+    assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.INVALID_MEASUREMENT]
+    assert operation.hybrid_resolver_calls == 0
+    assert not fallback_store.directory.exists()
 
 
 def test_overlap_direct_first_walk_composes_nonzero_provisional_descendant(session_factory) -> None:

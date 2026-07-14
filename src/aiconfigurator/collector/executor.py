@@ -10,13 +10,13 @@ return raw result mappings; they never construct or persist performance rows.
 
 from __future__ import annotations
 
-import ctypes
 import importlib
 import json
 import math
 import multiprocessing
 import os
 import queue
+import select
 import signal
 import tempfile
 import threading
@@ -38,6 +38,7 @@ from aiconfigurator.collector.scheduler import HardwareAwareScheduler, Unschedul
 from aiconfigurator.collector.types import Assignment, CollectionJob, HardwareInventory
 from aiconfigurator.sdk.resolution.session import CancellationToken
 from aiconfigurator.sdk.resolution.types import (
+    MeasurementFailureKind,
     MeasurementProtocol,
     MeasurementRecord,
     MeasurementRequest,
@@ -46,6 +47,8 @@ from aiconfigurator.sdk.resolution.types import (
     UnresolvedCode,
     canonical_json,
 )
+
+_WAIT_READY_POLL_SECONDS = 0.05
 
 __all__ = [
     "NcclRankBootstrap",
@@ -85,6 +88,7 @@ class PersistentNcclRuntime:
         self._close = close
         self._protocol = protocol
         self._closed = False
+        self._shutdown_started = False
 
     @property
     def protocol_digest(self) -> str | None:
@@ -93,6 +97,8 @@ class PersistentNcclRuntime:
     def measure(self, dtype: str, operation: str, element_count: int) -> tuple[float, ...]:
         if self._closed:
             raise RuntimeError("persistent NCCL runtime is closed")
+        if self._shutdown_started:
+            raise RuntimeError("persistent NCCL runtime shutdown is incomplete")
         if dtype not in self._DTYPES:
             raise ValueError(f"unsupported NCCL dtype {dtype!r}")
         if operation not in self._OPERATIONS:
@@ -113,9 +119,10 @@ class PersistentNcclRuntime:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        self._shutdown_started = True
         if self._close is not None:
             self._close()
+        self._closed = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,21 +157,63 @@ class NcclRankReply:
     error: str | None = None
 
 
-def _install_parent_death_signal(parent_pid: int) -> None:
-    """Kill a rank automatically if its owning persistent worker disappears."""
+def _install_parent_process_watchdog(parent_pid: int) -> None:
+    """Kill a child if its owning process disappears, independent of creator thread."""
 
     if isinstance(parent_pid, bool) or not isinstance(parent_pid, int) or parent_pid <= 0:
-        raise ValueError("rank parent_pid must be a positive integer")
-    libc = ctypes.CDLL(None, use_errno=True)
-    prctl = getattr(libc, "prctl", None)
-    if prctl is None:
-        raise RuntimeError("persistent ranks require Linux prctl parent-death support")
-    if prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number))
-    if os.getppid() != parent_pid:
+        raise ValueError("parent_pid must be a positive integer")
+
+    def kill_orphan() -> None:
         os.kill(os.getpid(), signal.SIGKILL)
-        raise RuntimeError("persistent rank parent exited during startup")
+
+    if os.getppid() != parent_pid:
+        kill_orphan()
+        return
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    parent_pidfd: int | None = None
+    if callable(pidfd_open):
+        try:
+            parent_pidfd = pidfd_open(parent_pid)
+        except ProcessLookupError:
+            kill_orphan()
+            return
+        except OSError:
+            # Older kernels and constrained containers may expose the Python
+            # API without supporting pidfds. getppid polling remains process-
+            # scoped and avoids PR_SET_PDEATHSIG's creator-thread semantics.
+            parent_pidfd = None
+
+    if os.getppid() != parent_pid:
+        if parent_pidfd is not None:
+            os.close(parent_pidfd)
+        kill_orphan()
+        return
+
+    def watch_parent() -> None:
+        if parent_pidfd is not None:
+            try:
+                poller = select.poll()
+                poller.register(parent_pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+                while True:
+                    try:
+                        events = poller.poll()
+                    except InterruptedError:
+                        continue
+                    if events:
+                        break
+            finally:
+                os.close(parent_pidfd)
+        else:
+            while os.getppid() == parent_pid:
+                time.sleep(0.05)
+        kill_orphan()
+
+    threading.Thread(
+        target=watch_parent,
+        name="aic-parent-process-watchdog",
+        daemon=True,
+    ).start()
 
 
 def _nccl_alltoall_splits(
@@ -314,7 +363,7 @@ def nccl_rank_process_main(
     """Initialize one NCCL rank once and serve independent exact cases."""
 
     if bootstrap.parent_pid is not None:
-        _install_parent_death_signal(bootstrap.parent_pid)
+        _install_parent_process_watchdog(bootstrap.parent_pid)
     backend = runtime_factory(bootstrap)
     command: NcclRankCommand | None = None
     failed = False
@@ -415,6 +464,10 @@ class PersistentNcclRankGroup:
         self._processes: list[Any] = []
         self._closed = False
         self._poisoned = False
+        self._shutdown_started = False
+        self._teardown_complete = False
+        self._cleanup_complete = False
+        self._close_error: RuntimeError | None = None
         self._rendezvous = tempfile.TemporaryDirectory(prefix="aic-nccl-rendezvous-")
         init_method = f"file://{self._rendezvous.name}/store"
         previous_init_method = os.environ.get("AICONFIGURATOR_NCCL_INIT_METHOD")
@@ -478,6 +531,8 @@ class PersistentNcclRankGroup:
             raise RuntimeError("persistent NCCL rank group is closed")
         if self._poisoned:
             raise RuntimeError("persistent NCCL rank group is poisoned")
+        if self._shutdown_started:
+            raise RuntimeError("persistent NCCL rank group shutdown is incomplete")
         if dtype not in PersistentNcclRuntime._DTYPES:
             raise ValueError(f"unsupported NCCL dtype {dtype!r}")
         if operation not in PersistentNcclRuntime._OPERATIONS:
@@ -548,9 +603,11 @@ class PersistentNcclRankGroup:
                 raise shutdown_error from error
             raise
 
-    def _join_or_kill(self, process: Any) -> bool:
+    def _join_or_kill(self, process: Any) -> tuple[bool, bool]:
+        forced_termination = False
         process.join(self._shutdown_timeout_seconds)
         if process.is_alive():
+            forced_termination = True
             process.terminate()
             process.join(self._shutdown_timeout_seconds)
         if process.is_alive():
@@ -558,9 +615,11 @@ class PersistentNcclRankGroup:
             if callable(kill):
                 kill()
                 process.join(self._shutdown_timeout_seconds)
-        return not process.is_alive()
+        return not process.is_alive(), forced_termination
 
     def _cleanup(self, *, forced: bool) -> None:
+        if self._cleanup_complete:
+            return
         for queue_object in (*self._command_queues, self._reply_queue):
             if forced:
                 cancel_join_thread = getattr(queue_object, "cancel_join_thread", None)
@@ -570,9 +629,10 @@ class PersistentNcclRankGroup:
             if callable(close):
                 close()
         self._rendezvous.cleanup()
+        self._cleanup_complete = True
 
     def _poison(self) -> None:
-        if self._poisoned:
+        if self._teardown_complete:
             return
         self._poisoned = True
         for process in self._processes:
@@ -591,19 +651,40 @@ class PersistentNcclRankGroup:
         self._cleanup(forced=True)
         if remaining_ranks:
             raise RuntimeError(f"persistent rank processes {remaining_ranks!r} survived forced shutdown")
+        self._teardown_complete = True
 
     def close(self) -> None:
+        if self._close_error is not None:
+            raise self._close_error
         if self._closed:
             return
-        self._closed = True
         if self._poisoned:
+            self._poison()
+            self._closed = True
             return
-        for command_queue in self._command_queues:
-            command_queue.put(None)
-        remaining_ranks = tuple(rank for rank, process in enumerate(self._processes) if not self._join_or_kill(process))
+        if not self._shutdown_started:
+            self._shutdown_started = True
+            for command_queue in self._command_queues:
+                command_queue.put(None)
+        remaining_ranks: list[int] = []
+        failed_ranks: list[tuple[int, int]] = []
+        for rank, process in enumerate(self._processes):
+            stopped, forced_termination = self._join_or_kill(process)
+            if not stopped:
+                remaining_ranks.append(rank)
+                continue
+            exitcode = getattr(process, "exitcode", None)
+            if not forced_termination and exitcode not in (None, 0):
+                failed_ranks.append((rank, int(exitcode)))
         self._cleanup(forced=bool(remaining_ranks))
         if remaining_ranks:
-            raise RuntimeError(f"persistent rank processes {remaining_ranks!r} survived forced shutdown")
+            raise RuntimeError(f"persistent rank processes {tuple(remaining_ranks)!r} survived forced shutdown")
+        self._teardown_complete = True
+        if failed_ranks:
+            detail = ", ".join(f"rank {rank} exited with code {exitcode}" for rank, exitcode in failed_ranks)
+            self._close_error = RuntimeError(f"persistent rank cleanup failed: {detail}")
+            raise self._close_error
+        self._closed = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +697,7 @@ class WorkerBootstrap:
     protocol_digest: str
     device_uuids: tuple[str, ...]
     topology_fingerprint: str
+    parent_pid: int | None = None
 
     @property
     def local_ordinals(self) -> tuple[int, ...]:
@@ -689,6 +771,8 @@ def worker_process_main(
     plain result dictionaries; row validation and persistence stay parent-owned.
     """
 
+    if bootstrap.parent_pid is not None:
+        _install_parent_process_watchdog(bootstrap.parent_pid)
     runner = bind_and_import_runner(bootstrap, import_module=import_module)
     try:
         while True:
@@ -709,10 +793,19 @@ def worker_process_main(
                 raw_result = runner(**case, protocol=command.protocol)
                 if not isinstance(raw_result, Mapping):
                     raise TypeError("exact runner must return a raw result mapping")
+                raw_result = dict(raw_result)
+                if "_worker_binding" in raw_result:
+                    raise ValueError("exact runner result uses reserved _worker_binding field")
+                raw_result["_worker_binding"] = {
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    "device_uuids": list(bootstrap.device_uuids),
+                    "local_ordinals": list(bootstrap.local_ordinals),
+                    "topology_fingerprint": bootstrap.topology_fingerprint,
+                }
                 reply = WorkerReply(
                     invocation_id=command.invocation_id,
                     request_digest=command.request_digest,
-                    raw_result=dict(raw_result),
+                    raw_result=raw_result,
                 )
             except BaseException:
                 reply = WorkerReply(
@@ -744,6 +837,7 @@ class _ProcessWorkerChannel:
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._closed = False
         self._joined = False
+        self._join_error: RuntimeError | None = None
 
     @property
     def ready_handles(self) -> tuple[object, object]:
@@ -768,8 +862,9 @@ class _ProcessWorkerChannel:
 
     def join(self) -> None:
         if self._joined:
+            if self._join_error is not None:
+                raise self._join_error
             return
-        self._joined = True
 
         def _bounded_join() -> None:
             try:
@@ -794,6 +889,10 @@ class _ProcessWorkerChannel:
         if self._process.is_alive():
             raise RuntimeError("persistent worker survived forced kill")
 
+        exitcode = getattr(self._process, "exitcode", None)
+        if not forced_termination and exitcode not in (None, 0):
+            self._join_error = RuntimeError(f"persistent worker exited with code {exitcode} during graceful shutdown")
+
         for queue_object in (self._command_queue, self._reply_queue):
             if forced_termination:
                 cancel_join_thread = getattr(queue_object, "cancel_join_thread", None)
@@ -806,6 +905,9 @@ class _ProcessWorkerChannel:
                 join_thread = getattr(queue_object, "join_thread", None)
                 if callable(join_thread):
                     join_thread()
+        self._joined = True
+        if self._join_error is not None:
+            raise self._join_error
 
 
 class ProcessWorkerFactory:
@@ -832,9 +934,10 @@ class ProcessWorkerFactory:
     def __call__(self, bootstrap: WorkerBootstrap) -> WorkerChannel:
         command_queue = self._context.Queue()
         reply_queue = self._context.Queue()
+        owned_bootstrap = replace(bootstrap, parent_pid=os.getpid())
         process = self._context.Process(
             target=self._worker_target,
-            args=(bootstrap, command_queue, reply_queue),
+            args=(owned_bootstrap, command_queue, reply_queue),
             daemon=False,
         )
         process.start()
@@ -883,6 +986,10 @@ class _ActiveInvocation:
     assignment: Assignment
     channel: WorkerChannel
     command: WorkerCommand
+    execution_id: str
+    wave_index: int
+    wave_request_digests: tuple[str, ...]
+    wave_gpu_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -892,6 +999,7 @@ class _LeaseKey:
     run_module: str
     run_func: str
     protocol_digest: str
+    request_digest: str
     device_uuids: tuple[str, ...]
     topology_fingerprint: str
 
@@ -918,10 +1026,13 @@ class PersistentMeasurementExecutor:
         self._wait_ready = wait_ready
         self._clock = clock
         self._device_by_id = {device.index: device for device in inventory.devices}
+        self._inventory_provenance = self._hardware_inventory_provenance(inventory)
         self._leases: dict[_LeaseKey, WorkerChannel] = {}
         self._closed_channel_refs: list[Callable[[], WorkerChannel | None]] = []
+        self._termination_failure: str | None = None
         self._lock = threading.RLock()
         self._closed = False
+        self._execution_sequence = 0
 
     def bind_request(self, request: MeasurementRequest) -> MeasurementRequest:
         """Bind a request's sampling template to its resolved route metadata."""
@@ -949,24 +1060,37 @@ class PersistentMeasurementExecutor:
                 return ()
             if cancellation.cancelled():
                 return tuple(
-                    self._failure(request, UnresolvedCode.CANCELLED, "collection cancelled before preparation")
+                    self._failure(
+                        request,
+                        UnresolvedCode.CANCELLED,
+                        "collection cancelled before preparation",
+                        failure_kind=MeasurementFailureKind.CANCELLATION,
+                    )
                     for request in request_tuple
                 )
             if self._clock() >= deadline_monotonic:
                 return tuple(
-                    self._failure(request, UnresolvedCode.TIMEOUT, "collection deadline expired before preparation")
+                    self._failure(
+                        request,
+                        UnresolvedCode.TIMEOUT,
+                        "collection deadline expired before preparation",
+                        failure_kind=MeasurementFailureKind.OPERATIONAL,
+                    )
                     for request in request_tuple
                 )
 
             records: list[MeasurementRecord | None] = [None] * len(request_tuple)
             prepared_jobs = self._prepare_jobs(request_tuple, records)
             if prepared_jobs:
+                self._execution_sequence += 1
+                execution_id = f"execution-{self._execution_sequence}"
                 waves = self._scheduler.plan(tuple(item.job for item in prepared_jobs))
                 by_digest = {item.job.request_digest: item for item in prepared_jobs}
                 self._execute_waves(
                     waves,
                     by_digest,
                     records,
+                    execution_id=execution_id,
                     deadline_monotonic=deadline_monotonic,
                     cancellation=cancellation,
                 )
@@ -981,11 +1105,25 @@ class PersistentMeasurementExecutor:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
             channels = tuple({id(channel): channel for channel in self._leases.values()}.values())
-            self._leases.clear()
+            # Signal every GPU-owning worker before joining any one of them.
+            # CUDA/runtime destruction can take measurable time; serial
+            # close->join would multiply that cost by the number of unique
+            # persistent leases and can exhaust the coordinator's outer bound.
             for channel in channels:
-                self._close_channel(channel)
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+            failures: list[RuntimeError] = []
+            for channel in channels:
+                try:
+                    self._evict(channel, propagate_failure=True, already_signaled=True)
+                except RuntimeError as error:
+                    failures.append(error)
+            if failures:
+                raise failures[0]
+            self._closed = True
 
     def _prepare_jobs(
         self,
@@ -1027,6 +1165,7 @@ class PersistentMeasurementExecutor:
                     request,
                     UnresolvedCode.MISSING_ADAPTER,
                     f"adapter resolution failed: {error}",
+                    failure_kind=MeasurementFailureKind.OPERATIONAL,
                 )
                 continue
             try:
@@ -1035,7 +1174,12 @@ class PersistentMeasurementExecutor:
                 records[index] = self._failure(request, UnresolvedCode.IDENTITY_MISMATCH, str(error))
                 continue
             except ValueError as error:
-                records[index] = self._failure(request, UnresolvedCode.UNSUPPORTED_SHAPE, str(error))
+                records[index] = self._failure(
+                    request,
+                    UnresolvedCode.UNSUPPORTED_SHAPE,
+                    str(error),
+                    failure_kind=MeasurementFailureKind.OPERATIONAL,
+                )
                 continue
             except Exception as error:
                 records[index] = self._failure(
@@ -1070,7 +1214,12 @@ class PersistentMeasurementExecutor:
             try:
                 self._scheduler.plan((job,))
             except UnschedulableRequest as error:
-                records[index] = self._failure(request, UnresolvedCode.RESOURCE_UNAVAILABLE, str(error))
+                records[index] = self._failure(
+                    request,
+                    UnresolvedCode.RESOURCE_UNAVAILABLE,
+                    str(error),
+                    failure_kind=MeasurementFailureKind.OPERATIONAL,
+                )
                 continue
             prepared_jobs.append(_PreparedJob(index, request, adapter, prepared, job))
         return prepared_jobs
@@ -1081,6 +1230,7 @@ class PersistentMeasurementExecutor:
         by_digest: Mapping[str, _PreparedJob],
         records: list[MeasurementRecord | None],
         *,
+        execution_id: str,
         deadline_monotonic: float,
         cancellation: CancellationToken,
     ) -> None:
@@ -1091,6 +1241,8 @@ class PersistentMeasurementExecutor:
                 return
 
             active: dict[int, _ActiveInvocation] = {}
+            wave_request_digests = tuple(assignment.job.request_digest for assignment in wave)
+            wave_gpu_ids = tuple(sorted({gpu_id for assignment in wave for gpu_id in assignment.gpu_ids}))
             for assignment in wave:
                 prepared_job = by_digest[assignment.job.request_digest]
                 try:
@@ -1119,7 +1271,16 @@ class PersistentMeasurementExecutor:
                     )
                     self._evict(channel)
                     continue
-                active[id(channel)] = _ActiveInvocation(prepared_job, assignment, channel, command)
+                active[id(channel)] = _ActiveInvocation(
+                    prepared_job=prepared_job,
+                    assignment=assignment,
+                    channel=channel,
+                    command=command,
+                    execution_id=execution_id,
+                    wave_index=wave_index,
+                    wave_request_digests=wave_request_digests,
+                    wave_gpu_ids=wave_gpu_ids,
+                )
 
             self._drain_wave(
                 active,
@@ -1146,7 +1307,10 @@ class PersistentMeasurementExecutor:
                 self._fail_active(active, records, stop_code)
                 return
 
-            timeout_seconds = max(0.0, deadline_monotonic - self._clock())
+            timeout_seconds = min(
+                _WAIT_READY_POLL_SECONDS,
+                max(0.0, deadline_monotonic - self._clock()),
+            )
             try:
                 ready = tuple(self._wait_ready(tuple(item.channel for item in active.values()), timeout_seconds))
             except Exception as error:
@@ -1161,9 +1325,11 @@ class PersistentMeasurementExecutor:
                 return
 
             if not ready:
-                stop_code = self._stop_code(deadline_monotonic, cancellation) or UnresolvedCode.TIMEOUT
-                self._fail_active(active, records, stop_code)
-                return
+                stop_code = self._stop_code(deadline_monotonic, cancellation)
+                if stop_code is not None:
+                    self._fail_active(active, records, stop_code)
+                    return
+                continue
 
             for channel in ready:
                 invocation = active.pop(id(channel), None)
@@ -1185,7 +1351,12 @@ class PersistentMeasurementExecutor:
             )
         if not alive:
             self._evict(channel)
-            return self._failure(request, UnresolvedCode.COLLECTOR_FAILED, "worker exited before replying")
+            return self._failure(
+                request,
+                UnresolvedCode.COLLECTOR_FAILED,
+                "worker exited before replying",
+                failure_kind=MeasurementFailureKind.OPERATIONAL,
+            )
         try:
             reply = channel.recv()
         except Exception as error:
@@ -1215,6 +1386,21 @@ class PersistentMeasurementExecutor:
                 "worker must return a raw result mapping",
             )
         try:
+            worker_binding = reply.raw_result.get("_worker_binding")
+            if worker_binding is not None:
+                if not isinstance(worker_binding, Mapping):
+                    raise TypeError("worker binding evidence must be a mapping")
+                assigned_device_uuids = tuple(
+                    self._device_by_id[gpu_id].uuid for gpu_id in invocation.assignment.gpu_ids
+                )
+                expected_binding = {
+                    "cuda_visible_devices": ",".join(assigned_device_uuids),
+                    "device_uuids": list(assigned_device_uuids),
+                    "local_ordinals": list(range(len(assigned_device_uuids))),
+                    "topology_fingerprint": self._inventory.topology_fingerprint,
+                }
+                if dict(worker_binding) != expected_binding:
+                    raise ValueError("worker binding evidence does not match the assigned hardware lease")
             record = invocation.prepared_job.adapter.record(invocation.prepared_job.prepared, reply.raw_result)
             parent_provenance = {
                 "measurement_environment": json.loads(request.environment.canonical),
@@ -1223,7 +1409,13 @@ class PersistentMeasurementExecutor:
                 "topology_fingerprint": request.environment.topology_fingerprint,
                 "invocation_id": invocation.command.invocation_id,
                 "request_digest": invocation.command.request_digest,
+                "resolution_execution": self._resolution_execution_provenance(
+                    invocation,
+                    worker_binding=worker_binding,
+                ),
             }
+            if worker_binding is not None:
+                parent_provenance["worker_binding"] = dict(worker_binding)
             return replace(
                 record,
                 provenance={**dict(record.provenance), **parent_provenance},
@@ -1236,7 +1428,114 @@ class PersistentMeasurementExecutor:
                 f"adapter result conversion failed: {error}",
             )
 
+    def _resolution_execution_provenance(
+        self,
+        invocation: _ActiveInvocation,
+        *,
+        worker_binding: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        prepared_job = invocation.prepared_job
+        request = prepared_job.request
+        lazy = prepared_job.adapter.lazy
+        contract = prepared_job.prepared.contract
+        device_uuids = [self._device_by_id[gpu_id].uuid for gpu_id in invocation.assignment.gpu_ids]
+        worker = {
+            "adapter_namespace": lazy.namespace,
+            "run_module": lazy.run_module,
+            "run_func": lazy.run_func,
+            "device_uuids": device_uuids,
+            "local_ordinals": list(range(len(device_uuids))),
+        }
+        if worker_binding is not None:
+            worker["binding"] = dict(worker_binding)
+        inventory_gpu_ids = sorted(self._device_by_id)
+        selected_gpu_ids = list(invocation.assignment.gpu_ids)
+        selected_gpu_id_set = set(selected_gpu_ids)
+        wave_gpu_id_set = set(invocation.wave_gpu_ids)
+        return {
+            "registry_route": {
+                "namespace": lazy.namespace,
+                "backend": request.environment.backend,
+                "backend_version": request.environment.backend_version,
+                "adapter_module": lazy.adapter_module,
+                "run_module": lazy.run_module,
+                "run_func": lazy.run_func,
+            },
+            "resource": {
+                "gpu_count": contract.gpu_count,
+                "fabric": contract.fabric.value,
+                "exclusive_devices": contract.exclusive_devices,
+                "reserve_fabric_domain": contract.reserve_fabric_domain,
+            },
+            "wave": {
+                "execution_id": invocation.execution_id,
+                "index": invocation.wave_index,
+                "request_digests": list(invocation.wave_request_digests),
+            },
+            "assignment": {
+                "gpu_ids": list(invocation.assignment.gpu_ids),
+                "device_uuids": device_uuids,
+                "reserved_domains": sorted(invocation.assignment.reserved_domains),
+            },
+            "worker": worker,
+            "invocation": {
+                "id": invocation.command.invocation_id,
+                "request_digest": invocation.command.request_digest,
+            },
+            "inventory": self._inventory_provenance,
+            "lease": {
+                "inventory_gpu_ids": inventory_gpu_ids,
+                "selected_gpu_ids": selected_gpu_ids,
+                "selected_device_uuids": device_uuids,
+                "wave_occupied_gpu_ids": list(invocation.wave_gpu_ids),
+                "remaining_compatible_gpu_ids": [
+                    gpu_id for gpu_id in inventory_gpu_ids if gpu_id not in selected_gpu_id_set
+                ],
+                "unleased_compatible_gpu_ids": [
+                    gpu_id for gpu_id in inventory_gpu_ids if gpu_id not in wave_gpu_id_set
+                ],
+                "reserved_domains": sorted(invocation.assignment.reserved_domains),
+            },
+        }
+
+    @staticmethod
+    def _hardware_inventory_provenance(inventory: HardwareInventory) -> dict[str, Any]:
+        pairs = sorted(set(inventory.links) | set(inventory.p2p_read) | set(inventory.p2p_write))
+        return {
+            "schema_revision": inventory.schema_revision,
+            "topology_fingerprint": inventory.topology_fingerprint,
+            "devices": [
+                {
+                    "gpu_id": device.index,
+                    "uuid": device.uuid,
+                    "name": device.name,
+                    "pci_bus_id": device.pci_bus_id,
+                    "fabric_domain": inventory.fabric_domains.get(device.index),
+                }
+                for device in sorted(inventory.devices, key=lambda candidate: candidate.index)
+            ],
+            "capabilities": [
+                {
+                    "left_gpu_id": left,
+                    "right_gpu_id": right,
+                    "link": inventory.links.get((left, right)),
+                    "p2p_read": inventory.p2p_read.get((left, right), False),
+                    "p2p_write": inventory.p2p_write.get((left, right), False),
+                }
+                for left, right in pairs
+            ],
+            "discovery_evidence": {
+                "raw_gpu_query": inventory.evidence.raw_gpu_query,
+                "raw_topology": inventory.evidence.raw_topology,
+                "raw_p2p_read": inventory.evidence.raw_p2p_read,
+                "raw_p2p_write": inventory.evidence.raw_p2p_write,
+                "p2p_errors": list(inventory.evidence.p2p_errors),
+            },
+        }
+
     def _acquire_channel(self, prepared_job: _PreparedJob, assignment: Assignment) -> WorkerChannel:
+        if self._termination_failure is not None:
+            raise RuntimeError(self._termination_failure)
         device_uuids = tuple(self._device_by_id[gpu_id].uuid for gpu_id in assignment.gpu_ids)
         lazy = prepared_job.adapter.lazy
         key = _LeaseKey(
@@ -1245,6 +1544,12 @@ class PersistentMeasurementExecutor:
             run_module=lazy.run_module,
             run_func=lazy.run_func,
             protocol_digest=prepared_job.request.protocol.digest,
+            # A measured PerfKey is the worker-process state boundary. GPU
+            # frameworks such as SGLang retain model-runner globals that are
+            # valid for one exact case but cannot safely be repurposed for a
+            # different shape. A later encounter of this digest is a database
+            # hit, so cross-key process reuse has no collection benefit.
+            request_digest=prepared_job.request.key.digest,
             device_uuids=device_uuids,
             topology_fingerprint=self._inventory.topology_fingerprint,
         )
@@ -1254,9 +1559,16 @@ class PersistentMeasurementExecutor:
                 if channel.is_alive():
                     return channel
             except Exception as error:
-                self._evict(channel)
+                self._evict(channel, propagate_failure=True)
                 raise RuntimeError(f"worker health probe failed: {error}") from error
-            self._evict(channel)
+            self._evict(channel, propagate_failure=True)
+        overlapping_channels = {
+            id(candidate): candidate
+            for lease_key, candidate in self._leases.items()
+            if lease_key != key and not set(lease_key.device_uuids).isdisjoint(device_uuids)
+        }
+        for stale_channel in tuple(overlapping_channels.values()):
+            self._evict(stale_channel, propagate_failure=True)
         bootstrap = WorkerBootstrap(
             run_module=lazy.run_module,
             run_func=lazy.run_func,
@@ -1287,8 +1599,18 @@ class PersistentMeasurementExecutor:
         code: UnresolvedCode,
     ) -> None:
         detail = "collection cancelled" if code is UnresolvedCode.CANCELLED else "collection deadline expired"
+        failure_kind = (
+            MeasurementFailureKind.CANCELLATION
+            if code is UnresolvedCode.CANCELLED
+            else MeasurementFailureKind.OPERATIONAL
+        )
         for invocation in tuple(active.values()):
-            records[invocation.prepared_job.index] = self._failure(invocation.prepared_job.request, code, detail)
+            records[invocation.prepared_job.index] = self._failure(
+                invocation.prepared_job.request,
+                code,
+                detail,
+                failure_kind=failure_kind,
+            )
             self._evict(invocation.channel)
         active.clear()
 
@@ -1300,18 +1622,57 @@ class PersistentMeasurementExecutor:
         code: UnresolvedCode,
     ) -> None:
         detail = "collection cancelled before submission" if code is UnresolvedCode.CANCELLED else "deadline expired"
+        failure_kind = (
+            MeasurementFailureKind.CANCELLATION
+            if code is UnresolvedCode.CANCELLED
+            else MeasurementFailureKind.OPERATIONAL
+        )
         for wave in waves:
             for assignment in wave:
                 prepared_job = by_digest[assignment.job.request_digest]
-                records[prepared_job.index] = self._failure(prepared_job.request, code, detail)
+                records[prepared_job.index] = self._failure(
+                    prepared_job.request,
+                    code,
+                    detail,
+                    failure_kind=failure_kind,
+                )
 
-    def _evict(self, channel: WorkerChannel) -> None:
+    def _evict(
+        self,
+        channel: WorkerChannel,
+        *,
+        propagate_failure: bool = False,
+        already_signaled: bool = False,
+    ) -> None:
         stale_keys = [key for key, candidate in self._leases.items() if candidate is channel]
+        if not stale_keys:
+            self._close_channel(channel, signal=not already_signaled)
+            return
+        try:
+            # Never forget a GPU-owning worker until join confirms termination.
+            # A teardown failure retains its lease and poisons future acquisition
+            # so no path can fail open by spawning a second owner on that UUID.
+            self._close_channel(
+                channel,
+                require_terminated=True,
+                signal=not already_signaled,
+            )
+        except Exception as error:
+            detail = f"persistent worker termination was not confirmed: {error}"
+            self._termination_failure = detail
+            if propagate_failure:
+                raise RuntimeError(detail) from error
+            return
         for key in stale_keys:
             del self._leases[key]
-        self._close_channel(channel)
 
-    def _close_channel(self, channel: WorkerChannel) -> None:
+    def _close_channel(
+        self,
+        channel: WorkerChannel,
+        *,
+        require_terminated: bool = False,
+        signal: bool = True,
+    ) -> None:
         live_refs = [reference for reference in self._closed_channel_refs if reference() is not None]
         self._closed_channel_refs = live_refs
         if any(reference() is channel for reference in live_refs):
@@ -1322,21 +1683,25 @@ class PersistentMeasurementExecutor:
             # WorkerChannel is a structural protocol, so retain a strong
             # identity reference for unusual non-weakrefable implementations.
             reference = lambda channel=channel: channel
-        self._closed_channel_refs.append(reference)
-        try:
-            channel.close()
-        except Exception:
-            pass
+        if signal:
+            try:
+                channel.close()
+            except Exception:
+                pass
         try:
             channel.join()
         except Exception:
-            pass
+            if require_terminated:
+                raise
+        self._closed_channel_refs.append(reference)
 
     @staticmethod
     def _failure(
         request: MeasurementRequest,
         code: UnresolvedCode,
         detail: str,
+        *,
+        failure_kind: MeasurementFailureKind = MeasurementFailureKind.INVARIANT,
     ) -> MeasurementRecord:
         return MeasurementRecord(
             key=request.key,
@@ -1349,4 +1714,5 @@ class PersistentMeasurementExecutor:
             provenance={},
             failure_code=code,
             failure_reason=detail,
+            failure_kind=failure_kind,
         )

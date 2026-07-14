@@ -298,6 +298,16 @@ class UnresolvedCode(_StringEnum):
     OBSERVE_ONLY = "observe_only"
 
 
+class MeasurementFailureKind(_StringEnum):
+    """Policy-relevant origin of a non-valid measurement outcome."""
+
+    OPERATIONAL = "operational"
+    BUDGET = "budget"
+    CANCELLATION = "cancellation"
+    INVARIANT = "invariant"
+    OBSERVATION = "observation"
+
+
 @dataclass(frozen=True, slots=True)
 class MeasurementRecord:
     key: PerfKey
@@ -310,6 +320,7 @@ class MeasurementRecord:
     provenance: Mapping[str, Any]
     failure_code: UnresolvedCode | None = None
     failure_reason: str | None = None
+    failure_kind: MeasurementFailureKind | None = None
     sequence: int | None = field(default=None, compare=False)
 
     @classmethod
@@ -338,7 +349,7 @@ class MeasurementRecord:
                 raise ValueError("valid records require finite non-negative latency_ms")
             if len(self.samples_ms) != self.protocol.samples:
                 raise ValueError("sample count must match the measurement protocol")
-            if self.failure_code is not None or self.failure_reason is not None:
+            if self.failure_code is not None or self.failure_reason is not None or self.failure_kind is not None:
                 raise ValueError("valid records cannot provide failure details")
         elif self.latency_ms is not None:
             raise ValueError("non-valid records cannot provide latency_ms")
@@ -358,3 +369,5 @@ class UnresolvedReason:
     code: UnresolvedCode
     operation: str
     detail: str
+    key: PerfKey | None = None
+    failure_kind: MeasurementFailureKind | None = None

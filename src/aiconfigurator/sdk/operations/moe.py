@@ -189,6 +189,8 @@ def _xprofile_moe_quants(query_quant, table) -> list:
 class MoE(Operation):
     """MoE operation with power tracking."""
 
+    _RESOLUTION_NAMESPACE = perf_namespace("moe_perf.txt")
+
     # CP-invariant: the A2A dispatch globalizes tokens across all (cp*ep) ranks,
     # so expert compute sees the full token set regardless of CP and deliberately
     # ignores ``seq_split`` (per-rank cp sharding does not reduce expert work).
@@ -300,10 +302,10 @@ class MoE(Operation):
             )
         if not isinstance(environment, MeasurementEnvironment):
             raise TypeError("database measurement_environment must be a MeasurementEnvironment")
-        expected = (database.system, database.backend, database.version)
-        actual = (environment.system, environment.backend, environment.backend_version)
+        expected = (database.system, database.backend)
+        actual = (environment.system, environment.backend)
         if actual != expected:
-            raise ValueError("database measurement environment does not match system/backend/version")
+            raise ValueError("database measurement environment does not match system/backend")
         return environment
 
     def measurement_request(
@@ -1262,6 +1264,21 @@ class MoEDispatch(Operation):
     _normal_data_cache: ClassVar[dict] = {}
     _ll_data_cache: ClassVar[dict] = {}
     _OWNS_RESOLUTION_WALK: ClassVar[bool] = True
+
+    def resolution_capabilities(self):
+        """Describe the frozen non-DeepEP dispatch walk without a shape."""
+        from aiconfigurator.collector.preflight import OperationCapability, OperationKind
+
+        capabilities = list(super().resolution_capabilities())
+        if self.num_gpus > 1:
+            capabilities.append(
+                OperationCapability(
+                    "CustomAllReduce",
+                    OperationKind.MEASURED,
+                    perf_namespace("custom_allreduce_perf.txt"),
+                )
+            )
+        return tuple(capabilities)
 
     def __init__(
         self,

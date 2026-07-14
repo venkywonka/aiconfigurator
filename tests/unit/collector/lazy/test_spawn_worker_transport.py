@@ -7,8 +7,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import multiprocessing
 import os
+import signal
+import threading
+import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +23,42 @@ from aiconfigurator.collector.types import RawMeasurement
 from aiconfigurator.sdk.resolution.types import MeasurementProtocol
 
 pytestmark = pytest.mark.unit
+
+
+def _own_persistent_worker(pid_connection: Any) -> None:
+    """Spawn one real generic worker and expose its PID to the test parent."""
+
+    executor = importlib.import_module("aiconfigurator.collector.executor")
+    factory = executor.ProcessWorkerFactory()
+    channel = factory(
+        executor.WorkerBootstrap(
+            run_module="time",
+            run_func="sleep",
+            adapter_namespace="parent-death-test/v1",
+            protocol_digest="parent-death-test",
+            device_uuids=(),
+            topology_fingerprint="cpu-only",
+        )
+    )
+    # Let the spawned worker reach its command loop after installing its
+    # process-scoped owner watchdog.
+    deadline = time.monotonic() + 5.0
+    while not channel.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)
+    pid_connection.send(channel._process.pid)
+    pid_connection.close()
+    while True:
+        time.sleep(1.0)
+
+
+def _process_is_running(pid: int) -> bool:
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        state = stat_path.read_text().split()[2]
+    except FileNotFoundError:
+        return False
+    return state != "Z"
 
 
 def _api() -> SimpleNamespace:
@@ -91,6 +132,8 @@ class _Process:
     alive: bool = True
     finish_on_join: bool = True
     finish_on_terminate: bool = True
+    finish_on_kill: bool = True
+    exitcode: int | None = 0
 
     def start(self) -> None:
         self.start_calls += 1
@@ -110,7 +153,8 @@ class _Process:
 
     def kill(self) -> None:
         self.kill_calls += 1
-        self.alive = False
+        if self.finish_on_kill:
+            self.alive = False
 
 
 class _SpawnContext:
@@ -298,6 +342,82 @@ def test_worker_loop_rejects_non_object_json_and_non_mapping_runner_results(
     assert expected_error in reply.error
 
 
+def test_worker_installs_parent_process_watchdog_before_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _api()
+    executor = importlib.import_module("aiconfigurator.collector.executor")
+    events: list[object] = []
+    bootstrap = replace(_bootstrap(api), parent_pid=12345)
+
+    monkeypatch.setattr(
+        executor,
+        "_install_parent_process_watchdog",
+        lambda parent_pid: events.append(("parent-watchdog", parent_pid)),
+    )
+
+    def import_module(name: str) -> object:
+        events.append(("import", name))
+        return SimpleNamespace(run_case=lambda **_: {})
+
+    api.worker_process_main(
+        bootstrap,
+        _Queue(None),
+        _Queue(),
+        import_module=import_module,
+    )
+
+    assert events == [
+        ("parent-watchdog", 12345),
+        ("import", "aiconfigurator.collector.testing.fake_runner"),
+    ]
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires Linux process supervision")
+def test_worker_spawned_by_transient_thread_survives_thread_exit() -> None:
+    api = _api()
+    protocol = _protocol()
+    channels: list[Any] = []
+    thread_errors: list[BaseException] = []
+
+    def spawn_and_initialize_worker() -> None:
+        try:
+            factory = api.ProcessWorkerFactory()
+            channel = factory(
+                api.WorkerBootstrap(
+                    run_module="time",
+                    run_func="sleep",
+                    adapter_namespace="thread-owner-test/v1",
+                    protocol_digest=protocol.digest,
+                    device_uuids=(),
+                    topology_fingerprint="cpu-only",
+                )
+            )
+            channel.send(api.WorkerCommand("ready", "ready", b'{"secs": 0}', protocol))
+            ready = factory.wait_ready((channel,), 10.0)
+            if ready != (channel,) or not channel.is_alive():
+                raise RuntimeError("worker did not reach its command loop")
+            reply = channel.recv()
+            if not isinstance(reply, api.WorkerReply):
+                raise TypeError("worker returned a malformed readiness reply")
+            channels.append(channel)
+        except BaseException as error:
+            thread_errors.append(error)
+
+    creator = threading.Thread(target=spawn_and_initialize_worker)
+    creator.start()
+    creator.join(15.0)
+
+    assert not creator.is_alive()
+    assert thread_errors == []
+    assert len(channels) == 1
+    channel = channels[0]
+    try:
+        time.sleep(0.1)
+        assert channel.is_alive(), "worker died when only its creator thread exited"
+    finally:
+        channel.close()
+        channel.join()
+
+
 def test_process_factory_uses_spawn_reuses_channel_closes_joins_and_waits_ready() -> None:
     api = _api()
     context = _SpawnContext()
@@ -325,7 +445,9 @@ def test_process_factory_uses_spawn_reuses_channel_closes_joins_and_waits_ready(
     assert len(context.processes) == 2
     assert all(process.target is target for process in context.processes)
     assert all(process.start_calls == 1 for process in context.processes)
-    assert context.processes[0].args == (_bootstrap(api), context.queues[0], context.queues[1])
+    spawned_bootstrap = context.processes[0].args[0]
+    assert spawned_bootstrap == replace(_bootstrap(api), parent_pid=os.getpid())
+    assert context.processes[0].args == (spawned_bootstrap, context.queues[0], context.queues[1])
 
     first = api.WorkerCommand("invocation-1", "digest-1", b"{}", _protocol())
     second = api.WorkerCommand("invocation-2", "digest-2", b"{}", _protocol())
@@ -353,6 +475,37 @@ def test_process_factory_uses_spawn_reuses_channel_closes_joins_and_waits_ready(
     left.join()
     assert context.queues[0].puts == [first, second, None]
     assert context.processes[0].join_calls == [5.0]
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires Linux process supervision")
+def test_generic_worker_dies_when_its_owning_candidate_process_is_terminated() -> None:
+    context = multiprocessing.get_context("spawn")
+    receive_pid, send_pid = context.Pipe(duplex=False)
+    owner = context.Process(target=_own_persistent_worker, args=(send_pid,))
+    worker_pid: int | None = None
+    owner.start()
+    try:
+        assert receive_pid.poll(10.0), "candidate owner did not report its persistent worker"
+        worker_pid = receive_pid.recv()
+        assert _process_is_running(worker_pid)
+
+        owner.terminate()
+        owner.join(5.0)
+        assert owner.exitcode == -signal.SIGTERM
+
+        deadline = time.monotonic() + 5.0
+        while _process_is_running(worker_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not _process_is_running(worker_pid), (
+            "generic measurement worker survived its candidate owner and could retain the GPU lease"
+        )
+    finally:
+        receive_pid.close()
+        if owner.is_alive():
+            owner.kill()
+            owner.join(5.0)
+        if worker_pid is not None and _process_is_running(worker_pid):
+            os.kill(worker_pid, signal.SIGKILL)
 
 
 def test_wait_ready_maps_a_dead_process_sentinel_to_its_channel() -> None:
@@ -398,6 +551,7 @@ def test_join_terminates_a_hung_worker_with_bounded_waits_and_cleans_queues() ->
     process = context.processes[0]
     process.finish_on_join = False
     process.finish_on_terminate = False
+    process.exitcode = -9
 
     channel.close()
     channel.join()
@@ -411,3 +565,58 @@ def test_join_terminates_a_hung_worker_with_bounded_waits_and_cleans_queues() ->
     assert [queue.close_calls for queue in context.queues] == [1, 1]
     assert [queue.cancel_join_thread_calls for queue in context.queues] == [1, 1]
     assert [queue.join_thread_calls for queue in context.queues] == [0, 0]
+
+
+def test_join_reports_nonzero_graceful_worker_exit_after_cleaning_queues() -> None:
+    api = _api()
+    context = _SpawnContext()
+    factory = api.ProcessWorkerFactory(
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+        connection_wait=lambda handles, timeout: (),
+    )
+    channel = factory(_bootstrap(api))
+    process = context.processes[0]
+    process.exitcode = 17
+
+    channel.close()
+    with pytest.raises(RuntimeError, match=r"persistent worker exited with code 17"):
+        channel.join()
+    with pytest.raises(RuntimeError, match=r"persistent worker exited with code 17"):
+        channel.join()
+
+    assert process.terminate_calls == 0
+    assert process.kill_calls == 0
+    assert [queue.close_calls for queue in context.queues] == [1, 1]
+    assert [queue.join_thread_calls for queue in context.queues] == [1, 1]
+
+
+def test_join_retries_when_a_worker_initially_survives_forced_kill() -> None:
+    api = _api()
+    context = _SpawnContext()
+    factory = api.ProcessWorkerFactory(
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+        connection_wait=lambda handles, timeout: (),
+        shutdown_timeout_seconds=0.125,
+    )
+    channel = factory(_bootstrap(api))
+    process = context.processes[0]
+    process.finish_on_join = False
+    process.finish_on_terminate = False
+    process.finish_on_kill = False
+
+    channel.close()
+    with pytest.raises(RuntimeError, match="survived forced kill"):
+        channel.join()
+
+    assert process.is_alive()
+    assert [queue.close_calls for queue in context.queues] == [0, 0]
+    process.finish_on_kill = True
+
+    channel.join()
+    channel.join()
+
+    assert not process.is_alive()
+    assert process.kill_calls == 2
+    assert [queue.close_calls for queue in context.queues] == [1, 1]

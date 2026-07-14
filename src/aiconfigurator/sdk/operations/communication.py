@@ -105,6 +105,19 @@ class CustomAllReduce(Operation):
         del kwargs
         return self._tp_size == 1
 
+    def resolution_capabilities(self):
+        from aiconfigurator.collector.preflight import OperationCapability, OperationKind
+
+        if self.is_resolution_deterministic():
+            return (OperationCapability(type(self).__name__, OperationKind.DETERMINISTIC),)
+        return (
+            OperationCapability(
+                type(self).__name__,
+                OperationKind.MEASURED,
+                perf_namespace("custom_allreduce_perf.txt"),
+            ),
+        )
+
     def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
         """Normalize the exact physical collective used by prediction."""
 
@@ -126,10 +139,10 @@ class CustomAllReduce(Operation):
         environment = getattr(database, "measurement_environment", None)
         if not isinstance(environment, MeasurementEnvironment):
             raise TypeError("CustomAllReduce lazy collection requires a bound MeasurementEnvironment")
-        expected = (database.system, database.backend, database.version)
-        actual = (environment.system, environment.backend, environment.backend_version)
+        expected = (database.system, database.backend)
+        actual = (environment.system, environment.backend)
         if actual != expected:
-            raise ValueError("database measurement environment does not match system/backend/version")
+            raise ValueError("database measurement environment does not match system/backend")
         return environment
 
     def measurement_request(

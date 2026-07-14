@@ -28,6 +28,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementRecord,
     MeasurementRequest,
     PerfKey,
+    ProtocolMismatchError,
 )
 
 pytestmark = pytest.mark.unit
@@ -224,7 +225,7 @@ def test_version_floor_eligibility_reuses_the_existing_collector_route_resolver(
     assert index.routes_for((_NAMESPACE, "sglang", "0.5.11"))[0].collector_module.endswith("collect_gemm")
 
 
-def test_protocol_identity_is_checked_before_case_or_resource_but_sampling_counts_are_flexible(
+def test_protocol_identity_and_minimum_samples_are_checked_before_case_or_resource(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -240,6 +241,10 @@ def test_protocol_identity_is_checked_before_case_or_resource_but_sampling_count
         with pytest.raises(ValueError, match=field):
             route.prepare(request)
         assert events == []
+
+    with pytest.raises(ProtocolMismatchError, match=r"samples.*at least three"):
+        route.prepare(_request(protocol=_protocol(samples=2)))
+    assert events == []
 
     request = _request(protocol=_protocol(warmups=7, samples=5))
     prepared = route.prepare(request)

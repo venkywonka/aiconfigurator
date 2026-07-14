@@ -12,7 +12,12 @@ from typing import Any
 
 from aiconfigurator.collector.registry_types import PerfFile
 from aiconfigurator.collector.types import FabricRequirement, ResourceContract
-from aiconfigurator.sdk.resolution.types import MeasurementRecord, MeasurementRequest, PerfKey
+from aiconfigurator.sdk.resolution.types import (
+    MeasurementRecord,
+    MeasurementRequest,
+    PerfKey,
+    ProtocolMismatchError,
+)
 
 _NAMESPACE = f"{PerfFile.MOE}/v1"
 _QUERY_FIELDS = (
@@ -30,8 +35,8 @@ _MODEL_ARTIFACT = "sgl-project/DeepSeek-V4-Flash-FP8"
 _RUNTIME_VERSIONS = {
     "cuda": "13.0",
     "model_profile": "dsv4-v1.2",
-    "sglang": "0.5.10",
 }
+_SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _PROFILE_COMPATIBILITY = {
     "model_artifact": _MODEL_ARTIFACT,
     "serving_mode": "aggregated",
@@ -59,17 +64,18 @@ def _validate_capability(request: MeasurementRequest, case: Mapping[str, Any]) -
     if (
         environment.system != "gb200"
         or environment.backend != "sglang"
-        or environment.backend_version != "0.5.10"
+        or environment.backend_version not in _SUPPORTED_SGLANG_VERSIONS
+        or environment.runtime_versions.get("sglang") != environment.backend_version
         or _normalized_label(environment.gpu_class) != "nvidia gb200"
         or any(environment.runtime_versions.get(name) != version for name, version in _RUNTIME_VERSIONS.items())
     ):
-        raise ValueError("MoE request is outside the frozen GB200/SGLang 0.5.10 runtime capability envelope")
+        raise ValueError("MoE request is outside the frozen GB200/SGLang runtime capability envelope")
     if dict(environment.profile_compatibility or {}) != _PROFILE_COMPATIBILITY:
         raise ValueError("MoE request profile compatibility does not match the frozen DSv4 V1.2 deployment")
     if dict(request.semantic_descriptor) != _SEMANTIC_DESCRIPTOR:
         raise ValueError("MoE request semantic descriptor does not match the power_law rank simulation")
     if request.protocol.samples < 3:
-        raise ValueError("MoE measurement protocol samples must be at least three")
+        raise ProtocolMismatchError("MoE measurement protocol samples must be at least three")
     if case["hidden_size"] != 4096 or case["inter_size"] != 2048 or case["topk"] != 6 or case["num_experts"] != 256:
         raise ValueError("MoE shape is outside the frozen DSv4 V1.2 capability envelope")
     if case["moe_tp_size"] != 1:
@@ -179,7 +185,7 @@ def moe_result_to_record(
     if {field: perf_row.get(field) for field in expected_identity} != expected_identity:
         raise ValueError("MoE perf row identity does not match the requested TP1/EP4 case")
     if perf_row.get("framework") != "SGLang" or perf_row.get("version") != request.environment.backend_version:
-        raise ValueError("MoE perf row framework identity does not match SGLang 0.5.10")
+        raise ValueError("MoE perf row framework identity does not match the requested SGLang runtime")
     if perf_row.get("op_name") != "moe" or perf_row.get("kernel_source") != "sglang_fused_moe_triton":
         raise ValueError("MoE perf row kernel identity is unsupported")
     row_latency = _positive_finite_number(perf_row.get("latency"), field="perf row latency")

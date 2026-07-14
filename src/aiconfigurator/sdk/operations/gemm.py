@@ -131,6 +131,8 @@ class GEMM(Operation):
     ``(systems_root, system, backend, version, enable_shared_layer)``.
     """
 
+    _RESOLUTION_NAMESPACE = perf_namespace("gemm_perf.txt")
+
     # Per-op subclass overrides of Operation._data_cache. Keyed by
     # (systems_root, system, backend, version, enable_shared_layer).
     _data_cache: ClassVar[dict] = {}
@@ -845,10 +847,13 @@ class GEMM(Operation):
             )
         if not isinstance(environment, MeasurementEnvironment):
             raise TypeError("database measurement_environment must be a MeasurementEnvironment")
-        expected = (database.system, database.backend, database.version)
-        actual = (environment.system, environment.backend, environment.backend_version)
+        # database.version identifies curated prediction tables, while an
+        # explicit environment identifies the runtime that owns new PerfKeys.
+        # A release-candidate runtime may measure over the stable profile.
+        expected = (database.system, database.backend)
+        actual = (environment.system, environment.backend)
         if actual != expected:
-            raise ValueError("database measurement environment does not match system/backend/version")
+            raise ValueError("database measurement environment does not match system/backend")
         return environment
 
     def measurement_request(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import subprocess
 import sys
 
 import pytest
@@ -95,8 +96,23 @@ def test_packaged_registry_uses_canonical_perf_namespace_and_lightweight_adapter
     assert len(TRTLLM_LAZY_REGISTRY) == 1
     assert TRTLLM_LAZY_REGISTRY[0].lazy is GEMM_LAZY_SPEC
     assert TRTLLM_LAZY_REGISTRY[0].perf_filename == PerfFile.GEMM
-    assert "torch" not in sys.modules
-    assert "tensorrt_llm" not in sys.modules
+    import_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from aiconfigurator.collector.trtllm.registry import TRTLLM_LAZY_REGISTRY; "
+                "assert TRTLLM_LAZY_REGISTRY; "
+                "assert 'torch' not in sys.modules; "
+                "assert 'tensorrt_llm' not in sys.modules"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert import_probe.returncode == 0, import_probe.stderr
 
 
 def test_bf16_request_maps_to_one_gpu_case_without_reinterpreting_shape() -> None:

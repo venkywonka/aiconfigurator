@@ -547,6 +547,7 @@ class DeepSeekV4MHCModule(Operation):
     """DeepSeek-V4 manifold-constrained hyper-connection pre/post module."""
 
     _data_cache: ClassVar[dict] = {}
+    _RESOLUTION_NAMESPACE = perf_namespace("mhc_module_perf.txt")
     _CP_AWARE: ClassVar[bool] = True  # token-major: query divides num_tokens by self._seq_split
     _V1_2_PROFILE_COMPATIBILITY: ClassVar[dict[str, object]] = {
         "model_artifact": "sgl-project/DeepSeek-V4-Flash-FP8",
@@ -558,6 +559,11 @@ class DeepSeekV4MHCModule(Operation):
         "moe_tp_size": 1,
         "moe_ep_size": 4,
         "nextn": 0,
+    }
+    _V1_2_RUNTIME_VERSIONS: ClassVar[dict[str, str]] = {
+        "cuda": "13.0",
+        "model_profile": "dsv4-v1.2",
+        "sglang": "0.5.10",
     }
 
     def __init__(
@@ -798,10 +804,10 @@ class DeepSeekV4MHCModule(Operation):
         environment = getattr(database, "measurement_environment", None)
         if not isinstance(environment, MeasurementEnvironment):
             raise TypeError("mHC lazy collection requires a bound MeasurementEnvironment")
-        expected = (database.system, database.backend, database.version)
-        actual = (environment.system, environment.backend, environment.backend_version)
+        expected = (database.system, database.backend)
+        actual = (environment.system, environment.backend)
         if actual != expected:
-            raise ValueError("database measurement environment does not match system/backend/version")
+            raise ValueError("database measurement environment does not match system/backend")
         return environment
 
     def measurement_request(
@@ -860,7 +866,10 @@ class DeepSeekV4MHCModule(Operation):
             and environment.backend == "sglang"
             and environment.backend_version == "0.5.10"
             and " ".join(environment.gpu_class.split()).casefold() == "nvidia gb200"
-            and environment.runtime_versions.get("model_profile") == "dsv4-v1.2"
+            and all(
+                environment.runtime_versions.get(name) == version
+                for name, version in self._V1_2_RUNTIME_VERSIONS.items()
+            )
             and dict(environment.profile_compatibility or {}) == self._V1_2_PROFILE_COMPATIBILITY
             and self._seq_split == 1
             and normalized_query.get("op") in {"pre", "post"}
@@ -970,9 +979,29 @@ class _BaseDeepSeekV4AttentionModule(Operation):
     _V1_2_RUNTIME_VERSIONS: ClassVar[dict[str, str]] = {
         "cuda": "13.0",
         "model_profile": "dsv4-v1.2",
-        "sglang": "0.5.10",
     }
+    _V1_2_SGLANG_VERSIONS: ClassVar[frozenset[str]] = frozenset({"0.5.10", "0.5.10rc0"})
     _ATTENTION_PHASE: ClassVar[str]
+
+    def resolution_capabilities(self):
+        """Classify the exact frozen attention family, not a runtime shape."""
+        from aiconfigurator.collector.preflight import OperationCapability, OperationKind
+
+        attention_kind = {4: "csa", 128: "hca"}.get(self._compress_ratio)
+        if attention_kind is None:
+            return (
+                OperationCapability(
+                    type(self).__name__,
+                    OperationKind.UNSUPPORTED,
+                ),
+            )
+        return (
+            OperationCapability(
+                f"{type(self).__name__}[{attention_kind}]",
+                OperationKind.MEASURED,
+                perf_namespace(f"dsv4_{attention_kind}_{self._ATTENTION_PHASE}_module_perf.txt"),
+            ),
+        )
 
     def __init__(
         self,
@@ -1059,17 +1088,18 @@ class _BaseDeepSeekV4AttentionModule(Operation):
         environment = getattr(database, "measurement_environment", None)
         if not isinstance(environment, MeasurementEnvironment):
             raise TypeError("DSv4 attention lazy collection requires a bound MeasurementEnvironment")
-        expected = (database.system, database.backend, database.version)
-        actual = (environment.system, environment.backend, environment.backend_version)
+        expected = (database.system, database.backend)
+        actual = (environment.system, environment.backend)
         if actual != expected:
-            raise ValueError("database measurement environment does not match system/backend/version")
+            raise ValueError("database measurement environment does not match system/backend")
         return environment
 
     def _validate_v1_2_measurement_capability(self, environment: MeasurementEnvironment) -> None:
         if (
             environment.system != "gb200"
             or environment.backend != "sglang"
-            or environment.backend_version != "0.5.10"
+            or environment.backend_version not in self._V1_2_SGLANG_VERSIONS
+            or environment.runtime_versions.get("sglang") != environment.backend_version
             or " ".join(environment.gpu_class.split()).casefold() != "nvidia gb200"
             or any(
                 environment.runtime_versions.get(name) != version

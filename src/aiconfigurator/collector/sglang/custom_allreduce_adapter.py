@@ -12,7 +12,12 @@ from typing import Any
 
 from aiconfigurator.collector.registry_types import PerfFile
 from aiconfigurator.collector.types import FabricRequirement, ResourceContract
-from aiconfigurator.sdk.resolution.types import MeasurementRecord, MeasurementRequest, PerfKey
+from aiconfigurator.sdk.resolution.types import (
+    MeasurementRecord,
+    MeasurementRequest,
+    PerfKey,
+    ProtocolMismatchError,
+)
 
 _NAMESPACE = f"{PerfFile.CUSTOM_ALLREDUCE}/v1"
 _QUERY_FIELDS = ("dtype", "operation", "world_size", "elements")
@@ -20,8 +25,8 @@ _MODEL_ARTIFACT = "sgl-project/DeepSeek-V4-Flash-FP8"
 _RUNTIME_VERSIONS = {
     "cuda": "13.0",
     "model_profile": "dsv4-v1.2",
-    "sglang": "0.5.10",
 }
+_SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _PROFILE_COMPATIBILITY = {
     "model_artifact": _MODEL_ARTIFACT,
     "serving_mode": "aggregated",
@@ -51,11 +56,12 @@ def _validate_capability(request: MeasurementRequest, case: Mapping[str, Any]) -
     if (
         environment.system != "gb200"
         or environment.backend != "sglang"
-        or environment.backend_version != "0.5.10"
+        or environment.backend_version not in _SUPPORTED_SGLANG_VERSIONS
+        or environment.runtime_versions.get("sglang") != environment.backend_version
         or _normalized_label(environment.gpu_class) != "nvidia gb200"
         or any(environment.runtime_versions.get(name) != version for name, version in _RUNTIME_VERSIONS.items())
     ):
-        raise ValueError("CustomAllReduce request is outside the frozen GB200/SGLang 0.5.10 runtime capability")
+        raise ValueError("CustomAllReduce request is outside the frozen GB200/SGLang runtime capability")
     if dict(environment.profile_compatibility or {}) != _PROFILE_COMPATIBILITY:
         raise ValueError("CustomAllReduce profile compatibility does not match the frozen DSv4 V1.2 deployment")
     if (
@@ -68,7 +74,7 @@ def _validate_capability(request: MeasurementRequest, case: Mapping[str, Any]) -
     if dict(request.semantic_descriptor) != _SEMANTIC_DESCRIPTOR:
         raise ValueError("CustomAllReduce semantic descriptor must identify the SGLang graph implementation")
     if request.protocol.samples < 3:
-        raise ValueError("CustomAllReduce measurement protocol samples must be at least three")
+        raise ProtocolMismatchError("CustomAllReduce measurement protocol samples must be at least three")
     if case["dtype"] != "half":
         raise ValueError("CustomAllReduce frozen capability requires half dtype")
     if case["world_size"] != 4:
@@ -179,7 +185,7 @@ def custom_allreduce_result_to_record(
     if {field: perf_row.get(field) for field in expected_identity} != expected_identity:
         raise ValueError("CustomAllReduce perf row identity does not match the requested world/GPU shape")
     if perf_row.get("framework") != "SGLang" or perf_row.get("version") != request.environment.backend_version:
-        raise ValueError("CustomAllReduce perf row framework identity does not match SGLang 0.5.10")
+        raise ValueError("CustomAllReduce perf row framework identity does not match the requested SGLang runtime")
     if perf_row.get("device") is None or _normalized_label(str(perf_row["device"])) != _normalized_label(
         request.environment.gpu_class
     ):
@@ -223,6 +229,8 @@ def custom_allreduce_result_to_record(
         raise ValueError("CustomAllReduce provenance must contain four unique rank PIDs")
     if provenance.get("model_artifact") != _MODEL_ARTIFACT:
         raise ValueError("CustomAllReduce provenance model artifact does not match the frozen profile")
+    if provenance.get("physical_dtype") != "bfloat16":
+        raise ValueError("CustomAllReduce provenance physical dtype must be bfloat16")
 
     return MeasurementRecord.valid(
         key=request.key,

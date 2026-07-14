@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,6 +27,7 @@ from aiconfigurator.sdk.resolution.types import (
     MeasurementProtocol,
     MeasurementRequest,
     PerfKey,
+    ProtocolMismatchError,
 )
 
 pytestmark = pytest.mark.unit
@@ -174,6 +176,14 @@ def _request(
     )
 
 
+def test_attention_rejects_malformed_sampling_protocol_as_protocol_mismatch() -> None:
+    route = _ROUTES[0]
+    request = replace(_request(route), protocol=replace(_protocol(), samples=2))
+
+    with pytest.raises(ProtocolMismatchError, match="samples must be at least three"):
+        dsv4_attn_adapter.dsv4_attn_request_to_case(request)
+
+
 def _expected_case(route: _Route, query: Mapping[str, object]) -> dict[str, object]:
     case = dict(query)
     case["mode"] = route.mode
@@ -215,7 +225,12 @@ def _perf_row(route: _Route, query: Mapping[str, object], *, latency_ms: float =
     }
 
 
-def _raw_result(route: _Route, request: MeasurementRequest) -> dict[str, object]:
+def _raw_result(
+    route: _Route,
+    request: MeasurementRequest,
+    *,
+    framework_version: str = "0.5.10",
+) -> dict[str, object]:
     latency_ms = 1.25
     return {
         "latency_ms": latency_ms,
@@ -226,7 +241,7 @@ def _raw_result(route: _Route, request: MeasurementRequest) -> dict[str, object]
         "perf_row": _perf_row(route, request.query, latency_ms=latency_ms),
         "provenance": {
             "framework": "SGLang",
-            "framework_version": "0.5.10",
+            "framework_version": framework_version,
             "kernel_source": "compressed_flashmla",
             "device": "NVIDIA GB200",
             "used_cuda_graph": True,
@@ -329,6 +344,25 @@ def test_attention_capability_allows_unrelated_runtime_inventory_entries() -> No
     )
 
 
+def test_coherent_release_candidate_round_trips_as_a_distinct_exact_environment() -> None:
+    route = _ROUTES[0]
+    environment = replace(
+        _environment(),
+        backend_version="0.5.10rc0",
+        runtime_versions={**_RUNTIME_VERSIONS, "sglang": "0.5.10rc0"},
+    )
+    request = _request(route, environment=environment)
+    case = dsv4_attn_adapter.dsv4_attn_request_to_case(request)
+    raw_result = _raw_result(route, request, framework_version="0.5.10rc0")
+
+    record = dsv4_attn_adapter.dsv4_attn_result_to_record(request, case, raw_result)
+
+    assert record.key == request.key
+    assert request.environment.backend_version == "0.5.10rc0"
+    assert request.environment.runtime_versions["sglang"] == "0.5.10rc0"
+    assert record.provenance["framework_version"] == "0.5.10rc0"
+
+
 @pytest.mark.parametrize(
     ("mismatch", "request_factory"),
     [
@@ -370,9 +404,11 @@ def test_attention_capability_allows_unrelated_runtime_inventory_entries() -> No
         ("gemm_type", lambda route: _request(route, query=_query(route, gemm_type="bfloat16"))),
         (
             "mla_dtype",
-            lambda route: _request(route, query=_query(route, mla_dtype="fp8"))
-            if route.mode == "context"
-            else _request(route, query={**_query(route), "mla_dtype": "fp8"}),
+            lambda route: (
+                _request(route, query=_query(route, mla_dtype="fp8"))
+                if route.mode == "context"
+                else _request(route, query={**_query(route), "mla_dtype": "fp8"})
+            ),
         ),
         ("query_fields", lambda route: _request(route, query={**_query(route), "scale_factor": 43})),
     ],
@@ -467,8 +503,10 @@ def test_attention_result_validation_fails_closed(mutation) -> None:
 
 
 @pytest.mark.parametrize("route", _ROUTES, ids=lambda route: f"{route.attn_kind}-{route.mode}")
+@pytest.mark.parametrize("framework_version", ("0.5.10", "0.5.10rc0"))
 def test_exact_attention_runner_emits_one_padded_full_module_row_without_writing(
     route: _Route,
+    framework_version: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -480,7 +518,7 @@ def test_exact_attention_runner_emits_one_padded_full_module_row_without_writing
         calls.append(("prepare", kwargs))
         return dsv4_attn.PreparedDsv4AttentionCase(
             kernel_func=lambda: calls.append(("kernel",)),
-            framework_version="0.5.10",
+            framework_version=framework_version,
             device_name="NVIDIA GB200",
             device=object(),
             architecture=_ARCHITECTURE,
@@ -520,7 +558,14 @@ def test_exact_attention_runner_emits_one_padded_full_module_row_without_writing
     assert result.energy_wms == 125.0
     assert result.protocol_digest == request.protocol.digest
     assert result.perf_row == _perf_row(route, request.query)
-    assert result.provenance == _raw_result(route, request)["provenance"]
+    assert (
+        result.provenance
+        == _raw_result(
+            route,
+            request,
+            framework_version=framework_version,
+        )["provenance"]
+    )
     prepare_kwargs = next(call[1] for call in calls if call[0] == "prepare")
     assert prepare_kwargs["canonical_num_heads"] == _CANONICAL_NUM_HEADS
     assert prepare_kwargs["num_heads"] == _PADDED_NUM_HEADS
@@ -532,6 +577,266 @@ def test_exact_attention_runner_emits_one_padded_full_module_row_without_writing
     assert benchmark_kwargs["allow_graph_fail"] is False
     assert benchmark_kwargs["use_cuda_graph"] is True
     assert not tuple(tmp_path.iterdir())
+
+
+def test_attention_runner_cleans_prepared_case_when_contract_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = _ROUTES[0]
+    request = _request(route)
+    case = _expected_case(route, request.query)
+    case = {
+        **case,
+        "isl": case.get("isl"),
+        "prefix": case.get("prefix"),
+        "s_total": case.get("s_total"),
+    }
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        dsv4_attn,
+        "_prepare_dsv4_attn_case",
+        lambda **kwargs: dsv4_attn.PreparedDsv4AttentionCase(
+            kernel_func=lambda: None,
+            framework_version="0.5.11",
+            device_name="NVIDIA GB200",
+            device=object(),
+            architecture=_ARCHITECTURE,
+            model_artifact=_MODEL_ARTIFACT,
+            mode=route.mode,
+            attn_kind=route.attn_kind,
+            compress_ratio=route.compress_ratio,
+            tp_size=_TP_SIZE,
+            canonical_num_heads=_CANONICAL_NUM_HEADS,
+            padded_num_heads=_PADDED_NUM_HEADS,
+            mla_dtype="bfloat16",
+            kv_cache_dtype="fp8",
+            gemm_type="fp8_block",
+            cleanup_func=lambda: calls.append("cleanup"),
+        ),
+    )
+    monkeypatch.setattr(
+        dsv4_attn,
+        "benchmark_with_power",
+        lambda **kwargs: pytest.fail("invalid prepared cases must not benchmark"),
+    )
+
+    with pytest.raises(ValueError, match="prepared DSv4 attention case"):
+        dsv4_attn.run_dsv4_attn_case(**case, protocol=request.protocol)
+
+    assert calls == ["cleanup"]
+
+
+def test_attention_runner_preserves_benchmark_failure_when_cleanup_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = _ROUTES[0]
+    request = _request(route)
+    case = _expected_case(route, request.query)
+    calls: list[str] = []
+
+    def fail_cleanup() -> None:
+        calls.append("cleanup")
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(
+        dsv4_attn,
+        "_prepare_dsv4_attn_case",
+        lambda **kwargs: dsv4_attn.PreparedDsv4AttentionCase(
+            kernel_func=lambda: None,
+            framework_version="0.5.10rc0",
+            device_name="NVIDIA GB200",
+            device=object(),
+            architecture=_ARCHITECTURE,
+            model_artifact=_MODEL_ARTIFACT,
+            mode=route.mode,
+            attn_kind=route.attn_kind,
+            compress_ratio=route.compress_ratio,
+            tp_size=_TP_SIZE,
+            canonical_num_heads=_CANONICAL_NUM_HEADS,
+            padded_num_heads=_PADDED_NUM_HEADS,
+            mla_dtype="bfloat16",
+            kv_cache_dtype="fp8",
+            gemm_type="fp8_block",
+            cleanup_func=fail_cleanup,
+        ),
+    )
+
+    @contextmanager
+    def fail_benchmark(**kwargs):
+        raise RuntimeError("benchmark failed")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(dsv4_attn, "benchmark_with_power", fail_benchmark)
+
+    with pytest.raises(RuntimeError, match="benchmark failed"):
+        dsv4_attn.run_dsv4_attn_case(**case, protocol=request.protocol)
+
+    assert calls == ["cleanup"]
+
+
+def test_attention_preparation_cleans_distributed_state_when_model_load_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = _ROUTES[0]
+    request = _request(route)
+    case = _expected_case(route, request.query)
+    case = {
+        **case,
+        "batch_size": 2,
+        "isl": 97,
+        "prefix": 0,
+        "s_total": case.get("s_total"),
+    }
+    calls: list[str] = []
+    load_kwargs: dict[str, object] = {}
+
+    torch_module = ModuleType("torch")
+    torch_module.cuda = SimpleNamespace(empty_cache=lambda: calls.append("empty-cache"))
+    torch_module.distributed = SimpleNamespace(is_initialized=lambda: False)
+    parallel_state = SimpleNamespace(
+        destroy_model_parallel=lambda: calls.append("destroy-model-parallel"),
+        destroy_distributed_environment=lambda: calls.append("destroy-distributed-environment"),
+    )
+    sglang_module = ModuleType("sglang")
+    sglang_module.__path__ = []
+    srt_module = ModuleType("sglang.srt")
+    srt_module.__path__ = []
+    distributed_module = ModuleType("sglang.srt.distributed")
+    distributed_module.parallel_state = parallel_state
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "sglang", sglang_module)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_module)
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed_module)
+
+    def fail_model_load(*_args, **kwargs):
+        load_kwargs.update(kwargs)
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(dsv4_attn, "_load_model_runner", fail_model_load)
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        dsv4_attn._prepare_dsv4_attn_case(
+            **case,
+            device="cuda:0",
+            model_path=_MODEL_ARTIFACT,
+        )
+
+    assert calls == [
+        "destroy-model-parallel",
+        "destroy-distributed-environment",
+        "empty-cache",
+    ]
+    assert load_kwargs["required_swa_tokens"] == 512
+
+
+def test_attention_preparation_preserves_load_error_when_cleanup_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = _ROUTES[0]
+    request = _request(route)
+    case = _expected_case(route, request.query)
+    case = {
+        **case,
+        "isl": case.get("isl"),
+        "prefix": case.get("prefix"),
+        "s_total": case.get("s_total"),
+    }
+    calls: list[str] = []
+
+    torch_module = ModuleType("torch")
+    torch_module.cuda = SimpleNamespace(empty_cache=lambda: calls.append("empty-cache"))
+    torch_module.distributed = SimpleNamespace(is_initialized=lambda: False)
+
+    def fail_cleanup() -> None:
+        calls.append("destroy-model-parallel")
+        raise RuntimeError("cleanup failed")
+
+    distributed_module = ModuleType("sglang.srt.distributed")
+    distributed_module.parallel_state = SimpleNamespace(
+        destroy_model_parallel=fail_cleanup,
+        destroy_distributed_environment=lambda: calls.append("destroy-distributed-environment"),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "sglang", ModuleType("sglang"))
+    monkeypatch.setitem(sys.modules, "sglang.srt", ModuleType("sglang.srt"))
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed_module)
+    monkeypatch.setattr(
+        dsv4_attn,
+        "_load_model_runner",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("construction failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        dsv4_attn._prepare_dsv4_attn_case(
+            **case,
+            device="cuda:0",
+            model_path=_MODEL_ARTIFACT,
+        )
+
+    assert calls == ["destroy-model-parallel", "empty-cache"]
+
+
+def test_attention_preparation_cleans_loaded_runner_when_module_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = _ROUTES[0]
+    request = _request(route)
+    case = _expected_case(route, request.query)
+    case = {
+        **case,
+        "isl": case.get("isl"),
+        "prefix": case.get("prefix"),
+        "s_total": case.get("s_total"),
+    }
+    calls: list[str] = []
+
+    torch_module = ModuleType("torch")
+    torch_module.cuda = SimpleNamespace(empty_cache=lambda: calls.append("empty-cache"))
+    torch_module.distributed = SimpleNamespace(is_initialized=lambda: False)
+    parallel_state = SimpleNamespace(
+        destroy_model_parallel=lambda: calls.append("destroy-model-parallel"),
+        destroy_distributed_environment=lambda: calls.append("destroy-distributed-environment"),
+    )
+    distributed_module = ModuleType("sglang.srt.distributed")
+    distributed_module.parallel_state = parallel_state
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "sglang", ModuleType("sglang"))
+    monkeypatch.setitem(sys.modules, "sglang.srt", ModuleType("sglang.srt"))
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed_module)
+    model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(clear=lambda: calls.append("clear-request-pool")),
+        token_to_kv_pool_allocator=SimpleNamespace(clear=lambda: calls.append("clear-kv-pool")),
+        model=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        self_attn=SimpleNamespace(
+                            compress_ratio=route.compress_ratio + 1,
+                            n_heads=_PADDED_NUM_HEADS,
+                        )
+                    )
+                ]
+            ),
+            config=SimpleNamespace(architectures=[_ARCHITECTURE]),
+        ),
+    )
+    monkeypatch.setattr(dsv4_attn, "_load_model_runner", lambda *args, **kwargs: model_runner)
+
+    with pytest.raises(ValueError, match="loaded SGLang attention module"):
+        dsv4_attn._prepare_dsv4_attn_case(
+            **case,
+            device="cuda:0",
+            model_path=_MODEL_ARTIFACT,
+        )
+
+    assert calls == [
+        "clear-request-pool",
+        "clear-kv-pool",
+        "destroy-model-parallel",
+        "destroy-distributed-environment",
+        "empty-cache",
+    ]
 
 
 def test_attention_runner_is_exact_only_import_light_and_has_no_offline_output_api(
@@ -567,9 +872,11 @@ def test_attention_runner_is_exact_only_import_light_and_has_no_offline_output_a
 def test_model_runner_construction_retries_with_a_fresh_nccl_port_after_collision() -> None:
     ports = iter((45101, 45102))
     attempted_ports: list[int] = []
+    events: list[str] = []
 
     def model_runner_factory(**kwargs):
         attempted_ports.append(kwargs["nccl_port"])
+        events.append(f"attempt:{kwargs['nccl_port']}")
         if len(attempted_ports) == 1:
             raise OSError(errno.EADDRINUSE, "Address already in use")
         return object()
@@ -578,10 +885,12 @@ def test_model_runner_construction_retries_with_a_fresh_nccl_port_after_collisio
         model_runner_factory,
         {"model_config": object()},
         port_factory=lambda: next(ports),
+        cleanup_failed_attempt=lambda: events.append("cleanup"),
     )
 
     assert result is not None
     assert attempted_ports == [45101, 45102]
+    assert events == ["attempt:45101", "cleanup", "attempt:45102"]
 
 
 def test_model_runner_construction_does_not_retry_unrelated_failures() -> None:
@@ -599,7 +908,358 @@ def test_model_runner_construction_does_not_retry_unrelated_failures() -> None:
         dsv4_attn._construct_model_runner(
             model_runner_factory,
             {"model_config": object()},
+            cleanup_failed_attempt=lambda: None,
             port_factory=port_factory,
         )
 
     assert port_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("logical_tokens", "expected_full_tokens", "expected_swa_tokens"),
+    (
+        (257, 5120, 512),
+        (641, 7680, 768),
+        (642, 7680, 768),
+    ),
+)
+def test_attention_runner_sizes_full_pool_for_exact_swa_request(
+    logical_tokens: int,
+    expected_full_tokens: int,
+    expected_swa_tokens: int,
+) -> None:
+    full_tokens = dsv4_attn._full_tokens_for_swa_capacity(
+        logical_tokens=logical_tokens,
+        page_size=256,
+        swa_full_tokens_ratio=0.1,
+    )
+
+    assert full_tokens == expected_full_tokens
+    assert int(full_tokens * 0.1) // 256 * 256 == expected_swa_tokens
+    assert expected_swa_tokens >= logical_tokens
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "tokens_per_request", "expected_swa_tokens"),
+    (
+        (1, 257, 512),
+        (2, 97, 512),
+        (3, 1, 768),
+    ),
+)
+def test_attention_runner_rounds_swa_capacity_per_request_page(
+    batch_size: int,
+    tokens_per_request: int,
+    expected_swa_tokens: int,
+) -> None:
+    assert (
+        dsv4_attn._page_rounded_swa_capacity_tokens(
+            batch_size=batch_size,
+            tokens_per_request=tokens_per_request,
+            page_size=256,
+        )
+        == expected_swa_tokens
+    )
+
+
+@pytest.mark.parametrize(
+    ("logical_tokens", "page_size", "swa_full_tokens_ratio"),
+    ((0, 256, 0.1), (257, 0, 0.1), (257, 256, 0.0), (257, 256, 1.01)),
+)
+def test_attention_runner_rejects_invalid_swa_capacity_inputs(
+    logical_tokens: int,
+    page_size: int,
+    swa_full_tokens_ratio: float,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=r"token|page|ratio"):
+        dsv4_attn._full_tokens_for_swa_capacity(
+            logical_tokens=logical_tokens,
+            page_size=page_size,
+            swa_full_tokens_ratio=swa_full_tokens_ratio,
+        )
+
+
+def test_attention_runner_cleanup_releases_model_pools_and_distributed_state() -> None:
+    calls: list[str] = []
+
+    class Pool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def clear(self) -> None:
+            calls.append(self.name)
+
+    class Distributed:
+        initialized = True
+
+        @classmethod
+        def is_initialized(cls) -> bool:
+            return cls.initialized
+
+    class Cuda:
+        @staticmethod
+        def empty_cache() -> None:
+            calls.append("cuda")
+
+    class Torch:
+        cuda = Cuda()
+        distributed = Distributed()
+
+    model_runner = type(
+        "ModelRunner",
+        (),
+        {
+            "req_to_token_pool": Pool("request-pool"),
+            "token_to_kv_pool_allocator": Pool("kv-pool"),
+        },
+    )()
+
+    def cleanup_distributed() -> None:
+        calls.append("distributed")
+        Distributed.initialized = False
+
+    dsv4_attn._cleanup_model_runner(
+        model_runner,
+        torch_module=Torch(),
+        cleanup_distributed=cleanup_distributed,
+        collect_garbage=lambda: calls.append("gc"),
+    )
+
+    assert calls == ["request-pool", "kv-pool", "distributed", "cuda", "gc"]
+    assert Distributed.is_initialized() is False
+
+
+def test_attention_runner_cleanup_releases_distributed_state_when_pool_is_partial() -> None:
+    calls: list[str] = []
+    torch_module = SimpleNamespace(
+        cuda=SimpleNamespace(empty_cache=lambda: calls.append("cuda")),
+        distributed=SimpleNamespace(is_initialized=lambda: False),
+    )
+    partial_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(clear=lambda: calls.append("request-pool")),
+    )
+
+    with pytest.raises(RuntimeError, match="model-pool cleanup failed"):
+        dsv4_attn._cleanup_model_runner(
+            partial_runner,
+            torch_module=torch_module,
+            cleanup_distributed=lambda: calls.append("distributed"),
+            collect_garbage=lambda: calls.append("gc"),
+        )
+
+    assert calls == ["request-pool", "distributed", "cuda", "gc"]
+
+
+def test_attention_runner_cleanup_preserves_pool_failure_when_distributed_cleanup_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_failure = RuntimeError("request pool cleanup failed")
+
+    def fail_pool_cleanup() -> None:
+        raise pool_failure
+
+    model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(clear=fail_pool_cleanup),
+        token_to_kv_pool_allocator=SimpleNamespace(clear=lambda: None),
+    )
+    torch_module = SimpleNamespace(
+        cuda=SimpleNamespace(empty_cache=lambda: None),
+        distributed=SimpleNamespace(is_initialized=lambda: False),
+    )
+    monkeypatch.setattr(dsv4_attn, "_cleanup_temporary_model_dirs", lambda: None)
+
+    with pytest.raises(RuntimeError, match="model-pool cleanup failed") as failure:
+        dsv4_attn._cleanup_model_runner(
+            model_runner,
+            torch_module=torch_module,
+            cleanup_distributed=lambda: (_ for _ in ()).throw(RuntimeError("distributed cleanup failed")),
+            collect_garbage=lambda: None,
+        )
+
+    assert failure.value.__cause__ is pool_failure
+
+
+def test_attention_distributed_cleanup_preserves_first_error_when_temp_cleanup_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    torch_module = SimpleNamespace(
+        cuda=SimpleNamespace(empty_cache=lambda: calls.append("cuda")),
+        distributed=SimpleNamespace(is_initialized=lambda: False),
+    )
+
+    def cleanup_distributed() -> None:
+        calls.append("distributed")
+        raise RuntimeError("distributed cleanup failed")
+
+    def cleanup_temp_dirs() -> None:
+        calls.append("temp-dirs")
+        raise OSError("temporary directory cleanup failed")
+
+    monkeypatch.setattr(dsv4_attn, "_cleanup_temporary_model_dirs", cleanup_temp_dirs)
+
+    with pytest.raises(RuntimeError, match="distributed cleanup failed"):
+        dsv4_attn._cleanup_distributed_runtime(
+            torch_module=torch_module,
+            cleanup_distributed=cleanup_distributed,
+            collect_garbage=lambda: calls.append("gc"),
+        )
+
+    assert calls == ["distributed", "cuda", "gc", "temp-dirs"]
+
+
+def test_model_runner_port_retry_fails_closed_when_cleanup_fails() -> None:
+    attempts = 0
+
+    def model_runner_factory(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise OSError(errno.EADDRINUSE, f"Address already in use: {kwargs['nccl_port']}")
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        dsv4_attn._construct_model_runner(
+            model_runner_factory,
+            {"model_config": object()},
+            cleanup_failed_attempt=lambda: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+            port_factory=lambda: 45101,
+        )
+
+    assert attempts == 1
+
+
+def test_attention_runtime_cleanup_removes_temporary_model_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dsv4_attn.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        dsv4_attn,
+        "_read_model_config",
+        lambda model_id: {
+            "architectures": [_ARCHITECTURE],
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 2,
+        },
+    )
+    model_dir = Path(dsv4_attn._patched_model_dir(_MODEL_ARTIFACT, "csa", 4))
+    assert (model_dir / "config.json").is_file()
+    torch_module = SimpleNamespace(
+        cuda=SimpleNamespace(empty_cache=lambda: None),
+        distributed=SimpleNamespace(is_initialized=lambda: False),
+    )
+
+    dsv4_attn._cleanup_distributed_runtime(
+        torch_module=torch_module,
+        cleanup_distributed=lambda: None,
+        collect_garbage=lambda: None,
+    )
+
+    assert not model_dir.exists()
+
+
+def test_attention_temp_cleanup_attempts_remaining_dirs_after_one_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    blocked = tmp_path / "blocked"
+    removable = tmp_path / "removable"
+    blocked.mkdir()
+    removable.mkdir()
+
+    class OrderedDirs(list[Path]):
+        def discard(self, item: Path) -> None:
+            if item in self:
+                self.remove(item)
+
+    tracked = OrderedDirs([blocked, removable])
+    calls: list[Path] = []
+
+    def remove_tree(path: Path) -> None:
+        calls.append(path)
+        if path == blocked:
+            raise PermissionError("blocked temp directory")
+        path.rmdir()
+
+    monkeypatch.setattr(dsv4_attn, "_TEMPORARY_MODEL_DIRS", tracked)
+    monkeypatch.setattr(dsv4_attn.shutil, "rmtree", remove_tree)
+
+    with pytest.raises(PermissionError, match="blocked temp directory"):
+        dsv4_attn._cleanup_temporary_model_dirs()
+
+    assert calls == [blocked, removable]
+    assert tracked == [blocked]
+    assert blocked.is_dir()
+    assert not removable.exists()
+
+
+def test_attention_only_dsv4_moe_preserves_stable_constructor_and_restores_binding() -> None:
+    class StableDeepseekV2MoE:
+        def __init__(self, *, config, layer_id: int, is_nextn: bool = False) -> None:
+            self.config = config
+            self.layer_id = layer_id
+            self.is_nextn = is_nextn
+
+        def get_moe_weights(self):
+            return ("stable-weight",)
+
+        def forward(self):
+            return "unsafe-moe-forward"
+
+    class DeepseekV2Module:
+        DeepseekV2MoE = StableDeepseekV2MoE
+
+    module = DeepseekV2Module()
+    with dsv4_attn._attention_only_dsv4_moe(module):
+        patched_type = module.DeepseekV2MoE
+        assert issubclass(patched_type, StableDeepseekV2MoE)
+        instance = patched_type(
+            config="dsv4",
+            layer_id=0,
+            is_nextn=False,
+            is_deepseek_v4=True,
+        )
+        assert instance.config == "dsv4"
+        assert instance.layer_id == 0
+        assert instance.get_moe_weights() == ("stable-weight",)
+        with pytest.raises(RuntimeError, match="must not execute the MoE path"):
+            instance.forward()
+
+    assert module.DeepseekV2MoE is StableDeepseekV2MoE
+    assert isinstance(instance, StableDeepseekV2MoE)
+
+
+def test_attention_only_dsv4_moe_forwards_flag_when_constructor_supports_it() -> None:
+    class CandidateDeepseekV2MoE:
+        def __init__(self, *, is_deepseek_v4: bool = False) -> None:
+            self.is_deepseek_v4 = is_deepseek_v4
+
+        def forward(self):
+            return "unsafe-moe-forward"
+
+    class DeepseekV2Module:
+        DeepseekV2MoE = CandidateDeepseekV2MoE
+
+    module = DeepseekV2Module()
+    with dsv4_attn._attention_only_dsv4_moe(module):
+        instance = module.DeepseekV2MoE(is_deepseek_v4=True)
+
+    assert instance.is_deepseek_v4 is True
+    assert module.DeepseekV2MoE is CandidateDeepseekV2MoE
+
+
+def test_attention_only_dsv4_moe_rejects_non_dsv4_use_and_restores_after_error() -> None:
+    class StableDeepseekV2MoE:
+        def __init__(self) -> None:
+            raise AssertionError("base constructor must not run for an invalid call")
+
+    class DeepseekV2Module:
+        DeepseekV2MoE = StableDeepseekV2MoE
+
+    module = DeepseekV2Module()
+    with (
+        pytest.raises(ValueError, match="requires is_deepseek_v4=True"),
+        dsv4_attn._attention_only_dsv4_moe(module),
+    ):
+        module.DeepseekV2MoE()
+
+    assert module.DeepseekV2MoE is StableDeepseekV2MoE

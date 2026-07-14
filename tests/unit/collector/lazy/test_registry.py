@@ -119,9 +119,19 @@ def test_lazy_entry_rejects_empty_or_untyped_metadata(bad_value: object, error_t
     lazy = _lazy_entry()
     values = {field.name: getattr(lazy, field.name) for field in fields(lazy)}
     for field_name in values:
+        if field_name == "preflight_resource":
+            continue
         invalid = values | {field_name: bad_value}
         with pytest.raises(error_type, match=field_name):
             LazyOpEntry(**invalid)
+
+
+def test_lazy_entry_rejects_untyped_preflight_resource() -> None:
+    lazy = _lazy_entry()
+    values = {field.name: getattr(lazy, field.name) for field in fields(lazy)}
+
+    with pytest.raises(TypeError, match="preflight_resource"):
+        LazyOpEntry(**(values | {"preflight_resource": "one-gpu"}))
 
 
 def test_legacy_registry_and_resolver_imports_are_identity_reexports() -> None:

@@ -46,6 +46,8 @@ from importlib.metadata import version as get_version
 
 import torch
 
+from aiconfigurator.collector.sglang.dsv4_runtime_contract import validate_deepseek_v4_runtime_contract
+
 # DSV4 local forks default to replacing small patched configs with packaged
 # config_backup_small.json.  Suppress so collector's per-kind 1-layer config
 # isn't overwritten.
@@ -544,6 +546,7 @@ def _load_model_runner(
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
 
+    validate_deepseek_v4_runtime_contract()
     suppress_other_loggers()
     torch.cuda.set_device(device)
 
@@ -607,8 +610,10 @@ def _load_model_runner(
     # gemm_type controls projection GEMM dispatch.  "fp8_block" → DeepGEMM
     # (matches production V4-Flash-FP8); anything else → cuBLASLt bf16.
     server_args.quantization = "fp8" if gemm_type == "fp8_block" else None
+    server_args.disable_piecewise_cuda_graph = True
     server_args.enable_piecewise_cuda_graph = False
-    server_args.attention_backend = "dsv4"
+    server_args.attention_backend = "compressed"
+    server_args.page_size = 256
 
     print(
         f"[dsv4-collector] model_path {model_path} -> {local_model_path}; "

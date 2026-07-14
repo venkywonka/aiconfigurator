@@ -4,7 +4,7 @@
 """Packaged lazy registrations for TensorRT-LLM collectors."""
 
 from aiconfigurator.collector.registry_types import OpEntry, PerfFile
-from aiconfigurator.collector.types import LazyOpEntry
+from aiconfigurator.collector.types import FabricRequirement, LazyOpEntry, ResourceContract
 from aiconfigurator.sdk.perf_namespace import perf_namespace
 
 GEMM_LAZY_SPEC = LazyOpEntry(
@@ -18,6 +18,7 @@ GEMM_LAZY_SPEC = LazyOpEntry(
     protocol_revision="cuda-event-samples-v1",
     timer="cuda_event",
     tuning_revision="trtllm-linear-v1",
+    preflight_resource=ResourceContract(gpu_count=1, fabric=FabricRequirement.NONE),
 )
 
 TRTLLM_LAZY_REGISTRY = (

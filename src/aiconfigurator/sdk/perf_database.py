@@ -1708,8 +1708,8 @@ class PerfDatabase:
 
         if not isinstance(environment, MeasurementEnvironment):
             raise TypeError("environment must be a MeasurementEnvironment")
-        expected_route = (self.system, self.backend, self.version)
-        actual_route = (environment.system, environment.backend, environment.backend_version)
+        expected_route = (self.system, self.backend)
+        actual_route = (environment.system, environment.backend)
         if actual_route != expected_route:
             raise ValueError(
                 "measurement environment route does not match this database: "

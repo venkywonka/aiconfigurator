@@ -13,17 +13,22 @@ from typing import Any
 
 from aiconfigurator.collector.registry_types import PerfFile
 from aiconfigurator.collector.types import FabricRequirement, ResourceContract
-from aiconfigurator.sdk.resolution.types import MeasurementRecord, MeasurementRequest, PerfKey
+from aiconfigurator.sdk.resolution.types import (
+    MeasurementRecord,
+    MeasurementRequest,
+    PerfKey,
+    ProtocolMismatchError,
+)
 
 _MODEL_ARTIFACT = "sgl-project/DeepSeek-V4-Flash-FP8"
 _ARCHITECTURE = "DeepseekV4ForCausalLM"
 _CANONICAL_NUM_HEADS = 16
 _PADDED_NUM_HEADS = 64
 _TP_SIZE = 4
+_SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _RUNTIME_VERSIONS = {
     "cuda": "13.0",
     "model_profile": "dsv4-v1.2",
-    "sglang": "0.5.10",
 }
 _PROFILE_COMPATIBILITY = {
     "model_artifact": _MODEL_ARTIFACT,
@@ -108,17 +113,18 @@ def _validate_capability(request: MeasurementRequest, route: _Route) -> None:
     if (
         environment.system != "gb200"
         or environment.backend != "sglang"
-        or environment.backend_version != "0.5.10"
+        or environment.backend_version not in _SUPPORTED_SGLANG_VERSIONS
+        or environment.runtime_versions.get("sglang") != environment.backend_version
         or _normalized_label(environment.gpu_class) != "nvidia gb200"
         or any(environment.runtime_versions.get(name) != version for name, version in _RUNTIME_VERSIONS.items())
     ):
-        raise ValueError("DSv4 attention request is outside the frozen GB200/SGLang 0.5.10 capability envelope")
+        raise ValueError("DSv4 attention request is outside the frozen GB200/SGLang capability envelope")
     if dict(environment.profile_compatibility or {}) != _PROFILE_COMPATIBILITY:
         raise ValueError("DSv4 attention profile compatibility does not match the frozen V1.2 deployment")
     if dict(request.semantic_descriptor) != _SEMANTIC_DESCRIPTOR:
         raise ValueError("DSv4 attention semantic descriptor does not describe the frozen full module")
     if request.protocol.samples < 3:
-        raise ValueError("DSv4 attention protocol samples must be at least three")
+        raise ProtocolMismatchError("DSv4 attention protocol samples must be at least three")
 
     query = request.query
     expected_fields = _CONTEXT_QUERY_FIELDS if route.mode == "context" else _GENERATION_QUERY_FIELDS

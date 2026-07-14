@@ -31,6 +31,7 @@ InferenceX tok/s/gpu vs tok/s/user frontier.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 from .config import Candidate, OptimizationTarget
 
@@ -136,7 +137,7 @@ def pareto_front(candidates: list[Candidate], objectives: list[OptimizationTarge
 
 def make_candidate(
     config: dict,
-    report: dict[str, float],
+    report: dict[str, Any],
     target: OptimizationTarget,
     *,
     pareto_objectives: list[OptimizationTarget] | None = None,
@@ -148,6 +149,7 @@ def make_candidate(
     stored in ``Candidate.objectives`` (Pareto dominance reads these) and ``score`` carries
     the first objective's value as a headline number (it is not used for ranking)."""
     metrics = {key: float(report[key]) for key in _METRIC_KEYS if key in report}
+    resolution_report = report.get("aic_resolution_report")
     if target is OptimizationTarget.PARETO:
         if not pareto_objectives:
             raise ValueError("a pareto candidate needs pareto_objectives")
@@ -158,12 +160,14 @@ def make_candidate(
             score=objectives[pareto_objectives[0].value],
             metrics=metrics,
             objectives=objectives,
+            aic_resolution_report=resolution_report,
         )
     return Candidate(
         config=config,
         used_gpus=int(config.get("used_gpus", 0)),
         score=score_report(report, target),
         metrics=metrics,
+        aic_resolution_report=resolution_report,
     )
 
 

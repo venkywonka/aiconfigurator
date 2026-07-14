@@ -20,10 +20,9 @@ _QUERY_FIELDS = ("gemm_type", "m", "n", "k")
 _PERF_IDENTITY_FIELDS = ("gemm_dtype", "m", "n", "k")
 _DSV4_SYSTEM = "gb200"
 _DSV4_BACKEND = "sglang"
-_DSV4_BACKEND_VERSION = "0.5.10"
+_DSV4_BACKEND_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _DSV4_GPU_CLASS = "nvidia gb200"
-_DSV4_MODEL_PROFILE = "dsv4-v1.2"
-_DSV4_RUNNER_VERSION = "1.3.0rc10"
+_DSV4_RUNTIME_VERSIONS = {"cuda": "13.0", "model_profile": "dsv4-v1.2"}
 _DSV4_GEMM_PROFILES = frozenset(
     {
         ("bfloat16", 256, 4096),
@@ -43,10 +42,10 @@ def _validate_dsv4_capability(request: MeasurementRequest, case: Mapping[str, An
     expected_environment = (
         environment.system == _DSV4_SYSTEM
         and environment.backend == _DSV4_BACKEND
-        and environment.backend_version == _DSV4_BACKEND_VERSION
+        and environment.backend_version in _DSV4_BACKEND_VERSIONS
+        and environment.runtime_versions.get(_DSV4_BACKEND) == environment.backend_version
         and _normalized_label(environment.gpu_class) == _DSV4_GPU_CLASS
-        and environment.runtime_versions.get("model_profile") == _DSV4_MODEL_PROFILE
-        and environment.runtime_versions.get("tensorrt_llm") == _DSV4_RUNNER_VERSION
+        and all(environment.runtime_versions.get(name) == version for name, version in _DSV4_RUNTIME_VERSIONS.items())
     )
     if not expected_environment:
         raise ValueError("GEMM request is outside the frozen DSv4 capability envelope")
@@ -159,10 +158,11 @@ def gemm_result_to_record(
     if not isinstance(provenance, Mapping):
         raise TypeError("GEMM provenance must be a mapping")
     expected_framework_version = request.environment.backend_version
-    if request.environment.backend == _DSV4_BACKEND:
-        expected_framework_version = request.environment.runtime_versions["tensorrt_llm"]
     if provenance.get("framework_version") != expected_framework_version:
         raise ValueError("GEMM provenance framework version does not match the request runtime")
+    expected_framework = "SGLang" if request.environment.backend == _DSV4_BACKEND else "TRTLLM"
+    if provenance.get("framework") != expected_framework:
+        raise ValueError("GEMM provenance framework does not match the request backend")
     measured_device = provenance.get("device")
     if not isinstance(measured_device, str) or (
         " ".join(measured_device.split()).casefold() != " ".join(request.environment.gpu_class.split()).casefold()

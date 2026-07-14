@@ -29,6 +29,11 @@ sweep:
   max_rounds: 40
   parallel_evals: 16
 
+# aic_resolution is intentionally absent: absence is pure prediction and issues
+# no GPU measurement work. The V1.3 resolving profile is currently limited to
+# aggregated SGLang DeepSeek-V4 Flash FP8 on GB200; see ../overview.md for the
+# canonical policy and separate measurement_gpu_groups example.
+
 # --- Pareto front (e.g. reproduce an InferenceX throughput/gpu vs throughput/user curve) ---
 # Multi-objective: sweep normalized KV load and return the non-dominated frontier.
 # kv_load_ratio is a continuous [min, max] only under Pareto; when all load fields are

@@ -94,6 +94,7 @@ class _Process:
     finish_on_join: bool = True
     finish_on_terminate: bool = True
     finish_on_kill: bool = True
+    exitcode: int | None = 0
 
     def start(self) -> None:
         self.start_calls += 1
@@ -193,6 +194,48 @@ def test_rank_group_spawns_one_process_per_assigned_gpu_and_reuses_one_lease() -
     command_queues, _ = _rank_queues(context)
     assert [queue.puts for queue in command_queues] == [[None], [None], [None]]
     assert [process.join_calls for process in context.processes] == [1, 1, 1]
+
+
+def test_close_reports_nonzero_graceful_rank_exit_after_cleaning_every_rank() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    context.processes[1].exitcode = 23
+
+    with pytest.raises(RuntimeError, match=r"rank 1.*code 23"):
+        group.close()
+    with pytest.raises(RuntimeError, match=r"rank 1.*code 23"):
+        group.close()
+
+    assert [process.join_calls for process in context.processes] == [1, 1]
+    assert [process.terminate_calls for process in context.processes] == [0, 0]
+    assert [process.kill_calls for process in context.processes] == [0, 0]
+    assert all(queue.close_calls == 1 for queue in context.queues)
+
+
+def test_close_does_not_misclassify_parent_terminated_rank_as_cleanup_crash() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    for process in context.processes:
+        process.finish_on_join = False
+        process.exitcode = -15
+
+    group.close()
+
+    assert [process.terminate_calls for process in context.processes] == [1, 1]
+    assert [process.kill_calls for process in context.processes] == [0, 0]
+    assert all(queue.close_calls == 1 for queue in context.queues)
 
 
 @dataclass
@@ -376,16 +419,16 @@ def test_all_rank_aggregation_rejects_invalid_rank_samples_before_they_can_be_ma
     assert group.poisoned is True
 
 
-def test_rank_worker_installs_parent_death_signal_and_can_return_all_rank_samples(
+def test_rank_worker_installs_parent_process_watchdog_and_can_return_all_rank_samples(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor = importlib.import_module("aiconfigurator.collector.executor")
     api = _api()
-    parent_death_calls: list[int] = []
+    parent_watchdog_calls: list[int] = []
     monkeypatch.setattr(
         executor,
-        "_install_parent_death_signal",
-        lambda parent_pid: parent_death_calls.append(parent_pid),
+        "_install_parent_process_watchdog",
+        lambda parent_pid: parent_watchdog_calls.append(parent_pid),
     )
     protocol = _protocol()
     command = api.NcclRankCommand(
@@ -410,7 +453,7 @@ def test_rank_worker_installs_parent_death_signal_and_can_return_all_rank_sample
         all_rank_samples=True,
     )
 
-    assert parent_death_calls == [12345]
+    assert parent_watchdog_calls == [12345]
     assert len(reply_queue.puts) == 1
     assert len(reply_queue.puts[0].samples_ms) == protocol.samples
 
@@ -608,6 +651,37 @@ def test_close_reports_rank_that_survives_kill_after_forced_cleanup() -> None:
     assert all(queue.close_calls == 1 for queue in context.queues)
 
 
+def test_close_retries_ranks_that_previously_survived_forced_shutdown() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    for process in context.processes:
+        process.finish_on_join = False
+        process.finish_on_terminate = False
+        process.finish_on_kill = False
+
+    with pytest.raises(RuntimeError, match=r"survived.*shutdown"):
+        group.close()
+
+    assert all(process.is_alive() for process in context.processes)
+    with pytest.raises(RuntimeError, match="shutdown is incomplete"):
+        group.measure("half", "all_reduce", 4096)
+    for process in context.processes:
+        process.finish_on_kill = True
+
+    group.close()
+    group.close()
+
+    assert not any(process.is_alive() for process in context.processes)
+    assert [process.kill_calls for process in context.processes] == [2, 2]
+    assert all(queue.close_calls == 1 for queue in context.queues)
+
+
 def test_poison_reports_rank_that_survives_kill_without_hiding_original_failure() -> None:
     api = _api()
     context = _SpawnContext()
@@ -641,3 +715,44 @@ def test_poison_reports_rank_that_survives_kill_without_hiding_original_failure(
     assert [process.kill_calls for process in context.processes] == [1, 1]
     assert all(queue.close_calls == 1 for queue in context.queues)
     assert all(queue.cancel_join_thread_calls == 1 for queue in context.queues)
+
+
+def test_close_retries_ranks_that_previously_survived_poisoning() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    command_queues, reply_queue = _rank_queues(context)
+    for process in context.processes:
+        process.finish_on_join = False
+        process.finish_on_terminate = False
+        process.finish_on_kill = False
+
+    def failed_reply() -> object:
+        command = command_queues[0].puts[-1]
+        return api.NcclRankReply(
+            invocation_id=command.invocation_id,
+            rank=1,
+            error="rank 1 crashed",
+        )
+
+    reply_queue.get_factory = failed_reply
+
+    with pytest.raises(RuntimeError, match=r"survived.*shutdown"):
+        group.measure("half", "all_reduce", 4096)
+
+    assert group.poisoned is True
+    assert all(process.is_alive() for process in context.processes)
+    for process in context.processes:
+        process.finish_on_kill = True
+
+    group.close()
+    group.close()
+
+    assert not any(process.is_alive() for process in context.processes)
+    assert [process.kill_calls for process in context.processes] == [2, 2]
+    assert all(queue.close_calls == 1 for queue in context.queues)

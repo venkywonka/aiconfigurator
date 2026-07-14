@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
+import logging
 import os
 import random
+import shutil
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,12 +20,19 @@ from pathlib import Path
 from typing import Any
 
 from aiconfigurator.collector.benchmark import benchmark_with_power
+from aiconfigurator.collector.sglang.dsv4_runtime_contract import validate_deepseek_v4_runtime_contract
 from aiconfigurator.collector.types import RawMeasurement
 from aiconfigurator.sdk.resolution.types import MeasurementProtocol
 
 _MODEL_ARTIFACT = "sgl-project/DeepSeek-V4-Flash-FP8"
 _ARCHITECTURE = "DeepseekV4ForCausalLM"
 _MODEL_CONFIG_DIR = Path(__file__).resolve().parents[2] / "model_configs"
+_TEMPORARY_MODEL_DIRS: set[Path] = set()
+logger = logging.getLogger(__name__)
+
+
+def _noop_cleanup() -> None:
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +50,7 @@ class PreparedMhcCase:
     hc_mult: int
     sinkhorn_iters: int
     quant_mode: str
+    cleanup: Callable[[], None] = _noop_cleanup
 
 
 def _read_model_config(model_id: str) -> dict[str, Any]:
@@ -62,8 +73,8 @@ def _patched_model_dir(model_id: str) -> str:
     config["architectures"] = [_ARCHITECTURE]
     config["model_type"] = "deepseek_v3"
 
-    temp_dir = Path(tempfile.gettempdir()) / f"aic_mhc_{model_id.replace('/', '_')}_{os.getpid()}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"aic_mhc_{model_id.replace('/', '_')}_"))
+    _TEMPORARY_MODEL_DIRS.add(temp_dir)
     with (temp_dir / "config.json").open("w") as config_stream:
         json.dump(config, config_stream)
 
@@ -71,6 +82,79 @@ def _patched_model_dir(model_id: str) -> str:
         expert_dtype = str(original_config.get("expert_dtype", "")).casefold()
         os.environ["SGLANG_DSV4_FP4_EXPERTS"] = "1" if expert_dtype == "fp4" else "0"
     return str(temp_dir)
+
+
+def _cleanup_temporary_model_dirs() -> None:
+    """Remove every worker-local dummy-load config created for an exact case."""
+
+    cleanup_errors: list[OSError] = []
+    for model_dir in tuple(_TEMPORARY_MODEL_DIRS):
+        try:
+            shutil.rmtree(model_dir)
+        except FileNotFoundError:
+            _TEMPORARY_MODEL_DIRS.discard(model_dir)
+        except OSError as error:
+            cleanup_errors.append(error)
+        else:
+            _TEMPORARY_MODEL_DIRS.discard(model_dir)
+    if cleanup_errors:
+        for secondary in cleanup_errors[1:]:
+            logger.error(
+                "secondary mHC temporary-directory cleanup failure; preserving the first error: %s",
+                secondary,
+            )
+        raise cleanup_errors[0]
+
+
+def _cleanup_mhc_runtime(
+    model_runner,
+    *,
+    torch_module,
+    cleanup_distributed: Callable[[], None],
+    collect_garbage: Callable[[], Any] = gc.collect,
+) -> None:
+    """Release one mHC runner fully so the bound worker can serve another case."""
+
+    cleanup_errors: list[Exception] = []
+    if model_runner is not None:
+        for pool_name in ("req_to_token_pool", "token_to_kv_pool_allocator"):
+            try:
+                pool = getattr(model_runner, pool_name)
+                pool.clear()
+            except Exception as error:
+                cleanup_errors.append(error)
+        for attribute in ("model", "req_to_token_pool", "token_to_kv_pool_allocator"):
+            try:
+                setattr(model_runner, attribute, None)
+            except Exception as error:
+                cleanup_errors.append(error)
+
+    for cleanup in (
+        cleanup_distributed,
+        collect_garbage,
+        torch_module.cuda.empty_cache,
+        _cleanup_temporary_model_dirs,
+    ):
+        try:
+            cleanup()
+        except Exception as error:
+            cleanup_errors.append(error)
+    if torch_module.distributed.is_initialized():
+        cleanup_errors.append(RuntimeError("SGLang distributed state remained initialized after mHC cleanup"))
+    if cleanup_errors:
+        for secondary in cleanup_errors[1:]:
+            logger.error(
+                "secondary mHC cleanup failure; preserving the first cleanup error: %s",
+                secondary,
+            )
+        raise cleanup_errors[0]
+
+
+def _preserve_primary_failure(cleanup: Callable[[], None], *, context: str) -> None:
+    try:
+        cleanup()
+    except Exception:
+        logger.exception("%s; preserving the primary mHC failure", context)
 
 
 def _load_one_layer_runner(
@@ -88,6 +172,7 @@ def _load_one_layer_runner(
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
 
+    validate_deepseek_v4_runtime_contract()
     suppress_other_loggers()
     torch_device = torch_module.device(device)
     torch_module.cuda.set_device(torch_device)
@@ -108,8 +193,10 @@ def _load_one_layer_runner(
         max_running_requests=16,
         max_prefill_tokens=4096,
     )
+    server_args.disable_piecewise_cuda_graph = True
     server_args.enable_piecewise_cuda_graph = False
-    server_args.attention_backend = "dsv4"
+    server_args.attention_backend = "compressed"
+    server_args.page_size = 256
     _set_envs_and_config(server_args)
     model_config = ModelConfig.from_server_args(server_args)
     return ModelRunner(
@@ -202,50 +289,79 @@ def _prepare_mhc_case(
     os.environ.setdefault("SGLANG_OPT_DEEPGEMM_HC_PRENORM", "0")
 
     import torch
+    from sglang.srt.distributed import parallel_state
 
-    model_runner = _load_one_layer_runner(
-        model_path,
-        device,
-        mem_fraction_static=0.5,
-        torch_module=torch,
-    )
-    layer = model_runner.model.model.layers[0]
-    actual_hidden_size = _hidden_size(layer)
-    actual_hc_mult = int(layer.hc_mult)
-    actual_sinkhorn_iters = int(getattr(layer.config, "hc_sinkhorn_iters", 20))
-    architecture_values = getattr(layer.config, "architectures", None)
-    architecture = architecture_values[0] if architecture_values else _ARCHITECTURE
-    if (
-        actual_hidden_size != hidden_size
-        or actual_hc_mult != hc_mult
-        or actual_sinkhorn_iters != sinkhorn_iters
-        or architecture != _ARCHITECTURE
-    ):
-        raise ValueError("loaded SGLang mHC layer does not match the requested frozen case")
+    model_runner = None
+    cleaned = False
+    kernel_state: dict[str, Callable[[], Any]] = {}
 
-    residual = _make_residual(layer, num_tokens, device, torch_module=torch)
-    raw_kernel = _make_kernel(layer, op, residual, torch_module=torch)
+    def cleanup_distributed() -> None:
+        parallel_state.destroy_model_parallel()
+        parallel_state.destroy_distributed_environment()
 
-    def timed_kernel():
-        with torch.no_grad():
-            return raw_kernel()
+    def cleanup() -> None:
+        nonlocal cleaned, model_runner
+        if cleaned:
+            return
+        cleaned = True
+        kernel_state.clear()
+        try:
+            _cleanup_mhc_runtime(
+                model_runner,
+                torch_module=torch,
+                cleanup_distributed=cleanup_distributed,
+            )
+        finally:
+            model_runner = None
 
-    call_args = _mhc_call_args(layer)
-    if len(call_args) != 2:
-        raise ValueError("loaded SGLang mHC layer does not expose both full-module sites")
-    return PreparedMhcCase(
-        kernel_func=timed_kernel,
-        framework_version=get_version("sglang"),
-        device_name=torch.cuda.get_device_name(torch.device(device)),
-        device=torch.device(device),
-        architecture=architecture,
-        model_artifact=model_path,
-        num_sites=len(call_args),
-        hidden_size=actual_hidden_size,
-        hc_mult=actual_hc_mult,
-        sinkhorn_iters=actual_sinkhorn_iters,
-        quant_mode=quant_mode,
-    )
+    try:
+        model_runner = _load_one_layer_runner(
+            model_path,
+            device,
+            mem_fraction_static=0.5,
+            torch_module=torch,
+        )
+        layer = model_runner.model.model.layers[0]
+        actual_hidden_size = _hidden_size(layer)
+        actual_hc_mult = int(layer.hc_mult)
+        actual_sinkhorn_iters = int(getattr(layer.config, "hc_sinkhorn_iters", 20))
+        architecture_values = getattr(layer.config, "architectures", None)
+        architecture = architecture_values[0] if architecture_values else _ARCHITECTURE
+        if (
+            actual_hidden_size != hidden_size
+            or actual_hc_mult != hc_mult
+            or actual_sinkhorn_iters != sinkhorn_iters
+            or architecture != _ARCHITECTURE
+        ):
+            raise ValueError("loaded SGLang mHC layer does not match the requested frozen case")
+
+        residual = _make_residual(layer, num_tokens, device, torch_module=torch)
+        kernel_state["raw_kernel"] = _make_kernel(layer, op, residual, torch_module=torch)
+
+        def timed_kernel():
+            with torch.no_grad():
+                return kernel_state["raw_kernel"]()
+
+        call_args = _mhc_call_args(layer)
+        if len(call_args) != 2:
+            raise ValueError("loaded SGLang mHC layer does not expose both full-module sites")
+        return PreparedMhcCase(
+            kernel_func=timed_kernel,
+            framework_version=get_version("sglang"),
+            device_name=torch.cuda.get_device_name(torch.device(device)),
+            device=torch.device(device),
+            architecture=architecture,
+            model_artifact=model_path,
+            num_sites=len(call_args),
+            hidden_size=actual_hidden_size,
+            hc_mult=actual_hc_mult,
+            sinkhorn_iters=actual_sinkhorn_iters,
+            quant_mode=quant_mode,
+            cleanup=cleanup,
+        )
+    except BaseException:
+        _preserve_primary_failure(cleanup, context="mHC preparation cleanup failed")
+        raise
 
 
 def get_mhc_test_cases() -> tuple[()]:
@@ -308,67 +424,74 @@ def run_mhc_case(
         device,
         model_path,
     )
-    if (
-        prepared.architecture != _ARCHITECTURE
-        or prepared.model_artifact != _MODEL_ARTIFACT
-        or prepared.num_sites != 2
-        or prepared.hidden_size != hidden_size
-        or prepared.hc_mult != hc_mult
-        or prepared.sinkhorn_iters != sinkhorn_iters
-        or prepared.quant_mode != quant_mode
-    ):
-        raise ValueError("prepared mHC case does not match the frozen two-site full-module request")
+    try:
+        if (
+            prepared.architecture != _ARCHITECTURE
+            or prepared.model_artifact != _MODEL_ARTIFACT
+            or prepared.num_sites != 2
+            or prepared.hidden_size != hidden_size
+            or prepared.hc_mult != hc_mult
+            or prepared.sinkhorn_iters != sinkhorn_iters
+            or prepared.quant_mode != quant_mode
+        ):
+            raise ValueError("prepared mHC case does not match the frozen two-site full-module request")
 
-    with benchmark_with_power(
-        device=prepared.device,
-        kernel_func=prepared.kernel_func,
-        num_warmups=protocol.warmups,
-        num_runs=protocol.samples,
-        repeat_n=1,
-        allow_graph_fail=False,
-        use_cuda_graph=True,
-        return_samples=True,
-    ) as results:
-        if results.get("used_cuda_graph") is not True:
-            raise RuntimeError("mHC exact runner requires CUDA Graph capture")
-        latency_ms = float(results["latency_ms"])
-        samples_ms = tuple(float(sample) for sample in results["samples_ms"])
-        if len(samples_ms) != protocol.samples:
-            raise ValueError("mHC benchmark sample count does not match the protocol")
-        power_stats = results.get("power_stats")
-        perf_row = {
-            "architecture": prepared.architecture,
-            "op_name": op,
-            "num_tokens": num_tokens,
-            "num_sites": prepared.num_sites,
-            "hc_mult": prepared.hc_mult,
-            "hidden_size": prepared.hidden_size,
-            "sinkhorn_iters": prepared.sinkhorn_iters,
-            "quant_mode": prepared.quant_mode,
-            "latency": latency_ms,
-        }
-        return RawMeasurement(
-            latency_ms=latency_ms,
-            energy_wms=float((power_stats or {}).get("power", 0.0)) * latency_ms,
-            samples_ms=samples_ms,
-            statistic=protocol.statistic,
-            perf_row=perf_row,
-            provenance={
-                "framework": "SGLang",
-                "framework_version": prepared.framework_version,
-                "kernel_source": "sglang_mhc",
-                "device": prepared.device_name,
-                "used_cuda_graph": True,
-                "throttled": bool(results["throttled"]),
-                "model_artifact": prepared.model_artifact,
-                "full_module": True,
+        with benchmark_with_power(
+            device=prepared.device,
+            kernel_func=prepared.kernel_func,
+            num_warmups=protocol.warmups,
+            num_runs=protocol.samples,
+            repeat_n=1,
+            allow_graph_fail=False,
+            use_cuda_graph=True,
+            return_samples=True,
+        ) as results:
+            if results.get("used_cuda_graph") is not True:
+                raise RuntimeError("mHC exact runner requires CUDA Graph capture")
+            latency_ms = float(results["latency_ms"])
+            samples_ms = tuple(float(sample) for sample in results["samples_ms"])
+            if len(samples_ms) != protocol.samples:
+                raise ValueError("mHC benchmark sample count does not match the protocol")
+            power_stats = results.get("power_stats")
+            perf_row = {
+                "architecture": prepared.architecture,
+                "op_name": op,
+                "num_tokens": num_tokens,
                 "num_sites": prepared.num_sites,
-                "tensor_generator": "normal-v1",
-                "seed": 0,
-            },
-            protocol_digest=protocol.digest,
-            power_stats=power_stats,
-        )
+                "hc_mult": prepared.hc_mult,
+                "hidden_size": prepared.hidden_size,
+                "sinkhorn_iters": prepared.sinkhorn_iters,
+                "quant_mode": prepared.quant_mode,
+                "latency": latency_ms,
+            }
+            measurement = RawMeasurement(
+                latency_ms=latency_ms,
+                energy_wms=float((power_stats or {}).get("power", 0.0)) * latency_ms,
+                samples_ms=samples_ms,
+                statistic=protocol.statistic,
+                perf_row=perf_row,
+                provenance={
+                    "framework": "SGLang",
+                    "framework_version": prepared.framework_version,
+                    "kernel_source": "sglang_mhc",
+                    "device": prepared.device_name,
+                    "used_cuda_graph": True,
+                    "throttled": bool(results["throttled"]),
+                    "model_artifact": prepared.model_artifact,
+                    "full_module": True,
+                    "num_sites": prepared.num_sites,
+                    "tensor_generator": "normal-v1",
+                    "seed": 0,
+                },
+                protocol_digest=protocol.digest,
+                power_stats=power_stats,
+            )
+    except BaseException:
+        _preserve_primary_failure(prepared.cleanup, context="mHC execution cleanup failed")
+        raise
+
+    prepared.cleanup()
+    return measurement
 
 
 __all__ = ["PreparedMhcCase", "get_mhc_test_cases", "run_mhc_case"]

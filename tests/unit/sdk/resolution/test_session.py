@@ -31,6 +31,20 @@ from aiconfigurator.sdk.resolution.types import (
 
 pytestmark = pytest.mark.unit
 
+_REPORT_SUMMARY_KEYS = (
+    "overlay_hits",
+    "unique_misses",
+    "consumer_misses",
+    "accepted_records",
+    "rejected_records",
+    "collection_seconds",
+    "unresolved",
+)
+
+
+def _report_summary(payload: dict[str, object]) -> dict[str, object]:
+    return {key: payload[key] for key in _REPORT_SUMMARY_KEYS}
+
 
 def _protocol(**overrides: object) -> MeasurementProtocol:
     values = {
@@ -277,7 +291,7 @@ def test_execute_callback_collects_then_requeries_exactly_once(tmp_path) -> None
     payload = session.report.to_dict()
     assert isinstance(payload["collection_seconds"], float)
     assert payload["collection_seconds"] >= 0.0
-    assert payload == {
+    assert _report_summary(payload) == {
         "overlay_hits": 1,
         "unique_misses": 1,
         "consumer_misses": 1,
@@ -896,7 +910,7 @@ def test_observe_only_reports_miss_without_executor_dispatch(tmp_path) -> None:
     assert [reason.code for reason in failure.value.reasons] == [UnresolvedCode.OBSERVE_ONLY]
     assert executor.request_batches == []
     payload = session.report.to_dict()
-    assert payload == {
+    assert _report_summary(payload) == {
         "overlay_hits": 0,
         "unique_misses": 1,
         "consumer_misses": 1,
@@ -908,6 +922,8 @@ def test_observe_only_reports_miss_without_executor_dispatch(tmp_path) -> None:
                 "code": "observe_only",
                 "operation": "gemm",
                 "detail": f"observed unresolved key {request.key.digest}",
+                "key_digest": request.key.digest,
+                "failure_kind": "observation",
             }
         ],
     }

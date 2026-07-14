@@ -5,8 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Spica — overview & sweep flow
 
-Spica turns a deployment-tuning question into a search. You give it four things in one
-YAML (`SmartSearchConfig`):
+Spica turns a deployment-tuning question into a search. You give it four core
+blocks plus optional online-resolution controls in one YAML (`SmartSearchConfig`):
 
 | Block | Model | What it is |
 |---|---|---|
@@ -14,6 +14,8 @@ YAML (`SmartSearchConfig`):
 | `workload:` | `Workload` | the **traffic** every candidate is replayed against (mostly pinned; Pareto may search KV load) |
 | `goal:` | `OptimizationGoal` | what **"better"** means (the target metric) + the SLA constraint |
 | `sweep:` | `SweepConfig` | run-control (`max_rounds`, `candidates_per_round`, `parallel_evals`, `random_seed`) |
+| `aic_resolution:` | `AicResolutionConfig` | optional shared Replay/Spica/Mocker evidence policy; absence is pure prediction |
+| `measurement_gpu_groups:` | `MeasurementResourcePool` | optional disjoint Spica evaluator GPU groups, separate from evidence policy |
 
 Spica returns the **best deployment config(s)** — a parallel shape + replica count +
 backend + engine/router/planner knobs — each scored by a **real dynamo replay** (the
@@ -36,6 +38,44 @@ GPU-budget bounds, single-mode-when-pinning-`parallel_configs`, the goal's SLA r
 (`goodput`/`goodput_per_gpu` need a `ttft_ms`+`itl_ms` or `e2e_ms` SLA), and the rule that
 **`workload.concurrency` is always scalar while a ranged `workload.kv_load_ratio` is Pareto-only**.
 An invalid config never reaches the search.
+
+#### Optional AIC V1.3 online resolution
+
+Spica uses the same public `aic_resolution` fields as Replay and direct Mocker.
+`lazy_collection` was removed and is a hard configuration error; it is not an
+alias. The concrete GPUs available to parallel Spica evaluators are configured
+separately, and one group becomes the runtime `gpu_ids` lease for one evaluator:
+
+```yaml
+aic_resolution:
+  policy: measure_on_miss
+  on_measurement_failure: error
+  overlay_path: /absolute/path/perf.sqlite
+  # Defaults to /absolute/path/perf.sqlite.live-fallbacks when omitted.
+  fallback_cache_dir: /absolute/path/perf.sqlite.live-fallbacks
+  max_new_keys: 256
+  max_wall_seconds: 3600.0
+  max_block_seconds: 30.0
+  force_remeasure: false
+
+measurement_gpu_groups:
+  - [0, 1, 2, 3]
+  - [4, 5, 6, 7]
+```
+
+Both paths are normalized lexically before use: repeated separators (including
+leading `//`), `.`, and `..` are collapsed without requiring the target to exist
+or resolving symlinks. The default fallback path is derived only after
+normalizing `overlay_path`, keeping Python and Rust payloads restart-stable and
+byte-for-byte consistent.
+
+The pool never enters AIC policy identity. Spica selects one group and emits only
+that concrete lease into the evaluator's internal Dynamo payload. The supported
+V1.3 resolving profile is SGLang aggregated DeepSeek-V4 Flash FP8 on GB200 with
+TP4, attention-DP1, CP1, PP1, MoE TP1/EP4, and MTP disabled.
+Spica rejects an `aic_resolution` search space containing any non-SGLang backend
+or disaggregated deployment before candidate evaluation, and deployment payload
+construction repeats the same guard for programmatic callers.
 
 ### 2. Filter throughput-scaling policies (`filter_scaling_policies`)
 
@@ -106,10 +146,12 @@ For each branch, a `BranchSampler` (`make_branch_sampler`, study id
 2. **deduplicate** — exact duplicate full samples reuse their cached measurement and are
    immediately told back to Vizier. They do not run replay or consume the unique replay
    budget; replacement suggestions are requested up to the per-round 11x safety cap.
-3. **evaluate** — the rest fan out across worker processes: a single **spawned**
-   `ProcessPoolExecutor` created once for the whole run (amortizing the per-worker dynamo
-   import) with `min(parallel_evals, per_round)` workers. The pool is used only when **both**
-   `parallel_evals > 1` and `per_round > 1`; otherwise evaluation runs sequentially in-process.
+3. **evaluate** — the rest fan out across **spawned** worker processes. Without a
+   measurement resource pool, one `ProcessPoolExecutor` is created for the run with
+   `min(parallel_evals, per_round)` workers. With `measurement_gpu_groups`, Spica creates
+   one stable single-worker pool per disjoint group and passes only that worker's concrete
+   `MeasurementLease`. Pools are used only when **both** `parallel_evals > 1` and
+   `per_round > 1`; otherwise evaluation runs sequentially in-process.
    Each worker runs the pure pipeline `_evaluate_one`: `unroll_sample` → resolve candidate KV
    capacity/derived concurrency (KV-load mode) → `build_deployment` →
    `ReplayEvaluator.evaluate` (**real replay**) → score (`make_candidate`). Workers never touch
@@ -117,11 +159,13 @@ For each branch, a `BranchSampler` (`make_branch_sampler`, study id
    "__main__":` guard that spawned workers require.
 4. **tell** — back on the main process: a **feasible** trial is `observe`'d with its metrics;
    replay/build failures are `observe_infeasible`'d. Backend and GPU-budget gates remain as
-   defensive checks, but structured projection should make them unreachable.
+defensive checks, but structured projection should make them unreachable.
 
 `is_feasible` gates on `used_gpus <= gpu_budget` only; SLA is **not** re-gated here (goodput
 targets already bake the SLA into the metric). Each trial's outcome is tallied as one of
-`feasible` / `infeasible` / `failed` / `unsupported`; cache hits are tallied separately.
+`feasible` / `infeasible` / `failed` / `unscorable` / `unsupported`; cache hits are tallied
+separately. A typed AIC resolution rejection is `unscorable`, not a zero-latency or successful
+candidate.
 
 ### 6. Merge by the goal
 

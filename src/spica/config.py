@@ -21,12 +21,13 @@ eventual merge into an AIC sweep task is mechanical.
 from __future__ import annotations
 
 import math
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, model_validator
 
 
 class OptimizationTarget(str, Enum):
@@ -618,6 +619,129 @@ class SweepConfig(BaseModel):
     max_eval_seconds: float | None = Field(default=600.0, gt=0)
 
 
+class AicResolutionPolicy(str, Enum):
+    """Blocking AIC evidence policy shared by Replay, Spica, and Live Mocker."""
+
+    OBSERVE_ONLY = "observe_only"
+    MEASURE_ON_MISS = "measure_on_miss"
+
+
+class MeasurementFailurePolicy(str, Enum):
+    """Action after an eligible exact-measurement failure."""
+
+    ERROR = "error"
+    HYBRID = "hybrid"
+
+
+class MeasurementLease(BaseModel):
+    """One concrete runtime GPU group bound to a resolution owner."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    gpu_ids: tuple[int, ...]
+
+    @model_validator(mode="after")
+    def _validate_gpu_ids(self) -> MeasurementLease:
+        if not self.gpu_ids:
+            raise ValueError("measurement lease gpu_ids must be non-empty")
+        if any(gpu_id < 0 for gpu_id in self.gpu_ids):
+            raise ValueError("measurement lease gpu_ids must be non-negative")
+        if len(set(self.gpu_ids)) != len(self.gpu_ids):
+            raise ValueError("measurement lease gpu_ids must be unique")
+        return self
+
+
+class MeasurementResourcePool(RootModel[tuple[tuple[int, ...], ...]]):
+    """Spica-owned pool of disjoint GPU groups available to evaluators."""
+
+    model_config = ConfigDict(frozen=True)
+
+    @model_validator(mode="after")
+    def _validate_groups(self) -> MeasurementResourcePool:
+        if not self.root:
+            raise ValueError("measurement_gpu_groups must be non-empty when supplied")
+        seen: set[int] = set()
+        for group in self.root:
+            if not group:
+                raise ValueError("each measurement_gpu_groups entry must be non-empty")
+            if any(gpu_id < 0 for gpu_id in group):
+                raise ValueError("measurement_gpu_groups ids must be non-negative")
+            duplicates = seen.intersection(group)
+            if len(set(group)) != len(group) or duplicates:
+                raise ValueError("measurement_gpu_groups must contain disjoint, unique GPU ids")
+            seen.update(group)
+        return self
+
+    def __len__(self) -> int:
+        return len(self.root)
+
+    def lease(self, index: int) -> MeasurementLease:
+        """Materialize one concrete lease without exposing the whole pool to AIC."""
+        return MeasurementLease(gpu_ids=self.root[index])
+
+
+class AicResolutionConfig(BaseModel):
+    """Canonical public AIC resolution policy for one consumer session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy: AicResolutionPolicy
+    on_measurement_failure: MeasurementFailurePolicy = MeasurementFailurePolicy.ERROR
+    overlay_path: Path
+    fallback_cache_dir: Path | None = None
+    max_new_keys: int = Field(default=256, ge=1)
+    # Cumulative online-collection wall budget for the whole session. Sized so the
+    # max_new_keys count cap binds before wall-time at realistic per-measurement cost
+    # (~11s observed on GB200), i.e. a full new-key session completes within budget and
+    # most (smaller) real miss-sets finish in minutes. Per-callback latency is bounded
+    # separately by max_block_seconds; raising this only extends how long a pathological
+    # full miss-set may keep collecting.
+    max_wall_seconds: float = Field(default=3600.0, gt=0)
+    max_block_seconds: float | None = Field(default=None, gt=0)
+    force_remeasure: bool = False
+
+    @staticmethod
+    def _lexically_normalize_path(path: Path) -> Path:
+        """Collapse separators/``.``/``..`` without filesystem or symlink access."""
+
+        normalized = os.path.normpath(path)
+        # POSIX permits implementation-defined semantics for exactly two leading
+        # slashes. AIC has one cross-language contract, so use Rust's single-root
+        # representation rather than preserving Python's special ``//`` case.
+        if normalized.startswith("//"):
+            normalized = f"/{normalized.lstrip('/')}"
+        return Path(normalized)
+
+    @model_validator(mode="after")
+    def _validate_contract(self) -> AicResolutionConfig:
+        if not self.overlay_path.is_absolute():
+            raise ValueError(f"aic_resolution.overlay_path must be absolute, got {self.overlay_path}")
+        self.overlay_path = self._lexically_normalize_path(self.overlay_path)
+        fallback = self.fallback_cache_dir
+        if fallback is None:
+            fallback = Path(f"{self.overlay_path}.live-fallbacks")
+        if not fallback.is_absolute():
+            raise ValueError(f"aic_resolution.fallback_cache_dir must be absolute, got {fallback}")
+        self.fallback_cache_dir = self._lexically_normalize_path(fallback)
+        if not math.isfinite(self.max_wall_seconds):
+            raise ValueError("aic_resolution.max_wall_seconds must be finite and positive")
+        if self.max_block_seconds is not None and not math.isfinite(self.max_block_seconds):
+            raise ValueError("aic_resolution.max_block_seconds must be finite and positive")
+        if (
+            self.policy is AicResolutionPolicy.OBSERVE_ONLY
+            and self.on_measurement_failure is MeasurementFailurePolicy.HYBRID
+        ):
+            raise ValueError("aic_resolution policy=observe_only cannot use on_measurement_failure=hybrid")
+        return self
+
+    def runtime_payload(self, lease: MeasurementLease | None = None) -> dict[str, Any]:
+        """Serialize public policy plus one optional concrete internal lease."""
+        payload = self.model_dump(mode="json", exclude_none=True)
+        if lease is not None:
+            payload["gpu_ids"] = list(lease.gpu_ids)
+        return payload
+
+
 class Candidate(BaseModel):
     """One evaluated configuration and its replay performance."""
 
@@ -631,6 +755,9 @@ class Candidate(BaseModel):
     # OptimizationTarget value (e.g. {"throughput_per_gpu": .., "throughput_per_user": ..});
     # None for a single-objective sweep. Drives Pareto dominance in score.pareto_front.
     objectives: dict[str, float] | None = None
+    # Rich per-callback AIC resolution evidence from the replay that produced this
+    # score. None when resolution was not requested or the replay predates it.
+    aic_resolution_report: dict[str, JsonValue] | None = None
 
 
 class SmartSearchConfig(BaseModel):
@@ -642,6 +769,17 @@ class SmartSearchConfig(BaseModel):
     workload: Workload
     goal: OptimizationGoal = Field(default_factory=OptimizationGoal)
     sweep: SweepConfig = Field(default_factory=SweepConfig)
+    aic_resolution: AicResolutionConfig | None = None
+    measurement_gpu_groups: MeasurementResourcePool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_lazy_collection(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "lazy_collection" in data:
+            raise ValueError(
+                "lazy_collection was removed in AIC V1.3; use aic_resolution and top-level measurement_gpu_groups"
+            )
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -677,6 +815,39 @@ class SmartSearchConfig(BaseModel):
             raise ValueError(
                 "a ranged workload.kv_load_ratio is only allowed when goal.target is 'pareto' "
                 f"(got target={self.goal.target.value}); use one scalar kv_load_ratio"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_measurement_pool_parallelism(self) -> SmartSearchConfig:
+        pool = self.measurement_gpu_groups
+        per_round = self.sweep.candidates_per_round or self.sweep.parallel_evals
+        effective_workers = min(self.sweep.parallel_evals, per_round)
+        if pool is not None and effective_workers > 1 and len(pool) < effective_workers:
+            raise ValueError(
+                "measurement_gpu_groups must provide at least one disjoint group per "
+                f"effective parallel_evals worker ({len(pool)} < {effective_workers}; "
+                f"parallel_evals={self.sweep.parallel_evals}, candidates_per_round={per_round})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_aic_resolution_profile(self) -> SmartSearchConfig:
+        """V1.3 resolution is frozen to the SGLang aggregated profile."""
+
+        if self.aic_resolution is None:
+            return self
+        unsupported_backends = sorted(set(self.search_space.backend) - {"sglang"})
+        if unsupported_backends:
+            raise ValueError(
+                "aic_resolution supports only backend='sglang' in V1.3; "
+                f"search_space.backend includes {unsupported_backends}"
+            )
+        unsupported_modes = sorted(set(self.search_space.deployment_mode) - {"agg"})
+        if unsupported_modes:
+            raise ValueError(
+                "aic_resolution supports only deployment_mode='agg' in V1.3; "
+                f"search_space.deployment_mode includes {unsupported_modes}"
             )
         return self
 

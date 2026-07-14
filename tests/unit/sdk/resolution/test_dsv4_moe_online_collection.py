@@ -256,6 +256,27 @@ def test_literal_curated_moe_row_rejects_frozen_runtime_mismatch(
     assert dsv4_profile_moe.curated_exact_result(database, x=19) is None
 
 
+def test_moe_stable_curated_profile_and_rc0_measurement_use_distinct_keys(
+    dsv4_profile_moe: MoE,
+) -> None:
+    database = _ProfileDatabase()
+    stable_request = dsv4_profile_moe.measurement_request(database, _protocol(), x=19)
+    stable_environment = database.measurement_environment
+    database.measurement_environment = replace(
+        stable_environment,
+        backend_version="0.5.10rc0",
+        runtime_versions={**stable_environment.runtime_versions, "sglang": "0.5.10rc0"},
+    )
+
+    rc0_request = dsv4_profile_moe.measurement_request(database, _protocol(), x=19)
+
+    assert database.version == "0.5.10"
+    assert stable_request is not None and rc0_request is not None
+    assert stable_request.key != rc0_request.key
+    assert stable_request.environment.backend_version == "0.5.10"
+    assert rc0_request.environment.backend_version == "0.5.10rc0"
+
+
 @pytest.mark.parametrize(
     ("environment_overrides", "profile_overrides"),
     [

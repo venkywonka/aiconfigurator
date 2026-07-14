@@ -43,6 +43,10 @@ def bind_request_protocol(request: MeasurementRequest, lazy: LazyOpEntry) -> Mea
         raise ProtocolMismatchError(
             f"request protocol statistic={request.protocol.statistic!r} is unsupported; adapters require 'median'"
         )
+    if request.protocol.samples < 3:
+        raise ProtocolMismatchError(
+            f"request protocol samples={request.protocol.samples!r} is unsupported; adapters require at least three"
+        )
     protocol = replace(
         request.protocol,
         revision=lazy.protocol_revision,
@@ -82,6 +86,10 @@ class ResolvedLazyAdapter:
             raise ProtocolMismatchError(
                 f"request protocol statistic={protocol.statistic!r} is unsupported; adapters require 'median'"
             )
+        if protocol.samples < 3:
+            raise ProtocolMismatchError(
+                f"request protocol samples={protocol.samples!r} is unsupported; adapters require at least three"
+            )
 
         environment = request.environment
         if environment.backend != self.backend:
@@ -104,6 +112,8 @@ class ResolvedLazyAdapter:
         contract = self._resource_func(request, case)
         if not isinstance(contract, ResourceContract):
             raise TypeError("lazy adapter resource function must return ResourceContract")
+        if self.lazy.preflight_resource is not None and contract != self.lazy.preflight_resource:
+            raise ValueError("runtime resource contract does not match the route's preflight resource contract")
         return PreparedMeasurement(request=request, case=case, contract=contract)
 
     def record(

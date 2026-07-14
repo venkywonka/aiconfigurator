@@ -12,7 +12,7 @@ from typing import Any
 
 from aiconfigurator.collector.registry_types import PerfFile
 from aiconfigurator.collector.types import FabricRequirement, ResourceContract
-from aiconfigurator.sdk.resolution.types import MeasurementRecord, MeasurementRequest
+from aiconfigurator.sdk.resolution.types import MeasurementRecord, MeasurementRequest, ProtocolMismatchError
 
 _NAMESPACE = f"{PerfFile.MHC_MODULE}/v1"
 _QUERY_FIELDS = (
@@ -31,8 +31,8 @@ _SEMANTIC_DESCRIPTOR = {
 _RUNTIME_VERSIONS = {
     "cuda": "13.0",
     "model_profile": "dsv4-v1.2",
-    "sglang": "0.5.10",
 }
+_SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _PROFILE_COMPATIBILITY = {
     "model_artifact": "sgl-project/DeepSeek-V4-Flash-FP8",
     "serving_mode": "aggregated",
@@ -56,15 +56,18 @@ def _validate_capability(request: MeasurementRequest, case: Mapping[str, Any]) -
     if (
         environment.system != "gb200"
         or environment.backend != "sglang"
-        or environment.backend_version != "0.5.10"
+        or environment.backend_version not in _SUPPORTED_SGLANG_VERSIONS
+        or environment.runtime_versions.get("sglang") != environment.backend_version
         or _normalized_label(environment.gpu_class) != "nvidia gb200"
         or any(environment.runtime_versions.get(name) != version for name, version in _RUNTIME_VERSIONS.items())
     ):
-        raise ValueError("mHC request is outside the frozen GB200/SGLang 0.5.10 runtime capability envelope")
+        raise ValueError("mHC request is outside the frozen GB200/SGLang runtime capability envelope")
     if dict(environment.profile_compatibility or {}) != _PROFILE_COMPATIBILITY:
         raise ValueError("mHC request profile compatibility does not match the frozen DSv4 V1.2 deployment")
     if dict(request.semantic_descriptor) != _SEMANTIC_DESCRIPTOR:
         raise ValueError("mHC request semantic descriptor does not describe the exact two-site full module")
+    if request.protocol.samples < 3:
+        raise ProtocolMismatchError("mHC measurement protocol samples must be at least three")
     if case["op"] not in {"pre", "post"}:
         raise ValueError("mHC op is outside the frozen pre/post capability envelope")
     if case["hidden_size"] != 4096 or case["hc_mult"] != 4 or case["sinkhorn_iters"] != 20:

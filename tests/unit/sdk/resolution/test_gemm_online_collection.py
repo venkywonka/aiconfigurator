@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -211,6 +212,22 @@ def test_database_rejects_a_measurement_environment_for_another_route(tmp_path: 
         database.set_measurement_environment(wrong)
 
 
+def test_database_keeps_curated_profile_version_separate_from_measurement_runtime(
+    tmp_path: Path,
+) -> None:
+    database = _write_database(tmp_path)
+    runtime_environment = replace(
+        _environment(),
+        backend_version="1.0rc0",
+        runtime_versions={"tensorrt_llm": "1.0rc0"},
+    )
+
+    database.set_measurement_environment(runtime_environment)
+
+    assert database.version == "1.0"
+    assert database.measurement_environment.backend_version == "1.0rc0"
+
+
 def test_bf16_cold_resolution_persists_once_and_warm_reopen_uses_zero_commands(tmp_path: Path) -> None:
     database = _write_database(tmp_path)
     device = GpuDevice(
@@ -288,11 +305,12 @@ def test_bf16_cold_resolution_persists_once_and_warm_reopen_uses_zero_commands(t
                             "k": case["k"],
                             "latency": latency_ms,
                         },
-                        "provenance": {
-                            "worker": "cpu-fake",
-                            "device_uuid": "GPU-test-0",
-                            "framework_version": "1.0",
-                            "device": "test-gpu",
+                            "provenance": {
+                                "worker": "cpu-fake",
+                                "device_uuid": "GPU-test-0",
+                                "framework": "TRTLLM",
+                                "framework_version": "1.0",
+                                "device": "test-gpu",
                         },
                     },
                 )
