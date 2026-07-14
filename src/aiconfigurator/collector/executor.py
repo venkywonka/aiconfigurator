@@ -10,11 +10,14 @@ return raw result mappings; they never construct or persist performance rows.
 
 from __future__ import annotations
 
+import ctypes
 import importlib
 import json
+import math
 import multiprocessing
 import os
 import queue
+import signal
 import tempfile
 import threading
 import time
@@ -123,6 +126,7 @@ class NcclRankBootstrap:
     world_size: int
     device_uuid: str
     protocol: MeasurementProtocol
+    parent_pid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,12 +142,29 @@ class NcclRankCommand:
 
 @dataclass(frozen=True, slots=True)
 class NcclRankReply:
-    """Per-rank completion acknowledgement; only rank zero carries samples."""
+    """Per-rank completion acknowledgement with mode-dependent samples."""
 
     invocation_id: str
     rank: int
     samples_ms: tuple[float, ...] = ()
     error: str | None = None
+
+
+def _install_parent_death_signal(parent_pid: int) -> None:
+    """Kill a rank automatically if its owning persistent worker disappears."""
+
+    if isinstance(parent_pid, bool) or not isinstance(parent_pid, int) or parent_pid <= 0:
+        raise ValueError("rank parent_pid must be a positive integer")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = getattr(libc, "prctl", None)
+    if prctl is None:
+        raise RuntimeError("persistent ranks require Linux prctl parent-death support")
+    if prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+        raise RuntimeError("persistent rank parent exited during startup")
 
 
 def _nccl_alltoall_splits(
@@ -288,9 +309,12 @@ def nccl_rank_process_main(
     reply_queue: Any,
     *,
     runtime_factory: Callable[[NcclRankBootstrap], Any] = _TorchNcclRankBackend,
+    all_rank_samples: bool = False,
 ) -> None:
     """Initialize one NCCL rank once and serve independent exact cases."""
 
+    if bootstrap.parent_pid is not None:
+        _install_parent_death_signal(bootstrap.parent_pid)
     backend = runtime_factory(bootstrap)
     command: NcclRankCommand | None = None
     failed = False
@@ -326,7 +350,7 @@ def nccl_rank_process_main(
                     NcclRankReply(
                         invocation_id=command.invocation_id,
                         rank=bootstrap.rank,
-                        samples_ms=samples if bootstrap.rank == 0 else (),
+                        samples_ms=samples if bootstrap.rank == 0 or all_rank_samples else (),
                     )
                 )
             except BaseException:
@@ -365,6 +389,7 @@ class PersistentNcclRankGroup:
         protocol: MeasurementProtocol,
         context_getter: Callable[[str], Any] = multiprocessing.get_context,
         worker_target: Callable[..., None] = nccl_rank_process_main,
+        collect_all_rank_samples: bool = False,
         reply_timeout_seconds: float = 120.0,
         shutdown_timeout_seconds: float = 5.0,
     ) -> None:
@@ -374,11 +399,14 @@ class PersistentNcclRankGroup:
             raise ValueError("persistent NCCL group device UUIDs must be unique")
         if not isinstance(protocol, MeasurementProtocol):
             raise TypeError("persistent NCCL group protocol must be a MeasurementProtocol")
+        if not isinstance(collect_all_rank_samples, bool):
+            raise TypeError("collect_all_rank_samples must be a bool")
         if reply_timeout_seconds <= 0 or shutdown_timeout_seconds < 0:
             raise ValueError("persistent NCCL group timeouts must be positive")
 
         self._device_uuids = device_uuids
         self._protocol = protocol
+        self._collect_all_rank_samples = collect_all_rank_samples
         self._reply_timeout_seconds = reply_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._context = context_getter("spawn")
@@ -399,6 +427,7 @@ class PersistentNcclRankGroup:
                     world_size=len(device_uuids),
                     device_uuid=device_uuid,
                     protocol=protocol,
+                    parent_pid=os.getpid(),
                 )
                 process = self._context.Process(
                     target=worker_target,
@@ -408,8 +437,11 @@ class PersistentNcclRankGroup:
                 process.start()
                 self._command_queues.append(command_queue)
                 self._processes.append(process)
-        except BaseException:
-            self._poison()
+        except BaseException as error:
+            try:
+                self._poison()
+            except BaseException as shutdown_error:
+                raise shutdown_error from error
             raise
         finally:
             if previous_init_method is None:
@@ -463,13 +495,17 @@ class PersistentNcclRankGroup:
         for command_queue in self._command_queues:
             command_queue.put(command)
 
-        rank_zero_samples: tuple[float, ...] | None = None
+        rank_samples: dict[int, tuple[float, ...]] = {}
         completed_ranks: set[int] = set()
         try:
             for _ in self._processes:
                 reply = self._get_reply()
                 if not isinstance(reply, NcclRankReply):
                     raise TypeError("persistent NCCL rank returned a malformed reply")
+                if reply.invocation_id == "" and reply.error is not None:
+                    if reply.rank in completed_ranks or not 0 <= reply.rank < len(self._processes):
+                        raise RuntimeError("persistent NCCL rank reply has an invalid rank")
+                    raise RuntimeError(f"persistent NCCL rank {reply.rank} initialization failed:\n{reply.error}")
                 if reply.invocation_id != command.invocation_id:
                     raise RuntimeError("persistent NCCL rank reply identity mismatch")
                 if reply.rank in completed_ranks or not 0 <= reply.rank < len(self._processes):
@@ -477,18 +513,42 @@ class PersistentNcclRankGroup:
                 if reply.error is not None:
                     raise RuntimeError(reply.error)
                 completed_ranks.add(reply.rank)
-                if reply.rank == 0:
-                    rank_zero_samples = tuple(reply.samples_ms)
-                elif reply.samples_ms:
+                samples = tuple(reply.samples_ms)
+                if self._collect_all_rank_samples:
+                    if len(samples) != self._protocol.samples:
+                        raise RuntimeError("persistent rank returned an invalid sample count")
+                    if any(
+                        isinstance(sample, bool)
+                        or not isinstance(sample, (int, float))
+                        or not math.isfinite(float(sample))
+                        or sample <= 0
+                        for sample in samples
+                    ):
+                        raise RuntimeError("persistent rank samples must be positive finite numbers")
+                    rank_samples[reply.rank] = samples
+                elif reply.rank == 0:
+                    rank_samples[0] = samples
+                elif samples:
                     raise RuntimeError("only NCCL rank zero may return timing samples")
+            if self._collect_all_rank_samples:
+                if len(rank_samples) != len(self._processes):
+                    raise RuntimeError("persistent rank group did not return samples from every rank")
+                return tuple(
+                    max(rank_samples[rank][sample_index] for rank in rank_samples)
+                    for sample_index in range(self._protocol.samples)
+                )
+            rank_zero_samples = rank_samples.get(0)
             if rank_zero_samples is None or len(rank_zero_samples) != self._protocol.samples:
                 raise RuntimeError("NCCL rank zero returned an invalid sample count")
             return rank_zero_samples
-        except BaseException:
-            self._poison()
+        except BaseException as error:
+            try:
+                self._poison()
+            except BaseException as shutdown_error:
+                raise shutdown_error from error
             raise
 
-    def _join_or_kill(self, process: Any) -> None:
+    def _join_or_kill(self, process: Any) -> bool:
         process.join(self._shutdown_timeout_seconds)
         if process.is_alive():
             process.terminate()
@@ -498,6 +558,7 @@ class PersistentNcclRankGroup:
             if callable(kill):
                 kill()
                 process.join(self._shutdown_timeout_seconds)
+        return not process.is_alive()
 
     def _cleanup(self, *, forced: bool) -> None:
         for queue_object in (*self._command_queues, self._reply_queue):
@@ -526,7 +587,10 @@ class PersistentNcclRankGroup:
                 kill()
         for process in survivors:
             process.join(self._shutdown_timeout_seconds)
+        remaining_ranks = tuple(rank for rank, process in enumerate(self._processes) if process.is_alive())
         self._cleanup(forced=True)
+        if remaining_ranks:
+            raise RuntimeError(f"persistent rank processes {remaining_ranks!r} survived forced shutdown")
 
     def close(self) -> None:
         if self._closed:
@@ -536,9 +600,10 @@ class PersistentNcclRankGroup:
             return
         for command_queue in self._command_queues:
             command_queue.put(None)
-        for process in self._processes:
-            self._join_or_kill(process)
-        self._cleanup(forced=False)
+        remaining_ranks = tuple(rank for rank, process in enumerate(self._processes) if not self._join_or_kill(process))
+        self._cleanup(forced=bool(remaining_ranks))
+        if remaining_ranks:
+            raise RuntimeError(f"persistent rank processes {remaining_ranks!r} survived forced shutdown")
 
 
 @dataclass(frozen=True, slots=True)

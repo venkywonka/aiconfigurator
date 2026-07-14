@@ -76,12 +76,178 @@ class CustomAllReduce(Operation):
 
     _data_cache: ClassVar[dict] = {}
     _CP_AWARE: ClassVar[bool] = True  # query divides x by self._seq_split (smaller per-rank AR payload)
+    _V1_2_RUNTIME_VERSIONS: ClassVar[dict[str, str]] = {
+        "cuda": "13.0",
+        "model_profile": "dsv4-v1.2",
+        "sglang": "0.5.10",
+    }
+    _V1_2_PROFILE_COMPATIBILITY: ClassVar[dict[str, object]] = {
+        "model_artifact": "sgl-project/DeepSeek-V4-Flash-FP8",
+        "serving_mode": "aggregated",
+        "tp_size": 4,
+        "attention_dp_size": 1,
+        "cp_size": 1,
+        "pp_size": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 4,
+        "nextn": 0,
+    }
 
     def __init__(self, name: str, scale_factor: float, h: int, tp_size: int, *, seq_split: int = 1) -> None:
         super().__init__(name, scale_factor, seq_split=seq_split)
         self._h = h
         self._tp_size = tp_size
         self._weights = 0.0
+
+    def is_resolution_deterministic(self, **kwargs: object) -> bool:
+        """TP1 is a reviewed no-op and needs no measurement evidence."""
+
+        del kwargs
+        return self._tp_size == 1
+
+    def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
+        """Normalize the exact physical collective used by prediction."""
+
+        x = kwargs.get("x")
+        if isinstance(x, bool) or not isinstance(x, int):
+            raise TypeError("CustomAllReduce token count must be an integer")
+        if x <= 0:
+            raise ValueError("CustomAllReduce token count must be positive")
+        elements = (-(-x // self._seq_split)) * self._h
+        return {
+            "dtype": common.CommQuantMode.half.name,
+            "operation": "all_reduce",
+            "world_size": self._tp_size,
+            "elements": elements,
+        }
+
+    @staticmethod
+    def _measurement_environment(database: PerfDatabase) -> MeasurementEnvironment:
+        environment = getattr(database, "measurement_environment", None)
+        if not isinstance(environment, MeasurementEnvironment):
+            raise TypeError("CustomAllReduce lazy collection requires a bound MeasurementEnvironment")
+        expected = (database.system, database.backend, database.version)
+        actual = (environment.system, environment.backend, environment.backend_version)
+        if actual != expected:
+            raise ValueError("database measurement environment does not match system/backend/version")
+        return environment
+
+    def measurement_request(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._measurement_request_from_normalized(
+            database,
+            protocol,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _measurement_request_from_normalized(
+        self,
+        database: PerfDatabase,
+        protocol: MeasurementProtocol,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> MeasurementRequest | None:
+        del kwargs
+        if int(normalized_query["world_size"]) <= 1:
+            return None
+        query = dict(normalized_query)
+        environment = self._measurement_environment(database)
+        namespace = perf_namespace("custom_allreduce_perf.txt")
+        return MeasurementRequest(
+            op_id=self._name,
+            key=PerfKey.build(namespace, query, environment),
+            query=query,
+            environment=environment,
+            semantic_descriptor={
+                "operation": "all_reduce",
+                "implementation": "sglang_custom_allreduce",
+                "mode": "graph",
+            },
+            protocol=protocol,
+        )
+
+    def curated_exact_result(self, database: PerfDatabase, **kwargs) -> PerformanceResult | None:
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._curated_exact_result_from_normalized(
+            database,
+            normalized_query=normalized,
+            **kwargs,
+        )
+
+    def _is_v1_2_curated_compatible(self, database: PerfDatabase) -> bool:
+        environment = getattr(database, "measurement_environment", None)
+        return bool(
+            isinstance(environment, MeasurementEnvironment)
+            and environment.system == "gb200"
+            and environment.backend == "sglang"
+            and environment.backend_version == "0.5.10"
+            and " ".join(environment.gpu_class.split()).casefold() == "nvidia gb200"
+            and isinstance(environment.topology_schema, str)
+            and bool(environment.topology_schema.strip())
+            and isinstance(environment.topology_fingerprint, str)
+            and bool(environment.topology_fingerprint.strip())
+            and all(
+                environment.runtime_versions.get(name) == version
+                for name, version in self._V1_2_RUNTIME_VERSIONS.items()
+            )
+            and dict(environment.profile_compatibility or {}) == self._V1_2_PROFILE_COMPATIBILITY
+        )
+
+    def _curated_exact_result_from_normalized(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult | None:
+        del kwargs
+        if not self._is_v1_2_curated_compatible(database):
+            return None
+        try:
+            dtype = common.CommQuantMode[str(normalized_query["dtype"])]
+            if normalized_query["operation"] != "all_reduce":
+                return None
+            world_size = int(normalized_query["world_size"])
+            elements = int(normalized_query["elements"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        self.load_data(database)
+        wrapper = getattr(database, "_custom_allreduce_data", None)
+        if wrapper is None:
+            return None
+        value: object = wrapper.data if hasattr(wrapper, "data") else wrapper
+        try:
+            for component in (dtype, world_size, "AUTO", elements):
+                if not isinstance(value, Mapping):
+                    return None
+                value = value[component]
+        except KeyError:
+            return None
+        if isinstance(value, Mapping):
+            try:
+                latency = float(value["latency"])
+                energy = float(value.get("energy", 0.0))
+            except (KeyError, TypeError, ValueError):
+                return None
+        else:
+            try:
+                latency = float(value)
+            except (TypeError, ValueError):
+                return None
+            energy = 0.0
+        return PerformanceResult(
+            latency * self._scale_factor,
+            energy=energy * self._scale_factor,
+            source="curated_exact",
+            provenance={"curated_path": getattr(wrapper, "filepath", None)},
+        )
 
     # ------------------------------------------------------------------
     # Data ownership
@@ -264,10 +430,32 @@ class CustomAllReduce(Operation):
             # ``silicon`` so EMPIRICAL/SOL modes don't get a spurious
             # silicon leakage in the breakdown report.
             return PerformanceResult(0.0, 0.0, source="empirical")
-        # count, not size in bytes
-        size = (-(-kwargs.get("x") // self._seq_split)) * self._h  # CP: ceil = busiest rank
+        normalized = self.normalize_perf_query(**kwargs)
+        return self._query_from_normalized(database, normalized)
 
-        result = database.query_custom_allreduce(common.CommQuantMode.half, self._tp_size, size)
+    def provisional_result(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> PerformanceResult:
+        del kwargs
+        return self._query_from_normalized(database, normalized_query)
+
+    def _query_from_normalized(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
+        dtype = common.CommQuantMode[str(normalized_query["dtype"])]
+        world_size = int(normalized_query["world_size"])
+        operation = str(normalized_query["operation"])
+        elements = int(normalized_query["elements"])
+        if operation != "all_reduce":
+            raise ValueError(f"unsupported CustomAllReduce operation {operation!r}")
+
+        result = database.query_custom_allreduce(dtype, world_size, elements)
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import pickle
 import subprocess
 from dataclasses import replace
@@ -50,6 +51,43 @@ TOPOLOGY = dedent(
     GPU2    SYS  SYS  X    NV4  32-63        1
     GPU3    SYS  SYS  NV4  X    32-63        1
     """
+)
+
+# Exact container bytes captured by the bounded no-measurement OCI-HSG probe
+# 4277198 on nvl72078-T01. Keep the SGR sequences: they are the regression.
+GB200_ANSI_TOPOLOGY = (
+    "\t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tCPU Affinity\t"
+    "NUMA Affinity\tGPU NUMA ID\x1b[0m\n"
+    "GPU0\t X \tNV18\tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-35\t0\t\tN/A\n"
+    "GPU1\tNV18\t X \tNV18\tNV18\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-35\t0\t\tN/A\n"
+    "GPU2\tNV18\tNV18\t X \tNV18\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t\t1\t\tN/A\n"
+    "GPU3\tNV18\tNV18\tNV18\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t\t1\t\tN/A\n"
+    "NIC0\tNODE\tNODE\tNODE\tNODE\t X \tNODE\tNODE\tNODE\tNODE\tNODE\t\t\t\t\n"
+    "NIC1\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tNODE\tNODE\tNODE\tNODE\t\t\t\t\n"
+    "NIC2\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tNODE\tNODE\tNODE\t\t\t\t\n"
+    "NIC3\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tNODE\tNODE\t\t\t\t\n"
+    "NIC4\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tNODE\t\t\t\t\n"
+    "NIC5\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \t\t\t\t\n"
+    "\n"
+    "Legend:\n"
+    "\n"
+    "  X    = Self\n"
+    "  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n"
+    "  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n"
+    "  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n"
+    "  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n"
+    "  PIX  = Connection traversing at most a single PCIe bridge\n"
+    "  NV#  = Connection traversing a bonded set of # NVLinks\n"
+    "\n"
+    "NIC Legend:\n"
+    "\n"
+    "  NIC0: mlx5_0\n"
+    "  NIC1: mlx5_1\n"
+    "  NIC2: mlx5_2\n"
+    "  NIC3: mlx5_3\n"
+    "  NIC4: mlx5_4\n"
+    "  NIC5: mlx5_5\n"
+    "\n"
 )
 
 P2P_OK_WITHIN_DOMAINS = dedent(
@@ -171,6 +209,55 @@ def test_topology_normalizes_row_order_and_rejects_unsafe_structure() -> None:
         assert parse_topology(topology, two_devices) == {(0, 1): token, (1, 0): token}
 
 
+def test_topology_parser_accepts_exact_ansi_sgr_gb200_capture() -> None:
+    assert hashlib.sha256(GB200_ANSI_TOPOLOGY.encode()).hexdigest() == (
+        "cca8b1e86930da4776987fdd3fe8160e6e3093342c4c99a9a030cfd9c5b29999"
+    )
+    devices = parse_gpu_query(GPU_QUERY)
+    links = parse_topology(GB200_ANSI_TOPOLOGY, devices)
+    assert len(links) == 12
+    assert set(links.values()) == {"NV18"}
+
+
+def test_topology_parser_accepts_compound_sgr_but_not_other_csi_sequences() -> None:
+    devices = parse_gpu_query(GPU_QUERY)
+    compound_sgr = TOPOLOGY.replace("GPU0 GPU1 GPU2 GPU3", "\x1b[1;4mGPU0 GPU1 GPU2 GPU3\x1b[0m", 1)
+    assert len(parse_topology(compound_sgr, devices)) == 12
+
+    non_sgr_csi = TOPOLOGY.replace("GPU0 GPU1 GPU2 GPU3", "\x1b[2KGPU0 GPU1 GPU2 GPU3", 1)
+    with pytest.raises(HardwareDiscoveryError, match="matrix columns"):
+        parse_topology(non_sgr_csi, devices)
+
+
+@pytest.mark.parametrize(
+    "header",
+    (
+        "\x1b[4mGPU1 GPU2 GPU3\x1b[0m",
+        "\x1b[4mGPU1 GPU0 GPU2 GPU3\x1b[0m",
+        "\x1b[4mGPU0 GPU0 GPU2 GPU3\x1b[0m",
+        "\x1b[4mGPX0 GPU1 GPU2 GPU3\x1b[0m",
+    ),
+)
+def test_sgr_wrapped_unsafe_topology_headers_still_fail_closed(header: str) -> None:
+    devices = parse_gpu_query(GPU_QUERY)
+    topology = TOPOLOGY.replace("GPU0 GPU1 GPU2 GPU3", header, 1)
+    with pytest.raises(HardwareDiscoveryError, match="matrix columns"):
+        parse_topology(topology, devices)
+
+
+@pytest.mark.parametrize(
+    "topology",
+    (
+        GB200_ANSI_TOPOLOGY.replace("GPU0\t X ", "GPU0\t OK ", 1),
+        GB200_ANSI_TOPOLOGY.replace("GPU0\t X \tNV18", "GPU0\t X \tFOO", 1),
+        GB200_ANSI_TOPOLOGY.replace("GPU1\tNV18", "GPU1\tSYS", 1),
+    ),
+)
+def test_sgr_wrapped_invalid_topology_payloads_still_fail_closed(topology: str) -> None:
+    with pytest.raises(HardwareDiscoveryError):
+        parse_topology(topology, parse_gpu_query(GPU_QUERY))
+
+
 def test_p2p_parser_keeps_directionality_and_treats_only_ok_as_capable() -> None:
     devices = parse_gpu_query("0, GPU-a, NVIDIA H100, 0000:01:00.0\n1, GPU-b, NVIDIA H100, 0000:02:00.0")
     negative_statuses = ("CNS", "GNS", "TNS", "NS", "U", "DR")
@@ -200,6 +287,14 @@ def test_p2p_parser_keeps_directionality_and_treats_only_ok_as_capable() -> None
 
     with_legend = "GPU0 GPU1\nGPU0 X OK\nGPU1 OK X\n\nLegend:\n  OK = Supported\n  NS = Not supported"
     assert parse_p2p_matrix(with_legend, devices) == {(0, 1): True, (1, 0): True}
+
+    sgr_matrix = P2P_OK_WITHIN_DOMAINS.replace("GPU0 GPU1 GPU2 GPU3", "\x1b[1;4mGPU0 GPU1 GPU2 GPU3\x1b[0m", 1)
+    four_devices = parse_gpu_query(GPU_QUERY)
+    assert parse_p2p_matrix(sgr_matrix, four_devices) == parse_p2p_matrix(P2P_OK_WITHIN_DOMAINS, four_devices)
+    with pytest.raises(HardwareDiscoveryError, match="invalid matrix row width"):
+        parse_p2p_matrix(
+            sgr_matrix.replace("GPU0    X    OK   NS   NS", "GPU0    X    OK   NS   NS EXTRA"), four_devices
+        )
 
 
 def test_discovery_requires_explicit_four_direction_peer_capability() -> None:

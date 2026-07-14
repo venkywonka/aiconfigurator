@@ -9,6 +9,7 @@ add a ``versions`` tuple following the trtllm registry pattern.
 """
 
 from aiconfigurator.collector.sglang.registry import (
+    CUSTOM_ALLREDUCE_LAZY_SPEC,
     DSV4_CSA_CONTEXT_LAZY_SPEC,
     DSV4_CSA_GENERATION_LAZY_SPEC,
     DSV4_HCA_CONTEXT_LAZY_SPEC,
@@ -70,6 +71,14 @@ REGISTRY: list[OpEntry] = [
         run_func="run_moe_torch",
         perf_filename=PerfFile.MOE,
         lazy=MOE_LAZY_SPEC,
+    ),
+    OpEntry(
+        op="custom_allreduce",
+        module="collector.sglang.custom_allreduce",
+        get_func="get_custom_allreduce_test_cases",
+        run_func="run_custom_allreduce_case",
+        perf_filename=PerfFile.CUSTOM_ALLREDUCE,
+        lazy=CUSTOM_ALLREDUCE_LAZY_SPEC,
     ),
     OpEntry(
         op="attention_context",

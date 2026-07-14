@@ -34,6 +34,19 @@ MOE_LAZY_SPEC = LazyOpEntry(
     tuning_revision="sglang-moe-v1",
 )
 
+CUSTOM_ALLREDUCE_LAZY_SPEC = LazyOpEntry(
+    namespace=perf_namespace(str(PerfFile.CUSTOM_ALLREDUCE)),
+    run_module="aiconfigurator.collector.sglang.custom_allreduce",
+    run_func="run_custom_allreduce_case",
+    adapter_module="aiconfigurator.collector.sglang.custom_allreduce_adapter",
+    case_func="custom_allreduce_request_to_case",
+    result_func="custom_allreduce_result_to_record",
+    resource_func="custom_allreduce_resource_for_request",
+    protocol_revision="cuda-event-samples-v1",
+    timer="cuda_event",
+    tuning_revision="sglang-custom-allreduce-v1",
+)
+
 
 def _dsv4_attention_lazy_spec(perf_file: PerfFile) -> LazyOpEntry:
     return LazyOpEntry(
@@ -81,6 +94,14 @@ SGLANG_LAZY_REGISTRY = (
         lazy=MOE_LAZY_SPEC,
     ),
     OpEntry(
+        op="custom_allreduce",
+        module="aiconfigurator.collector.sglang.custom_allreduce",
+        get_func="get_custom_allreduce_test_cases",
+        run_func="run_custom_allreduce_case",
+        perf_filename=PerfFile.CUSTOM_ALLREDUCE,
+        lazy=CUSTOM_ALLREDUCE_LAZY_SPEC,
+    ),
+    OpEntry(
         op="dsv4_csa_context_module",
         module="aiconfigurator.collector.sglang.dsv4_attn",
         get_func="get_dsv4_attn_test_cases",
@@ -115,6 +136,7 @@ SGLANG_LAZY_REGISTRY = (
 )
 
 __all__ = [
+    "CUSTOM_ALLREDUCE_LAZY_SPEC",
     "DSV4_CSA_CONTEXT_LAZY_SPEC",
     "DSV4_CSA_GENERATION_LAZY_SPEC",
     "DSV4_HCA_CONTEXT_LAZY_SPEC",

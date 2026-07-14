@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import importlib
+import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -57,6 +59,8 @@ class _Queue:
         self.puts: list[object] = []
         self.get_factory: Callable[[], object] | None = None
         self.get_calls = 0
+        self.close_calls = 0
+        self.cancel_join_thread_calls = 0
 
     def get(self) -> object:
         self.get_calls += 1
@@ -66,6 +70,12 @@ class _Queue:
 
     def put(self, item: object) -> None:
         self.puts.append(item)
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def cancel_join_thread(self) -> None:
+        self.cancel_join_thread_calls += 1
 
 
 @dataclass
@@ -83,6 +93,7 @@ class _Process:
     alive: bool = True
     finish_on_join: bool = True
     finish_on_terminate: bool = True
+    finish_on_kill: bool = True
 
     def start(self) -> None:
         self.start_calls += 1
@@ -103,7 +114,8 @@ class _Process:
     def kill(self) -> None:
         self.event_log.append(("kill", self.rank))
         self.kill_calls += 1
-        self.alive = False
+        if self.finish_on_kill:
+            self.alive = False
 
     def is_alive(self) -> bool:
         return self.alive
@@ -170,6 +182,7 @@ def test_rank_group_spawns_one_process_per_assigned_gpu_and_reuses_one_lease() -
             world_size=3,
             device_uuid=("GPU-a", "GPU-b", "GPU-c")[rank],
             protocol=_protocol(),
+            parent_pid=os.getpid(),
         )
         assert process.target is worker_target
         assert process.daemon is False
@@ -298,6 +311,110 @@ def test_rank_group_returns_only_the_correlated_rank0_samples() -> None:
         assert command.protocol == _protocol()
 
 
+def test_rank_group_can_aggregate_correlated_samples_from_every_rank() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+        collect_all_rank_samples=True,
+    )
+    command_queues, reply_queue = _rank_queues(context)
+    rank_samples = ((1.0, 1.5, 2.0), (1.2, 1.4, 2.5))
+    replies_seen = 0
+
+    def reply() -> object:
+        nonlocal replies_seen
+        command = command_queues[0].puts[-1]
+        rank = replies_seen
+        replies_seen += 1
+        return api.NcclRankReply(
+            invocation_id=command.invocation_id,
+            rank=rank,
+            samples_ms=rank_samples[rank],
+        )
+
+    reply_queue.get_factory = reply
+
+    assert group.measure("half", "all_reduce", 4096) == (1.2, 1.5, 2.5)
+
+
+@pytest.mark.parametrize("invalid_sample", [0.0, -1.0, math.nan])
+def test_all_rank_aggregation_rejects_invalid_rank_samples_before_they_can_be_masked(
+    invalid_sample: float,
+) -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+        collect_all_rank_samples=True,
+    )
+    command_queues, reply_queue = _rank_queues(context)
+    rank_samples = ((1.0, 1.5, 2.0), (invalid_sample, 1.4, 2.5))
+    replies_seen = 0
+
+    def reply() -> object:
+        nonlocal replies_seen
+        command = command_queues[0].puts[-1]
+        rank = replies_seen
+        replies_seen += 1
+        return api.NcclRankReply(
+            invocation_id=command.invocation_id,
+            rank=rank,
+            samples_ms=rank_samples[rank],
+        )
+
+    reply_queue.get_factory = reply
+
+    with pytest.raises(RuntimeError, match="positive finite"):
+        group.measure("half", "all_reduce", 4096)
+    assert group.poisoned is True
+
+
+def test_rank_worker_installs_parent_death_signal_and_can_return_all_rank_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = importlib.import_module("aiconfigurator.collector.executor")
+    api = _api()
+    parent_death_calls: list[int] = []
+    monkeypatch.setattr(
+        executor,
+        "_install_parent_death_signal",
+        lambda parent_pid: parent_death_calls.append(parent_pid),
+    )
+    protocol = _protocol()
+    command = api.NcclRankCommand(
+        invocation_id="all-ranks",
+        dtype="half",
+        operation="all_reduce",
+        element_count=4096,
+        protocol=protocol,
+    )
+    reply_queue = _Queue()
+    api.nccl_rank_process_main(
+        api.NcclRankBootstrap(
+            rank=1,
+            world_size=2,
+            device_uuid="GPU-b",
+            protocol=protocol,
+            parent_pid=12345,
+        ),
+        _Queue(command, None),
+        reply_queue,
+        runtime_factory=lambda _: _FakeCollectiveBackend(),
+        all_rank_samples=True,
+    )
+
+    assert parent_death_calls == [12345]
+    assert len(reply_queue.puts) == 1
+    assert len(reply_queue.puts[0].samples_ms) == protocol.samples
+
+
 def test_rank_failure_poison_terminates_all_ranks_without_waiting_or_barrier() -> None:
     api = _api()
     context = _SpawnContext()
@@ -353,6 +470,76 @@ def test_rank_failure_poison_terminates_all_ranks_without_waiting_or_barrier() -
     assert backend.barrier_calls == 0
 
 
+def test_rank_group_surfaces_empty_invocation_initialization_error_before_identity_mismatch() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    _, reply_queue = _rank_queues(context)
+    initialization_error = "ValueError: invalid literal for int() with base 10: 'GPU-a'"
+    reply_queue.get_factory = lambda: api.NcclRankReply(
+        invocation_id="",
+        rank=0,
+        error=initialization_error,
+    )
+
+    with pytest.raises(RuntimeError, match="rank 0 initialization failed") as failure:
+        group.measure("half", "all_reduce", 4096)
+
+    assert initialization_error in str(failure.value)
+    assert group.poisoned is True
+    assert reply_queue.get_calls == 1
+
+
+def test_rank_group_rejects_empty_invocation_without_initialization_error() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    _, reply_queue = _rank_queues(context)
+    reply_queue.get_factory = lambda: api.NcclRankReply(
+        invocation_id="",
+        rank=0,
+    )
+
+    with pytest.raises(RuntimeError, match="reply identity mismatch"):
+        group.measure("half", "all_reduce", 4096)
+
+    assert group.poisoned is True
+    assert reply_queue.get_calls == 1
+
+
+def test_rank_group_rejects_nonempty_stale_reply_before_its_secondary_error() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    _, reply_queue = _rank_queues(context)
+    reply_queue.get_factory = lambda: api.NcclRankReply(
+        invocation_id="stale-invocation",
+        rank=0,
+        error="stale rank error must not mask identity mismatch",
+    )
+
+    with pytest.raises(RuntimeError, match="reply identity mismatch"):
+        group.measure("half", "all_reduce", 4096)
+
+    assert group.poisoned is True
+    assert reply_queue.get_calls == 1
+
+
 def test_rank_failure_poison_kills_survivors_after_bounded_whole_group_join() -> None:
     api = _api()
     context = _SpawnContext()
@@ -398,3 +585,59 @@ def test_rank_failure_poison_kills_survivors_after_bounded_whole_group_join() ->
     ]
     assert [process.kill_calls for process in context.processes] == [1, 1]
     assert not any(process.is_alive() for process in context.processes)
+
+
+def test_close_reports_rank_that_survives_kill_after_forced_cleanup() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    for process in context.processes:
+        process.finish_on_join = False
+        process.finish_on_terminate = False
+        process.finish_on_kill = False
+
+    with pytest.raises(RuntimeError, match=r"survived.*shutdown"):
+        group.close()
+
+    assert [process.kill_calls for process in context.processes] == [1, 1]
+    assert all(queue.close_calls == 1 for queue in context.queues)
+
+
+def test_poison_reports_rank_that_survives_kill_without_hiding_original_failure() -> None:
+    api = _api()
+    context = _SpawnContext()
+    group = api.PersistentNcclRankGroup(
+        device_uuids=("GPU-a", "GPU-b"),
+        protocol=_protocol(),
+        context_getter=lambda method: context if method == "spawn" else None,
+        worker_target=object(),
+    )
+    command_queues, reply_queue = _rank_queues(context)
+    for process in context.processes:
+        process.finish_on_join = False
+        process.finish_on_terminate = False
+        process.finish_on_kill = False
+
+    def failed_reply() -> object:
+        command = command_queues[0].puts[-1]
+        return api.NcclRankReply(
+            invocation_id=command.invocation_id,
+            rank=1,
+            error="rank 1 crashed",
+        )
+
+    reply_queue.get_factory = failed_reply
+
+    with pytest.raises(RuntimeError, match=r"survived.*shutdown") as failure:
+        group.measure("half", "all_reduce", 4096)
+
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    assert "rank 1 crashed" in str(failure.value.__cause__)
+    assert [process.kill_calls for process in context.processes] == [1, 1]
+    assert all(queue.close_calls == 1 for queue in context.queues)
+    assert all(queue.cancel_join_thread_calls == 1 for queue in context.queues)

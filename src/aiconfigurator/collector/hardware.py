@@ -32,6 +32,7 @@ _P2P_READ_COMMAND = ("nvidia-smi", "topo", "-p2p", "r")
 _P2P_WRITE_COMMAND = ("nvidia-smi", "topo", "-p2p", "w")
 _PROBE_TIMEOUT_SECONDS = 10.0
 _P2P_NEGATIVE_STATUSES = frozenset({"CNS", "GNS", "TNS", "NS", "U", "DR"})
+_ANSI_SGR_SEQUENCE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class HardwareDiscoveryError(RuntimeError):
@@ -78,7 +79,8 @@ def _matrix_rows(
     *,
     allow_trailing_fields: bool,
 ) -> dict[int, list[str]]:
-    lines = [line for line in text.splitlines() if line.strip()]
+    parsing_text = _ANSI_SGR_SEQUENCE.sub("", text)
+    lines = [line for line in parsing_text.splitlines() if line.strip()]
     if not lines:
         raise HardwareDiscoveryError("empty nvidia-smi matrix")
     columns = [int(value) for value in re.findall(r"\bGPU([0-9]+)\b", lines[0])]
