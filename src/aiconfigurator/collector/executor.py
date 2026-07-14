@@ -76,7 +76,7 @@ class PersistentNcclRuntime:
     """
 
     _OPERATIONS = frozenset({"all_reduce", "all_gather", "reduce_scatter", "alltoall"})
-    _DTYPES = frozenset({"half", "int8"})
+    _DTYPES = frozenset({"half", "bfloat16", "int8"})
 
     def __init__(
         self,
@@ -274,7 +274,11 @@ class _TorchNcclRankBackend:
     ) -> tuple[Callable[[], None], Callable[[], None]]:
         torch = self._torch
         dist = self._dist
-        dtype = {"half": torch.float16, "int8": torch.int8}[dtype_name]
+        dtype = {
+            "half": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "int8": torch.int8,
+        }[dtype_name]
         world_size = self._bootstrap.world_size
 
         if operation == "all_reduce":

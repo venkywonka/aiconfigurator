@@ -15,6 +15,7 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from importlib import import_module
 from importlib.metadata import version as get_version
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,25 @@ class PreparedMhcCase:
     sinkhorn_iters: int
     quant_mode: str
     cleanup: Callable[[], None] = _noop_cleanup
+
+
+@dataclass(slots=True)
+class MhcRuntime:
+    """Reusable invariant SGLang model state for a compatible mHC sweep."""
+
+    model_runner: Any
+    torch_module: Any
+    cleanup_distributed: Callable[[], None]
+    framework_version: str
+    device_name: str
+    device: Any
+    architecture: str
+    model_artifact: str
+    hidden_size: int
+    hc_mult: int
+    sinkhorn_iters: int
+    mem_fraction_static: float
+    closed: bool = False
 
 
 def _read_model_config(model_id: str) -> dict[str, Any]:
@@ -106,6 +126,14 @@ def _cleanup_temporary_model_dirs() -> None:
         raise cleanup_errors[0]
 
 
+def _reset_sglang_process_globals() -> None:
+    """Release SGLang state that its distributed teardown leaves populated."""
+
+    expert_location = import_module("sglang.srt.eplb.expert_location")
+    if hasattr(expert_location, "_global_expert_location_metadata"):
+        expert_location._global_expert_location_metadata = None
+
+
 def _cleanup_mhc_runtime(
     model_runner,
     *,
@@ -131,6 +159,7 @@ def _cleanup_mhc_runtime(
 
     for cleanup in (
         cleanup_distributed,
+        _reset_sglang_process_globals,
         collect_garbage,
         torch_module.cuda.empty_cache,
         _cleanup_temporary_model_dirs,
@@ -214,6 +243,78 @@ def _load_one_layer_runner(
     )
 
 
+def open_mhc_runtime(
+    *,
+    model_path: str,
+    device: str = "cuda:0",
+    mem_fraction_static: float = 0.5,
+) -> MhcRuntime:
+    """Load one SGLang mHC layer for reuse by compatible exact cases."""
+
+    if not 0 < mem_fraction_static <= 1:
+        raise ValueError("mHC mem_fraction_static must be in (0, 1]")
+    os.environ.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
+    os.environ.setdefault("SGLANG_OPT_DEEPGEMM_HC_PRENORM", "0")
+
+    import torch
+    from sglang.srt.distributed import parallel_state
+
+    def cleanup_distributed() -> None:
+        parallel_state.destroy_model_parallel()
+        parallel_state.destroy_distributed_environment()
+
+    model_runner = None
+    try:
+        model_runner = _load_one_layer_runner(
+            model_path,
+            device,
+            mem_fraction_static=mem_fraction_static,
+            torch_module=torch,
+        )
+        layer = model_runner.model.model.layers[0]
+        architecture_values = getattr(layer.config, "architectures", None)
+        architecture = architecture_values[0] if architecture_values else _ARCHITECTURE
+        return MhcRuntime(
+            model_runner=model_runner,
+            torch_module=torch,
+            cleanup_distributed=cleanup_distributed,
+            framework_version=get_version("sglang"),
+            device_name=torch.cuda.get_device_name(torch.device(device)),
+            device=torch.device(device),
+            architecture=architecture,
+            model_artifact=model_path,
+            hidden_size=_hidden_size(layer),
+            hc_mult=int(layer.hc_mult),
+            sinkhorn_iters=int(getattr(layer.config, "hc_sinkhorn_iters", 20)),
+            mem_fraction_static=mem_fraction_static,
+        )
+    except BaseException:
+        _preserve_primary_failure(
+            lambda: _cleanup_mhc_runtime(
+                model_runner,
+                torch_module=torch,
+                cleanup_distributed=cleanup_distributed,
+            ),
+            context="mHC runtime cleanup after model construction failed",
+        )
+        raise
+
+
+def close_mhc_runtime(runtime: MhcRuntime) -> None:
+    """Close a reusable mHC runtime exactly once."""
+
+    if runtime.closed:
+        return
+    runtime.closed = True
+    model_runner = runtime.model_runner
+    runtime.model_runner = None
+    _cleanup_mhc_runtime(
+        model_runner,
+        torch_module=runtime.torch_module,
+        cleanup_distributed=runtime.cleanup_distributed,
+    )
+
+
 def _hidden_size(layer) -> int:
     return int(layer.config.hidden_size)
 
@@ -282,56 +383,48 @@ def _prepare_mhc_case(
     quant_mode: str,
     device: str,
     model_path: str,
+    *,
+    mem_fraction_static: float = 0.5,
+    runtime: MhcRuntime | None = None,
 ) -> PreparedMhcCase:
     """Import Torch/SGLang only after the worker has bound its GPU UUID."""
 
-    os.environ.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
-    os.environ.setdefault("SGLANG_OPT_DEEPGEMM_HC_PRENORM", "0")
+    owned_runtime = runtime is None
+    runtime = runtime or open_mhc_runtime(
+        model_path=model_path,
+        device=device,
+        mem_fraction_static=mem_fraction_static,
+    )
+    if runtime.closed or runtime.model_runner is None:
+        raise RuntimeError("mHC runtime is closed")
+    if (
+        runtime.model_artifact != model_path
+        or runtime.device != runtime.torch_module.device(device)
+        or runtime.mem_fraction_static != mem_fraction_static
+    ):
+        raise ValueError("mHC runtime does not match the requested model, device, or memory policy")
 
-    import torch
-    from sglang.srt.distributed import parallel_state
-
-    model_runner = None
+    torch = runtime.torch_module
+    model_runner = runtime.model_runner
     cleaned = False
     kernel_state: dict[str, Callable[[], Any]] = {}
 
-    def cleanup_distributed() -> None:
-        parallel_state.destroy_model_parallel()
-        parallel_state.destroy_distributed_environment()
-
     def cleanup() -> None:
-        nonlocal cleaned, model_runner
+        nonlocal cleaned
         if cleaned:
             return
         cleaned = True
         kernel_state.clear()
-        try:
-            _cleanup_mhc_runtime(
-                model_runner,
-                torch_module=torch,
-                cleanup_distributed=cleanup_distributed,
-            )
-        finally:
-            model_runner = None
+        if owned_runtime:
+            close_mhc_runtime(runtime)
 
     try:
-        model_runner = _load_one_layer_runner(
-            model_path,
-            device,
-            mem_fraction_static=0.5,
-            torch_module=torch,
-        )
         layer = model_runner.model.model.layers[0]
-        actual_hidden_size = _hidden_size(layer)
-        actual_hc_mult = int(layer.hc_mult)
-        actual_sinkhorn_iters = int(getattr(layer.config, "hc_sinkhorn_iters", 20))
-        architecture_values = getattr(layer.config, "architectures", None)
-        architecture = architecture_values[0] if architecture_values else _ARCHITECTURE
         if (
-            actual_hidden_size != hidden_size
-            or actual_hc_mult != hc_mult
-            or actual_sinkhorn_iters != sinkhorn_iters
-            or architecture != _ARCHITECTURE
+            runtime.hidden_size != hidden_size
+            or runtime.hc_mult != hc_mult
+            or runtime.sinkhorn_iters != sinkhorn_iters
+            or runtime.architecture != _ARCHITECTURE
         ):
             raise ValueError("loaded SGLang mHC layer does not match the requested frozen case")
 
@@ -347,15 +440,15 @@ def _prepare_mhc_case(
             raise ValueError("loaded SGLang mHC layer does not expose both full-module sites")
         return PreparedMhcCase(
             kernel_func=timed_kernel,
-            framework_version=get_version("sglang"),
-            device_name=torch.cuda.get_device_name(torch.device(device)),
-            device=torch.device(device),
-            architecture=architecture,
+            framework_version=runtime.framework_version,
+            device_name=runtime.device_name,
+            device=runtime.device,
+            architecture=runtime.architecture,
             model_artifact=model_path,
             num_sites=len(call_args),
-            hidden_size=actual_hidden_size,
-            hc_mult=actual_hc_mult,
-            sinkhorn_iters=actual_sinkhorn_iters,
+            hidden_size=runtime.hidden_size,
+            hc_mult=runtime.hc_mult,
+            sinkhorn_iters=runtime.sinkhorn_iters,
             quant_mode=quant_mode,
             cleanup=cleanup,
         )
@@ -381,21 +474,18 @@ def run_mhc_case(
     protocol: MeasurementProtocol | None = None,
     device: str = "cuda:0",
     model_path: str = _MODEL_ARTIFACT,
+    mem_fraction_static: float = 0.5,
+    runtime: MhcRuntime | None = None,
 ) -> RawMeasurement:
     """Measure one exact BF16 two-site mHC case without a perf-file write."""
 
     dimensions = (num_tokens, hidden_size, hc_mult, sinkhorn_iters)
     if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in dimensions):
         raise ValueError("mHC num_tokens, hidden_size, hc_mult, and sinkhorn_iters must be positive integers")
-    if (
-        op not in {"pre", "post"}
-        or hidden_size != 4096
-        or hc_mult != 4
-        or sinkhorn_iters != 20
-        or quant_mode != "bfloat16"
-        or model_path != _MODEL_ARTIFACT
-    ):
-        raise ValueError("mHC case is outside the frozen DSv4 BF16 full-module capability envelope")
+    if op not in {"pre", "post"} or quant_mode != "bfloat16":
+        raise ValueError("SGLang mHC runner requires a pre/post BF16 full-module case")
+    if not 0 < mem_fraction_static <= 1:
+        raise ValueError("mHC mem_fraction_static must be in (0, 1]")
 
     protocol = protocol or MeasurementProtocol(
         revision="cuda-event-samples-v1",
@@ -414,6 +504,9 @@ def run_mhc_case(
     ):
         raise ValueError("mHC measurement protocol is incompatible with the exact runner")
 
+    prepare_options = {} if mem_fraction_static == 0.5 else {"mem_fraction_static": mem_fraction_static}
+    if runtime is not None:
+        prepare_options["runtime"] = runtime
     prepared = _prepare_mhc_case(
         op,
         num_tokens,
@@ -423,11 +516,12 @@ def run_mhc_case(
         quant_mode,
         device,
         model_path,
+        **prepare_options,
     )
     try:
         if (
             prepared.architecture != _ARCHITECTURE
-            or prepared.model_artifact != _MODEL_ARTIFACT
+            or prepared.model_artifact != model_path
             or prepared.num_sites != 2
             or prepared.hidden_size != hidden_size
             or prepared.hc_mult != hc_mult
@@ -494,4 +588,11 @@ def run_mhc_case(
     return measurement
 
 
-__all__ = ["PreparedMhcCase", "get_mhc_test_cases", "run_mhc_case"]
+__all__ = [
+    "MhcRuntime",
+    "PreparedMhcCase",
+    "close_mhc_runtime",
+    "get_mhc_test_cases",
+    "open_mhc_runtime",
+    "run_mhc_case",
+]

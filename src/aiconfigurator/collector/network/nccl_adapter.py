@@ -17,7 +17,7 @@ from aiconfigurator.sdk.resolution.types import MeasurementRecord, MeasurementRe
 
 _NAMESPACE = perf_namespace(str(PerfFile.NCCL))
 _OPERATIONS = frozenset({"all_reduce", "all_gather", "reduce_scatter", "alltoall"})
-_DTYPES = frozenset({"half", "int8"})
+_DTYPES = frozenset({"half", "bfloat16", "int8"})
 _QUERY_FIELDS = frozenset({"nccl_dtype", "operation", "num_gpus", "message_size"})
 
 
@@ -45,6 +45,9 @@ def nccl_request_to_case(request: MeasurementRequest) -> dict[str, Any]:
         raise ValueError("lazy NCCL collection requires at least two GPUs")
     if request.environment.topology_schema is None or request.environment.topology_fingerprint is None:
         raise ValueError("NCCL collection requires an explicit topology identity")
+    nccl_version = request.environment.runtime_versions.get("nccl")
+    if not isinstance(nccl_version, str) or not nccl_version.strip():
+        raise ValueError("NCCL collection requires an explicit NCCL runtime version")
     return {
         "dtype": dtype,
         "nccl_op": operation,
@@ -136,6 +139,11 @@ def nccl_result_to_record(
     provenance = raw_result.get("provenance", {})
     if not isinstance(provenance, Mapping):
         raise TypeError("NCCL provenance must be a mapping")
+    if provenance.get("framework") != "NCCL":
+        raise ValueError("NCCL provenance framework does not match the request")
+    expected_nccl_version = request.environment.runtime_versions["nccl"]
+    if provenance.get("framework_version") != expected_nccl_version:
+        raise ValueError("NCCL runtime version does not match the request environment")
     return MeasurementRecord.valid(
         key=request.key,
         latency_ms=latency_ms,

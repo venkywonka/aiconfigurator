@@ -9,7 +9,6 @@ import contextlib
 import copy
 import errno
 import gc
-import inspect
 import json
 import logging
 import math
@@ -18,7 +17,7 @@ import shutil
 import socket
 import statistics
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import version as get_version
 from pathlib import Path
@@ -36,7 +35,6 @@ _ATTN_KIND_TO_COMPRESS_RATIO = {"csa": 4, "hca": 128}
 _CANONICAL_NUM_HEADS = 16
 _PADDED_NUM_HEADS = 64
 _TP_SIZE = 4
-_SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _PROPER_INIT_STD = 0.05
 _PROPER_INIT_SEED = 1234
 _INPUT_SEED = 0
@@ -70,6 +68,33 @@ class PreparedDsv4AttentionCase:
     cleanup_func: Callable[[], None] | None = None
 
 
+@dataclass(slots=True)
+class Dsv4AttentionRuntime:
+    """Reusable invariant SGLang model state for one compatible shape group."""
+
+    model_runner: Any
+    torch_module: Any
+    cleanup_distributed: Callable[[], None]
+    framework_version: str
+    device_name: str
+    device: Any
+    architecture: str
+    model_artifact: str
+    mode: str
+    attn_kind: str
+    compress_ratio: int
+    tp_size: int
+    canonical_num_heads: int
+    padded_num_heads: int
+    batch_size: int
+    mla_dtype: str
+    kv_cache_dtype: str
+    gemm_type: str
+    max_total_tokens: int
+    required_swa_tokens: int
+    closed: bool = False
+
+
 def _positive_int(value: object, *, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"DSv4 attention {field} must be a positive integer")
@@ -89,6 +114,16 @@ def _positive_finite_number(value: object, *, field: str) -> float:
     if not math.isfinite(number) or number <= 0:
         raise ValueError(f"DSv4 attention {field} must be positive and finite")
     return number
+
+
+def _canonical_model_id(model_path: str) -> str:
+    normalized = str(model_path).rstrip("/")
+    basename = normalized.rsplit("/", 1)[-1]
+    if basename == "DeepSeek-V4-Pro":
+        return "deepseek-ai/DeepSeek-V4-Pro"
+    if basename == "DeepSeek-V4-Flash":
+        return "deepseek-ai/DeepSeek-V4-Flash"
+    return str(model_path)
 
 
 def _read_model_config(model_id: str) -> dict[str, Any]:
@@ -182,36 +217,6 @@ def _tp_load_model_patch(tp_size: int) -> Iterator[None]:
         yield
     finally:
         ModelRunner.load_model = original_load
-
-
-@contextlib.contextmanager
-def _attention_only_dsv4_moe(deepseek_v2_module: Any) -> Iterator[None]:
-    """Adapt eager DSv4 model construction without enabling an MoE measurement."""
-
-    original_moe_type = deepseek_v2_module.DeepseekV2MoE
-    supports_dsv4_flag = "is_deepseek_v4" in inspect.signature(original_moe_type.__init__).parameters
-
-    class AttentionOnlyDeepseekV2MoE(original_moe_type):
-        def __init__(
-            self,
-            *args,
-            is_deepseek_v4: bool = False,
-            **kwargs,
-        ) -> None:
-            if is_deepseek_v4 is not True:
-                raise ValueError("attention-only DSv4 MoE compatibility requires is_deepseek_v4=True")
-            if supports_dsv4_flag:
-                kwargs["is_deepseek_v4"] = True
-            super().__init__(*args, **kwargs)
-
-        def forward(self, *args, **kwargs):
-            raise RuntimeError("attention-only DSv4 setup must not execute the MoE path")
-
-    deepseek_v2_module.DeepseekV2MoE = AttentionOnlyDeepseekV2MoE
-    try:
-        yield
-    finally:
-        deepseek_v2_module.DeepseekV2MoE = original_moe_type
 
 
 def _free_tcp_port() -> int:
@@ -338,7 +343,6 @@ def _load_model_runner(
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.models import deepseek_v2
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
 
@@ -377,10 +381,7 @@ def _load_model_runner(
         ),
     )
     model_config = ModelConfig.from_server_args(server_args)
-    with (
-        _tp_load_model_patch(tp_size),
-        _attention_only_dsv4_moe(deepseek_v2),
-    ):
+    with _tp_load_model_patch(tp_size):
         model_runner = _construct_model_runner(
             ModelRunner,
             {
@@ -759,6 +760,177 @@ def _cleanup_model_runner(
         raise cleanup_errors[0]
 
 
+def _case_runtime_capacity(
+    *,
+    mode: str,
+    batch_size: int,
+    isl: int | None,
+    prefix: int | None,
+    s_total: int | None,
+) -> tuple[int, int]:
+    """Return full-pool and SWA capacities required by one exact case."""
+
+    is_prefill = mode == "context"
+    sequence_length = int(isl) if is_prefill else int(s_total) - 1
+    prefix_length = int(prefix or 0) if is_prefill else 0
+    tokens_per_request = sequence_length + prefix_length + (0 if is_prefill else 1)
+    total_tokens = batch_size * tokens_per_request
+    return (
+        max(4096, math.ceil(total_tokens * 1.05)),
+        _page_rounded_swa_capacity_tokens(
+            batch_size=batch_size,
+            tokens_per_request=tokens_per_request,
+            page_size=256,
+        ),
+    )
+
+
+def open_dsv4_attn_runtime(
+    *,
+    mode: str,
+    attn_kind: str,
+    tp_size: int,
+    canonical_num_heads: int,
+    num_heads: int,
+    compress_ratio: int,
+    batch_size: int,
+    mla_dtype: str,
+    kv_cache_dtype: str,
+    gemm_type: str,
+    case_shapes: Sequence[Mapping[str, int | None]],
+    device: str = "cuda:0",
+    model_path: str = _MODEL_ARTIFACT,
+) -> Dsv4AttentionRuntime:
+    """Load one capacity-sized SGLang runtime for compatible attention cases."""
+
+    if not case_shapes:
+        raise ValueError("DSv4 attention runtime requires at least one exact shape")
+
+    capacities: list[tuple[int, int]] = []
+    for shape in case_shapes:
+        isl = shape.get("isl")
+        prefix = shape.get("prefix")
+        s_total = shape.get("s_total")
+        _validate_case(
+            mode=mode,
+            attn_kind=attn_kind,
+            tp_size=tp_size,
+            canonical_num_heads=canonical_num_heads,
+            num_heads=num_heads,
+            compress_ratio=compress_ratio,
+            batch_size=batch_size,
+            mla_dtype=mla_dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            gemm_type=gemm_type,
+            isl=isl,
+            prefix=prefix,
+            s_total=s_total,
+            model_path=model_path,
+        )
+        capacities.append(
+            _case_runtime_capacity(
+                mode=mode,
+                batch_size=batch_size,
+                isl=isl,
+                prefix=prefix,
+                s_total=s_total,
+            )
+        )
+    max_total_tokens = max(value[0] for value in capacities)
+    required_swa_tokens = max(value[1] for value in capacities)
+
+    import torch
+    from sglang.srt.distributed import parallel_state
+
+    def cleanup_distributed() -> None:
+        parallel_state.destroy_model_parallel()
+        parallel_state.destroy_distributed_environment()
+
+    def cleanup_failed_attempt() -> None:
+        _cleanup_distributed_runtime(
+            torch_module=torch,
+            cleanup_distributed=cleanup_distributed,
+        )
+
+    model_runner = None
+    try:
+        with _forced_proper_init():
+            model_runner = _load_model_runner(
+                model_path,
+                attn_kind=attn_kind,
+                compress_ratio=compress_ratio,
+                kv_cache_dtype=kv_cache_dtype,
+                gemm_type=gemm_type,
+                tp_size=tp_size,
+                batch_size=batch_size,
+                max_total_tokens=max_total_tokens,
+                required_swa_tokens=required_swa_tokens,
+                device=device,
+                torch_module=torch,
+                cleanup_failed_attempt=cleanup_failed_attempt,
+            )
+        attention_module = model_runner.model.model.layers[0].self_attn
+        actual_ratio = int(getattr(attention_module, "compress_ratio", -1))
+        padded_num_heads = int(getattr(attention_module, "n_heads", -1))
+        architecture_values = getattr(model_runner.model.config, "architectures", None)
+        architecture = architecture_values[0] if architecture_values else None
+        if (
+            actual_ratio != compress_ratio
+            or padded_num_heads != num_heads
+            or padded_num_heads // tp_size != canonical_num_heads
+            or architecture != _ARCHITECTURE
+        ):
+            raise ValueError("loaded SGLang attention module does not match the requested head/TP case")
+        return Dsv4AttentionRuntime(
+            model_runner=model_runner,
+            torch_module=torch,
+            cleanup_distributed=cleanup_distributed,
+            framework_version=get_version("sglang"),
+            device_name=torch.cuda.get_device_name(torch.device(device)),
+            device=torch.device(device),
+            architecture=architecture,
+            model_artifact=model_path,
+            mode=mode,
+            attn_kind=attn_kind,
+            compress_ratio=actual_ratio,
+            tp_size=tp_size,
+            canonical_num_heads=canonical_num_heads,
+            padded_num_heads=padded_num_heads,
+            batch_size=batch_size,
+            mla_dtype=mla_dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            gemm_type=gemm_type,
+            max_total_tokens=max_total_tokens,
+            required_swa_tokens=required_swa_tokens,
+        )
+    except BaseException:
+        if model_runner is None:
+            cleanup = cleanup_failed_attempt
+        else:
+            cleanup = lambda: _cleanup_model_runner(
+                model_runner,
+                torch_module=torch,
+                cleanup_distributed=cleanup_distributed,
+            )
+        _preserve_primary_failure(cleanup, context="DSv4 attention runtime construction cleanup failed")
+        raise
+
+
+def close_dsv4_attn_runtime(runtime: Dsv4AttentionRuntime) -> None:
+    """Close a reusable DSv4 attention runtime exactly once."""
+
+    if runtime.closed:
+        return
+    runtime.closed = True
+    model_runner = runtime.model_runner
+    runtime.model_runner = None
+    _cleanup_model_runner(
+        model_runner,
+        torch_module=runtime.torch_module,
+        cleanup_distributed=runtime.cleanup_distributed,
+    )
+
+
 def _prepare_dsv4_attn_case(
     *,
     mode: str,
@@ -776,72 +948,103 @@ def _prepare_dsv4_attn_case(
     s_total: int | None,
     device: str,
     model_path: str,
+    runtime: Dsv4AttentionRuntime | None = None,
 ) -> PreparedDsv4AttentionCase:
     """Import Torch/SGLang after GPU binding and prepare exactly one case."""
-
-    import torch
-    from sglang.srt.distributed import parallel_state
-
-    def cleanup_distributed() -> None:
-        parallel_state.destroy_model_parallel()
-        parallel_state.destroy_distributed_environment()
-
-    def cleanup_failed_attempt() -> None:
-        _cleanup_distributed_runtime(
-            torch_module=torch,
-            cleanup_distributed=cleanup_distributed,
-        )
 
     is_prefill = mode == "context"
     sequence_length = int(isl) if is_prefill else int(s_total) - 1
     prefix_length = int(prefix or 0) if is_prefill else 0
-    tokens_per_request = sequence_length + prefix_length + (0 if is_prefill else 1)
-    total_tokens = batch_size * tokens_per_request
-    max_total_tokens = max(4096, math.ceil(total_tokens * 1.05))
-    required_swa_tokens = _page_rounded_swa_capacity_tokens(
+    max_total_tokens, required_swa_tokens = _case_runtime_capacity(
+        mode=mode,
         batch_size=batch_size,
-        tokens_per_request=tokens_per_request,
-        page_size=256,
+        isl=isl,
+        prefix=prefix,
+        s_total=s_total,
     )
-    try:
-        with _forced_proper_init():
-            model_runner = _load_model_runner(
-                model_path,
-                attn_kind=attn_kind,
-                compress_ratio=compress_ratio,
-                kv_cache_dtype=kv_cache_dtype,
-                gemm_type=gemm_type,
-                tp_size=tp_size,
-                batch_size=batch_size,
-                max_total_tokens=max_total_tokens,
-                required_swa_tokens=required_swa_tokens,
-                device=device,
-                torch_module=torch,
-                cleanup_failed_attempt=cleanup_failed_attempt,
+    shape = {"isl": isl, "prefix": prefix, "s_total": s_total}
+    owned_runtime = runtime is None
+    runtime = runtime or open_dsv4_attn_runtime(
+        mode=mode,
+        attn_kind=attn_kind,
+        tp_size=tp_size,
+        canonical_num_heads=canonical_num_heads,
+        num_heads=num_heads,
+        compress_ratio=compress_ratio,
+        batch_size=batch_size,
+        mla_dtype=mla_dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        gemm_type=gemm_type,
+        case_shapes=(shape,),
+        device=device,
+        model_path=model_path,
+    )
+    if runtime.closed or runtime.model_runner is None:
+        raise RuntimeError("DSv4 attention runtime is closed")
+    expected_runtime = (
+        model_path,
+        mode,
+        attn_kind,
+        compress_ratio,
+        tp_size,
+        canonical_num_heads,
+        num_heads,
+        batch_size,
+        mla_dtype,
+        kv_cache_dtype,
+        gemm_type,
+    )
+    actual_runtime = (
+        runtime.model_artifact,
+        runtime.mode,
+        runtime.attn_kind,
+        runtime.compress_ratio,
+        runtime.tp_size,
+        runtime.canonical_num_heads,
+        runtime.padded_num_heads,
+        runtime.batch_size,
+        runtime.mla_dtype,
+        runtime.kv_cache_dtype,
+        runtime.gemm_type,
+    )
+    if actual_runtime != expected_runtime or runtime.device != runtime.torch_module.device(device):
+        raise ValueError("DSv4 attention runtime does not match the requested invariant configuration")
+    if runtime.max_total_tokens < max_total_tokens or runtime.required_swa_tokens < required_swa_tokens:
+        raise ValueError("DSv4 attention runtime does not have capacity for the requested exact shape")
+
+    torch = runtime.torch_module
+    model_runner = runtime.model_runner
+    case_state: dict[str, Any] = {}
+    cleaned = False
+
+    def cleanup_func() -> None:
+        nonlocal cleaned
+        if cleaned:
+            return
+        cleaned = True
+        case_state.clear()
+        if owned_runtime:
+            close_dsv4_attn_runtime(runtime)
+            return
+        try:
+            model_runner.req_to_token_pool.clear()
+            model_runner.token_to_kv_pool_allocator.clear()
+        except BaseException:
+            _preserve_primary_failure(
+                lambda: close_dsv4_attn_runtime(runtime),
+                context="shared DSv4 attention runtime cleanup failed",
             )
-    except BaseException:
-        _preserve_primary_failure(
-            lambda: _cleanup_distributed_runtime(
-                torch_module=torch,
-                cleanup_distributed=cleanup_distributed,
-            ),
-            context="distributed cleanup after model construction failed",
-        )
-        raise
+            raise
 
     try:
         attention_module = model_runner.model.model.layers[0].self_attn
-        actual_ratio = int(getattr(attention_module, "compress_ratio", -1))
-        padded_num_heads = int(getattr(attention_module, "n_heads", -1))
-        architecture_values = getattr(model_runner.model.config, "architectures", None)
-        architecture = architecture_values[0] if architecture_values else None
         if (
-            actual_ratio != compress_ratio
-            or padded_num_heads != num_heads
-            or padded_num_heads // tp_size != canonical_num_heads
-            or architecture != _ARCHITECTURE
+            runtime.architecture != _ARCHITECTURE
+            or runtime.compress_ratio != compress_ratio
+            or runtime.padded_num_heads != num_heads
+            or runtime.padded_num_heads // tp_size != canonical_num_heads
         ):
-            raise ValueError("loaded SGLang attention module does not match the frozen padded64/TP4 case")
+            raise ValueError("loaded SGLang attention module does not match the requested head/TP case")
 
         forward_batch = _build_forward_batch(
             model_runner,
@@ -860,43 +1063,41 @@ def _prepare_dsv4_attn_case(
             device=device,
             torch_module=torch,
         )
-        framework_version = get_version("sglang")
+        case_state.update(
+            attention_module=attention_module,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+            positions=positions,
+        )
 
         def kernel_func():
             with torch.no_grad():
-                if framework_version.startswith("0.5.13"):
+                if runtime.framework_version.startswith("0.5.13"):
                     from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 
                     forward_scope = forward_context(ForwardContext(attn_backend=model_runner.attn_backend))
                 else:
                     forward_scope = contextlib.nullcontext()
                 with forward_scope:
-                    return attention_module(
-                        x=hidden_states,
-                        positions=positions,
-                        forward_batch=forward_batch,
+                    return case_state["attention_module"](
+                        x=case_state["hidden_states"],
+                        positions=case_state["positions"],
+                        forward_batch=case_state["forward_batch"],
                     )
-
-        def cleanup_func() -> None:
-            _cleanup_model_runner(
-                model_runner,
-                torch_module=torch,
-                cleanup_distributed=cleanup_distributed,
-            )
 
         prepared = PreparedDsv4AttentionCase(
             kernel_func=kernel_func,
-            framework_version=framework_version,
-            device_name=torch.cuda.get_device_name(torch.device(device)),
-            device=torch.device(device),
-            architecture=architecture,
+            framework_version=runtime.framework_version,
+            device_name=runtime.device_name,
+            device=runtime.device,
+            architecture=runtime.architecture,
             model_artifact=model_path,
             mode=mode,
             attn_kind=attn_kind,
-            compress_ratio=actual_ratio,
+            compress_ratio=runtime.compress_ratio,
             tp_size=tp_size,
             canonical_num_heads=canonical_num_heads,
-            padded_num_heads=padded_num_heads,
+            padded_num_heads=runtime.padded_num_heads,
             mla_dtype=mla_dtype,
             kv_cache_dtype=kv_cache_dtype,
             gemm_type=gemm_type,
@@ -904,11 +1105,7 @@ def _prepare_dsv4_attn_case(
         )
     except BaseException:
         _preserve_primary_failure(
-            lambda: _cleanup_model_runner(
-                model_runner,
-                torch_module=torch,
-                cleanup_distributed=cleanup_distributed,
-            ),
+            cleanup_func,
             context="model-runner cleanup after attention preparation failed",
         )
         raise
@@ -939,18 +1136,17 @@ def _validate_case(
     model_path: str,
 ) -> None:
     expected_ratio = _ATTN_KIND_TO_COMPRESS_RATIO.get(attn_kind)
-    if (
-        mode not in {"context", "generation"}
-        or expected_ratio != compress_ratio
-        or tp_size != _TP_SIZE
-        or canonical_num_heads != _CANONICAL_NUM_HEADS
-        or num_heads != _PADDED_NUM_HEADS
-        or mla_dtype != "bfloat16"
-        or kv_cache_dtype != "fp8"
-        or gemm_type != "fp8_block"
-        or model_path != _MODEL_ARTIFACT
-    ):
-        raise ValueError("DSv4 attention case is outside the frozen V1.2 padded64/TP4 capability envelope")
+    if mode not in {"context", "generation"} or expected_ratio != compress_ratio:
+        raise ValueError("DSv4 attention mode, kind, and compression ratio are inconsistent")
+    _positive_int(tp_size, field="tp_size")
+    _positive_int(canonical_num_heads, field="canonical_num_heads")
+    _positive_int(num_heads, field="num_heads")
+    if num_heads % tp_size or num_heads // tp_size != canonical_num_heads:
+        raise ValueError("DSv4 attention padded heads must map exactly to the requested rank-local heads")
+    if mla_dtype != "bfloat16" or kv_cache_dtype != "fp8" or gemm_type not in {"bfloat16", "fp8_block"}:
+        raise ValueError("DSv4 attention dtype or GEMM mode is unsupported")
+    if not isinstance(model_path, str) or not model_path.strip():
+        raise ValueError("DSv4 attention model_path must be a non-empty string")
     _positive_int(batch_size, field="batch_size")
     if mode == "context":
         _positive_int(isl, field="isl")
@@ -993,6 +1189,7 @@ def run_dsv4_attn_case(
     protocol: MeasurementProtocol | None = None,
     device: str = "cuda:0",
     model_path: str = _MODEL_ARTIFACT,
+    runtime: Dsv4AttentionRuntime | None = None,
 ) -> RawMeasurement:
     """Measure one exact full-module attention case without offline output."""
 
@@ -1021,6 +1218,7 @@ def run_dsv4_attn_case(
         tuning_revision="sglang-dsv4-attn-v1",
     )
     _validate_protocol(protocol)
+    prepare_options = {} if runtime is None else {"runtime": runtime}
     prepared = _prepare_dsv4_attn_case(
         mode=mode,
         attn_kind=attn_kind,
@@ -1037,27 +1235,28 @@ def run_dsv4_attn_case(
         s_total=s_total,
         device=device,
         model_path=model_path,
+        **prepare_options,
     )
     try:
         if (
-            prepared.framework_version not in _SUPPORTED_SGLANG_VERSIONS
-            or " ".join(prepared.device_name.split()).casefold() != "nvidia gb200"
+            not prepared.framework_version
+            or not prepared.device_name
             or prepared.architecture != _ARCHITECTURE
-            or prepared.model_artifact != _MODEL_ARTIFACT
+            or prepared.model_artifact != model_path
             or prepared.mode != mode
             or prepared.attn_kind != attn_kind
             or prepared.compress_ratio != compress_ratio
-            or prepared.tp_size != _TP_SIZE
-            or prepared.canonical_num_heads != _CANONICAL_NUM_HEADS
-            or prepared.padded_num_heads != _PADDED_NUM_HEADS
-            or prepared.mla_dtype != "bfloat16"
-            or prepared.kv_cache_dtype != "fp8"
-            or prepared.gemm_type != "fp8_block"
+            or prepared.tp_size != tp_size
+            or prepared.canonical_num_heads != canonical_num_heads
+            or prepared.padded_num_heads != num_heads
+            or prepared.mla_dtype != mla_dtype
+            or prepared.kv_cache_dtype != kv_cache_dtype
+            or prepared.gemm_type != gemm_type
             or prepared.model_weight_generator != "proper-normal-v1"
             or prepared.model_weight_std != _PROPER_INIT_STD
             or prepared.model_weight_seed != _PROPER_INIT_SEED
         ):
-            raise ValueError("prepared DSv4 attention case does not match the frozen exact request")
+            raise ValueError("prepared DSv4 attention case does not match the exact request")
 
         with benchmark_with_power(
             device=prepared.device,
@@ -1093,8 +1292,9 @@ def run_dsv4_attn_case(
 
     persisted_isl = int(isl) if mode == "context" else 1
     persisted_step = int(prefix) if mode == "context" else int(s_total) - 1
+    persisted_model = _canonical_model_id(prepared.model_artifact)
     perf_row = {
-        "model": prepared.model_artifact,
+        "model": persisted_model,
         "architecture": prepared.architecture,
         "mla_dtype": prepared.mla_dtype,
         "kv_cache_dtype": prepared.kv_cache_dtype,
@@ -1120,11 +1320,11 @@ def run_dsv4_attn_case(
             "device": prepared.device_name,
             "used_cuda_graph": True,
             "throttled": throttled,
-            "model_artifact": prepared.model_artifact,
+            "model_artifact": persisted_model,
             "full_module": True,
             "mode": prepared.mode,
             "attn_kind": prepared.attn_kind,
-            "tp_simulation": "single-gpu-tp4",
+            "tp_simulation": f"single-gpu-tp{prepared.tp_size}",
             "canonical_num_heads": prepared.canonical_num_heads,
             "padded_num_heads": prepared.padded_num_heads,
             "tensor_generator": "normal-v1",
@@ -1138,4 +1338,11 @@ def run_dsv4_attn_case(
     )
 
 
-__all__ = ["PreparedDsv4AttentionCase", "get_dsv4_attn_test_cases", "run_dsv4_attn_case"]
+__all__ = [
+    "Dsv4AttentionRuntime",
+    "PreparedDsv4AttentionCase",
+    "close_dsv4_attn_runtime",
+    "get_dsv4_attn_test_cases",
+    "open_dsv4_attn_runtime",
+    "run_dsv4_attn_case",
+]

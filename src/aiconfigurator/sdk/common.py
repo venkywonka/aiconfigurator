@@ -1102,5 +1102,6 @@ class CommQuantMode(Enum):
     """
 
     half = QuantMapping(2, 0, "half")
+    bfloat16 = QuantMapping(2, 0, "bfloat16")
     int8 = QuantMapping(1, 0, "int8")
     fp8 = QuantMapping(1, 0, "fp8")

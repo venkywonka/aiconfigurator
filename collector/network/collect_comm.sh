@@ -91,6 +91,8 @@ echo "================================================"
 
 # Get the directory where this script is located
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ "$device" == "cuda" ]]; then
     GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -121,10 +123,10 @@ elif [[ "$device" == "cuda" ]]; then
         for op in "${nccl_ops[@]}"; do
             for dtype in "${dtypes[@]}"; do
                 if [[ "$measure_power" == "true" ]]; then
-                    python3 "$SCRIPT_DIR/collect_nccl.py" -n "$n" -NCCL "$op" --dtype "$dtype" \
+                    python3 -m collector.network.collect_nccl -n "$n" -NCCL "$op" --dtype "$dtype" \
                         --measure_power --power_test_duration_sec "$power_test_duration"
                 else
-                    python3 "$SCRIPT_DIR/collect_nccl.py" -n "$n" -NCCL "$op" --dtype "$dtype"
+                    python3 -m collector.network.collect_nccl -n "$n" -NCCL "$op" --dtype "$dtype"
                 fi
             done
         done

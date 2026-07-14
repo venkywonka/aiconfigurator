@@ -15,12 +15,14 @@
 //! - `P2POp`: pure analytic formula — `(bytes / inter_node_bw +
 //!   p2p_latency) * 1000`. No CSV.
 
-use serde::{Deserialize, Serialize};
 use crate::common::enums::CommQuantMode;
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
 use crate::operators::base::{PerformanceResult, Source};
 use crate::perf_database::PerfDatabase;
+use serde::{Deserialize, Serialize};
+
+const SGLANG_CUSTOM_ALLREDUCE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CustomAllReduceOp {
@@ -36,12 +38,7 @@ pub struct CustomAllReduceOp {
 }
 
 impl CustomAllReduceOp {
-    pub fn new(
-        name: impl Into<String>,
-        scale_factor: f64,
-        hidden_size: u32,
-        tp_size: u32,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, scale_factor: f64, hidden_size: u32, tp_size: u32) -> Self {
         Self {
             name: name.into(),
             scale_factor,
@@ -53,20 +50,32 @@ impl CustomAllReduceOp {
     }
 
     /// Query for `num_tokens` of activation. Python's
-    /// `CustomAllReduce.query` computes `size = x * self._h` (element
-    /// count, not bytes) and passes it directly to
-    /// `query_custom_allreduce`. Mirror that here — the underlying table
-    /// is keyed by element count, with dtype implicit in the quant mode.
-    pub fn query(
-        &self,
-        db: &PerfDatabase,
-        num_tokens: u32,
-    ) -> Result<PerformanceResult, AicError> {
+    /// `CustomAllReduce.query` computes `size = x * self._h` in elements.
+    /// SGLang uses its custom kernel through 8 MiB, then falls back to NCCL.
+    pub fn query(&self, db: &PerfDatabase, num_tokens: u32) -> Result<PerformanceResult, AicError> {
         if self.tp_size <= 1 {
             return Ok(PerformanceResult::zero());
         }
         let per_rank_tokens = num_tokens.div_ceil(self.seq_split.max(1)); // CP: busiest rank
         let message_size = (per_rank_tokens as u64) * (self.hidden_size as u64);
+        if db.backend == "sglang"
+            && message_size.saturating_mul(2) > SGLANG_CUSTOM_ALLREDUCE_MAX_BYTES
+            && db
+                .communication
+                .nccl_max_num_gpus(CommQuantMode::Half, "all_reduce")?
+                .is_some()
+        {
+            let mut fallback = NcclOp::new(
+                self.name.clone(),
+                self.scale_factor,
+                self.hidden_size as f64,
+                self.tp_size,
+                "all_reduce",
+            );
+            fallback.dtype = CommQuantMode::Half;
+            fallback.seq_split = self.seq_split;
+            return fallback.query(db, num_tokens);
+        }
         let spec = &db.system_spec;
         let per_node = spec.node.num_gpus_per_node;
         let effective_tp = self.tp_size.min(per_node);
@@ -125,33 +134,28 @@ impl NcclOp {
         }
     }
 
-    pub fn query(
-        &self,
-        db: &PerfDatabase,
-        num_tokens: u32,
-    ) -> Result<PerformanceResult, AicError> {
+    pub fn query(&self, db: &PerfDatabase, num_tokens: u32) -> Result<PerformanceResult, AicError> {
         if self.num_gpus <= 1 {
             return Ok(PerformanceResult::zero());
         }
         let per_rank_tokens = num_tokens.div_ceil(self.seq_split.max(1)); // CP: busiest rank
-        // Python: message_size = ceil(x/seq_split) * num_elements_per_token (float).
+                                                                          // Python: message_size = ceil(x/seq_split) * num_elements_per_token (float).
         let message_size = ((per_rank_tokens as f64) * self.hidden_size) as u64;
         let max_recorded = db
             .communication
             .nccl_max_num_gpus(self.dtype, &self.operation)?
             .unwrap_or(self.num_gpus);
         let effective = self.num_gpus.min(max_recorded);
-        let mut latency = db
-            .communication
-            .query_nccl(self.dtype, &self.operation, effective, message_size)?;
+        let mut latency =
+            db.communication
+                .query_nccl(self.dtype, &self.operation, effective, message_size)?;
         if self.num_gpus > max_recorded {
             let spec = &db.system_spec;
             let max_bw = p2p_bandwidth(spec, max_recorded);
             let req_bw = p2p_bandwidth(spec, self.num_gpus);
             let f_n = self.num_gpus as f64;
             let f_m = max_recorded as f64;
-            let scale =
-                (f_n - 1.0) / f_n * f_m / (f_m - 1.0).max(1.0) * max_bw / req_bw;
+            let scale = (f_n - 1.0) / f_n * f_m / (f_m - 1.0).max(1.0) * max_bw / req_bw;
             latency *= scale;
         }
         Ok(PerformanceResult::new(latency, Source::Silicon)
@@ -201,4 +205,62 @@ impl P2POp {
 
 fn p2p_bandwidth(spec: &SystemSpec, num_gpus: u32) -> f64 {
     spec.get_p2p_bandwidth(num_gpus)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn systems_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("src/aiconfigurator/systems")
+    }
+
+    #[test]
+    fn custom_allreduce_uses_nccl_above_sglang_byte_limit() {
+        let db = PerfDatabase::load(&systems_root(), "gb200", "sglang", "0.5.10")
+            .expect("bundled gb200/sglang database must load");
+        let op = CustomAllReduceOp::new("custom_allreduce", 1.0, 4096, 4);
+
+        let at_limit = op.query(&db, 1024).expect("8 MiB custom allreduce query");
+        let oversized = op.query(&db, 1025).expect("oversized NCCL fallback query");
+
+        assert!((at_limit.latency_ms - 0.07843616008758544).abs() < 1e-12);
+        assert!((oversized.latency_ms - 0.087531064453125).abs() < 1e-12);
+    }
+
+    #[test]
+    fn custom_allreduce_keeps_static_estimate_without_nccl_data() {
+        let db = PerfDatabase::load(&systems_root(), "rtx_pro_6000_server", "sglang", "0.5.10")
+            .expect("bundled RTX PRO SGLang database must load");
+        let op = CustomAllReduceOp::new("custom_allreduce", 1.0, 4096, 4);
+
+        let oversized = op
+            .query(&db, 1025)
+            .expect("missing NCCL data must retain the historical static estimate");
+
+        assert!((oversized.latency_ms - 1.088623237609863).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sglang_byte_limit_does_not_override_other_framework_custom_allreduce() {
+        for (backend, version) in [("vllm", "0.14.0"), ("trtllm", "1.3.0rc10")] {
+            let db = PerfDatabase::load(&systems_root(), "gb200", backend, version)
+                .expect("bundled non-SGLang database must load");
+            let op = CustomAllReduceOp::new("custom_allreduce", 1.0, 4096, 4);
+
+            let oversized = op
+                .query(&db, 1025)
+                .expect("non-SGLang query must retain CustomAllReduce");
+            let expected = db
+                .communication
+                .query_custom_allreduce(CommQuantMode::Half, 4, 1025 * 4096)
+                .expect("bundled CustomAllReduce row must exist");
+
+            assert!((oversized.latency_ms - expected).abs() < 1e-12);
+        }
+    }
 }

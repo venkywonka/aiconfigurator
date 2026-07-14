@@ -46,8 +46,11 @@ from aiconfigurator.sdk.resolution.types import (
 
 if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
+    from aiconfigurator.sdk.resolution.session import HybridFallbackValue
 
 logger = logging.getLogger(__name__)
+
+SGLANG_CUSTOM_ALLREDUCE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _cache_key(database: PerfDatabase) -> tuple:
@@ -116,7 +119,70 @@ class CustomAllReduce(Operation):
                 OperationKind.MEASURED,
                 perf_namespace("custom_allreduce_perf.txt"),
             ),
+            OperationCapability(
+                "NCCL",
+                OperationKind.MEASURED,
+                perf_namespace("nccl_perf.txt"),
+            ),
         )
+
+    @staticmethod
+    def _uses_nccl_fallback(
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> bool:
+        """Match SGLang's runtime dispatch when CustomAllReduce is too large."""
+
+        return (
+            database.backend == "sglang"
+            and int(normalized_query["elements"]) * common.CommQuantMode.half.value.memory
+            > SGLANG_CUSTOM_ALLREDUCE_MAX_BYTES
+        )
+
+    def _nccl_fallback(
+        self,
+        quant_mode: common.CommQuantMode = common.CommQuantMode.bfloat16,
+    ) -> NCCL:
+        return NCCL(
+            self._name,
+            self._scale_factor,
+            "all_reduce",
+            self._h,
+            self._tp_size,
+            quant_mode,
+            seq_split=self._seq_split,
+        )
+
+    @staticmethod
+    def _nccl_query(
+        normalized_query: Mapping[str, object],
+        quant_mode: common.CommQuantMode = common.CommQuantMode.bfloat16,
+    ) -> Mapping[str, object]:
+        return {
+            "nccl_dtype": quant_mode.name,
+            "operation": "all_reduce",
+            "num_gpus": int(normalized_query["world_size"]),
+            "message_size": int(normalized_query["elements"]),
+        }
+
+    def _static_oversized_result(
+        self,
+        database: PerfDatabase,
+        normalized_query: Mapping[str, object],
+    ) -> PerformanceResult:
+        """Approximate physical BF16 NCCL with legacy same-width FP16 data."""
+
+        approximate_query = self._nccl_query(normalized_query, common.CommQuantMode.half)
+        fallback = self._nccl_fallback(common.CommQuantMode.half)
+        if not fallback._curated_nccl_version_matches(database):
+            return PerformanceResult(0.0, energy=0.0, source="unresolved")
+        try:
+            return fallback._query_from_normalized(
+                database,
+                approximate_query,
+            )
+        except (PerfDataNotAvailableError, EmpiricalNotImplementedError):
+            return self._query_from_normalized(database, normalized_query)
 
     def normalize_perf_query(self, **kwargs: object) -> Mapping[str, object]:
         """Normalize the exact physical collective used by prediction."""
@@ -167,6 +233,13 @@ class CustomAllReduce(Operation):
         normalized_query: Mapping[str, object],
         **kwargs,
     ) -> MeasurementRequest | None:
+        if self._uses_nccl_fallback(database, normalized_query):
+            return self._nccl_fallback()._measurement_request_from_normalized(
+                database,
+                protocol,
+                normalized_query=self._nccl_query(normalized_query),
+                **kwargs,
+            )
         del kwargs
         if int(normalized_query["world_size"]) <= 1:
             return None
@@ -220,6 +293,12 @@ class CustomAllReduce(Operation):
         normalized_query: Mapping[str, object],
         **kwargs,
     ) -> PerformanceResult | None:
+        if self._uses_nccl_fallback(database, normalized_query):
+            return self._nccl_fallback()._curated_exact_result_from_normalized(
+                database,
+                normalized_query=self._nccl_query(normalized_query),
+                **kwargs,
+            )
         del kwargs
         if not self._is_v1_2_curated_compatible(database):
             return None
@@ -444,6 +523,9 @@ class CustomAllReduce(Operation):
             # silicon leakage in the breakdown report.
             return PerformanceResult(0.0, 0.0, source="empirical")
         normalized = self.normalize_perf_query(**kwargs)
+        if self._uses_nccl_fallback(database, normalized):
+            self._nccl_fallback(common.CommQuantMode.half)._require_curated_nccl_version_match(database)
+            return self._static_oversized_result(database, normalized)
         return self._query_from_normalized(database, normalized)
 
     def provisional_result(
@@ -454,7 +536,32 @@ class CustomAllReduce(Operation):
         **kwargs,
     ) -> PerformanceResult:
         del kwargs
+        if self._uses_nccl_fallback(database, normalized_query):
+            return self._static_oversized_result(database, normalized_query)
         return self._query_from_normalized(database, normalized_query)
+
+    def hybrid_fallback_value(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> HybridFallbackValue:
+        if self._uses_nccl_fallback(database, normalized_query):
+            fallback = self._nccl_fallback(common.CommQuantMode.half)
+            try:
+                return fallback.hybrid_fallback_value(
+                    database,
+                    normalized_query=self._nccl_query(normalized_query, common.CommQuantMode.half),
+                    **kwargs,
+                )
+            except (PerfDataNotAvailableError, EmpiricalNotImplementedError):
+                pass
+        return super().hybrid_fallback_value(
+            database,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
 
     def _query_from_normalized(
         self,
@@ -504,6 +611,8 @@ class NCCL(Operation):
         *,
         seq_split: int = 1,
     ) -> None:
+        if isinstance(num_gpus, bool) or not isinstance(num_gpus, int) or num_gpus <= 0:
+            raise ValueError("NCCL num_gpus must be positive")
         super().__init__(name, scale_factor, seq_split=seq_split)
         self._nccl_op = nccl_op
         self._num_elements_per_token = num_elements_per_token
@@ -785,6 +894,22 @@ class NCCL(Operation):
             **kwargs,
         )
 
+    @staticmethod
+    def _curated_nccl_version_matches(database: PerfDatabase) -> bool:
+        environment = getattr(database, "measurement_environment", None)
+        if not isinstance(environment, MeasurementEnvironment):
+            return True
+        requested = environment.runtime_versions.get("nccl")
+        if not isinstance(requested, str) or not requested.strip():
+            return False
+        configured = database.system_spec.get("misc", {}).get("nccl_version")
+        return isinstance(configured, str) and configured.strip() == requested.strip()
+
+    @classmethod
+    def _require_curated_nccl_version_match(cls, database: PerfDatabase) -> None:
+        if not cls._curated_nccl_version_matches(database):
+            raise ValueError("NCCL runtime version does not match the configured fallback table")
+
     def _curated_exact_result_from_normalized(
         self,
         database: PerfDatabase,
@@ -802,6 +927,8 @@ class NCCL(Operation):
             return None
         if num_gpus == 1:
             return PerformanceResult(0.0, energy=0.0, source="curated_exact")
+        if not self._curated_nccl_version_matches(database):
+            return None
         self.load_data(database)
         wrapper = database._nccl_data
         by_operation = wrapper.data.get(dtype)
@@ -824,6 +951,9 @@ class NCCL(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         normalized = self.normalize_perf_query(**kwargs)
+        if int(normalized["num_gpus"]) <= 1:
+            return PerformanceResult(0.0, energy=0.0, source="empirical")
+        self._require_curated_nccl_version_match(database)
         return self._query_from_normalized(database, normalized)
 
     def provisional_result(
@@ -834,7 +964,25 @@ class NCCL(Operation):
         **kwargs,
     ) -> PerformanceResult:
         del kwargs
+        if int(normalized_query["num_gpus"]) <= 1:
+            return PerformanceResult(0.0, energy=0.0, source="empirical")
+        if not self._curated_nccl_version_matches(database):
+            return PerformanceResult(0.0, energy=0.0, source="unresolved")
         return self._query_from_normalized(database, normalized_query)
+
+    def hybrid_fallback_value(
+        self,
+        database: PerfDatabase,
+        *,
+        normalized_query: Mapping[str, object],
+        **kwargs,
+    ) -> HybridFallbackValue:
+        self._require_curated_nccl_version_match(database)
+        return super().hybrid_fallback_value(
+            database,
+            normalized_query=normalized_query,
+            **kwargs,
+        )
 
     def _query_from_normalized(
         self,

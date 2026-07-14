@@ -579,6 +579,227 @@ def test_exact_attention_runner_emits_one_padded_full_module_row_without_writing
     assert not tuple(tmp_path.iterdir())
 
 
+def test_attention_runner_accepts_a_broader_offline_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = "deepseek-ai/DeepSeek-V4-Pro"
+    protocol = MeasurementProtocol(
+        revision="cuda-event-samples-v1",
+        warmups=5,
+        samples=3,
+        statistic="median",
+        timer="cuda_event",
+        tuning_revision="sglang-dsv4-attn-v1",
+    )
+    case = {
+        "mode": "context",
+        "attn_kind": "csa",
+        "tp_size": 2,
+        "canonical_num_heads": 32,
+        "num_heads": 64,
+        "compress_ratio": 4,
+        "batch_size": 1,
+        "mla_dtype": "bfloat16",
+        "kv_cache_dtype": "fp8",
+        "gemm_type": "bfloat16",
+        "isl": 128,
+        "prefix": 0,
+        "model_path": model_path,
+    }
+
+    monkeypatch.setattr(
+        dsv4_attn,
+        "_prepare_dsv4_attn_case",
+        lambda **kwargs: dsv4_attn.PreparedDsv4AttentionCase(
+            kernel_func=lambda: None,
+            framework_version="0.5.13",
+            device_name="NVIDIA B200",
+            device=object(),
+            architecture=_ARCHITECTURE,
+            model_artifact=model_path,
+            mode="context",
+            attn_kind="csa",
+            compress_ratio=4,
+            tp_size=2,
+            canonical_num_heads=32,
+            padded_num_heads=64,
+            mla_dtype="bfloat16",
+            kv_cache_dtype="fp8",
+            gemm_type="bfloat16",
+        ),
+    )
+
+    @contextmanager
+    def _benchmark(**kwargs):
+        yield {
+            "latency_ms": 2.0,
+            "samples_ms": (1.5, 2.0, 2.5),
+            "power_stats": None,
+            "throttled": False,
+            "used_cuda_graph": True,
+        }
+
+    monkeypatch.setattr(dsv4_attn, "benchmark_with_power", _benchmark)
+
+    result = dsv4_attn.run_dsv4_attn_case(**case, protocol=protocol)
+
+    assert result.perf_row["model"] == model_path
+    assert result.perf_row["tp_size"] == 2
+    assert result.perf_row["num_heads"] == 64
+    assert result.perf_row["gemm_type"] == "bfloat16"
+    assert result.provenance["framework_version"] == "0.5.13"
+    assert result.provenance["tp_simulation"] == "single-gpu-tp2"
+
+
+def test_attention_runner_preserves_canonical_model_identity_for_local_offline_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_model = "/models/DeepSeek-V4-Pro"
+    monkeypatch.setattr(
+        dsv4_attn,
+        "_prepare_dsv4_attn_case",
+        lambda **kwargs: dsv4_attn.PreparedDsv4AttentionCase(
+            kernel_func=lambda: None,
+            framework_version="0.5.13",
+            device_name="NVIDIA B200",
+            device=object(),
+            architecture=_ARCHITECTURE,
+            model_artifact=local_model,
+            mode="context",
+            attn_kind="csa",
+            compress_ratio=4,
+            tp_size=2,
+            canonical_num_heads=32,
+            padded_num_heads=64,
+            mla_dtype="bfloat16",
+            kv_cache_dtype="fp8",
+            gemm_type="bfloat16",
+        ),
+    )
+
+    @contextmanager
+    def _benchmark(**kwargs):
+        yield {
+            "latency_ms": 2.0,
+            "samples_ms": (1.5, 2.0, 2.5),
+            "power_stats": None,
+            "throttled": False,
+            "used_cuda_graph": True,
+        }
+
+    monkeypatch.setattr(dsv4_attn, "benchmark_with_power", _benchmark)
+    result = dsv4_attn.run_dsv4_attn_case(
+        mode="context",
+        attn_kind="csa",
+        tp_size=2,
+        canonical_num_heads=32,
+        num_heads=64,
+        compress_ratio=4,
+        batch_size=1,
+        mla_dtype="bfloat16",
+        kv_cache_dtype="fp8",
+        gemm_type="bfloat16",
+        isl=128,
+        prefix=0,
+        protocol=_protocol(),
+        model_path=local_model,
+    )
+
+    assert result.perf_row["model"] == "deepseek-ai/DeepSeek-V4-Pro"
+    assert result.provenance["model_artifact"] == "deepseek-ai/DeepSeek-V4-Pro"
+
+
+def test_offline_attention_worker_delegates_each_shape_to_the_canonical_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from collector.sglang import collect_dsv4_attn
+
+    calls: list[dict[str, Any]] = []
+    logged: list[dict[str, Any]] = []
+    runtime = object()
+    runtime_events: list[object] = []
+
+    def _run_dsv4_attn_case(**kwargs):
+        assert kwargs["runtime"] is runtime
+        calls.append(kwargs)
+        return RawMeasurement(
+            latency_ms=1.0,
+            energy_wms=0.0,
+            samples_ms=(0.9, 1.0, 1.1),
+            statistic="median",
+            perf_row={
+                "model": kwargs["model_path"],
+                "architecture": _ARCHITECTURE,
+                "mla_dtype": kwargs["mla_dtype"],
+                "kv_cache_dtype": kwargs["kv_cache_dtype"],
+                "gemm_type": kwargs["gemm_type"],
+                "num_heads": kwargs["num_heads"],
+                "batch_size": kwargs["batch_size"],
+                "isl": kwargs["isl"],
+                "tp_size": kwargs["tp_size"],
+                "step": kwargs["prefix"],
+                "compress_ratio": kwargs["compress_ratio"],
+                "latency": 1.0,
+            },
+            provenance={
+                "framework": "SGLang",
+                "framework_version": "0.5.13",
+                "kernel_source": "compressed_flashmla",
+                "device": "NVIDIA B200",
+            },
+            protocol_digest=kwargs["protocol"].digest,
+        )
+
+    monkeypatch.setattr(collect_dsv4_attn, "_SEQ_LENGTHS", [8, 16])
+    monkeypatch.setattr(collect_dsv4_attn, "_PREFIX_LENGTHS", [0, 4])
+    monkeypatch.setattr(collect_dsv4_attn, "_filter_pairs", lambda mode, batches, seqs: [(2, sl) for sl in seqs])
+    monkeypatch.setattr(collect_dsv4_attn, "_is_valid_shape", lambda mode, bs, sl, prefix: True)
+    monkeypatch.setattr(
+        collect_dsv4_attn,
+        "open_dsv4_attn_runtime",
+        lambda **kwargs: runtime_events.append(("open", kwargs)) or runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_dsv4_attn,
+        "close_dsv4_attn_runtime",
+        lambda value: runtime_events.append(("close", value)),
+        raising=False,
+    )
+    monkeypatch.setattr(collect_dsv4_attn, "run_dsv4_attn_case", _run_dsv4_attn_case)
+    monkeypatch.setattr(collect_dsv4_attn, "log_perf", lambda **kwargs: logged.append(kwargs))
+    perf_filename = tmp_path / "dsv4_csa_context_module_perf.txt"
+
+    collect_dsv4_attn.run_dsv4_attn_worker(
+        0,
+        2,
+        2,
+        "fp8",
+        "bfloat16",
+        "bfloat16",
+        "deepseek-ai/DeepSeek-V4-Pro",
+        "csa",
+        perf_filename=str(perf_filename),
+        device="cuda:3",
+    )
+
+    assert {(call["isl"], call["prefix"]) for call in calls} == {
+        (8, 0),
+        (16, 0),
+        (8, 4),
+        (16, 4),
+    }
+    assert all(call["tp_size"] == 2 for call in calls)
+    assert all(call["canonical_num_heads"] == 32 for call in calls)
+    assert all(call["num_heads"] == 64 for call in calls)
+    assert all(call["device"] == "cuda:3" for call in calls)
+    assert [event[0] for event in runtime_events] == ["open", "close"]
+    assert runtime_events[-1] == ("close", runtime)
+    assert len(logged) == 4
+    assert all(log["perf_filename"] == str(perf_filename) for log in logged)
+
+
 def test_attention_runner_cleans_prepared_case_when_contract_validation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -602,7 +823,7 @@ def test_attention_runner_cleans_prepared_case_when_contract_validation_fails(
             device_name="NVIDIA GB200",
             device=object(),
             architecture=_ARCHITECTURE,
-            model_artifact=_MODEL_ARTIFACT,
+            model_artifact="other/model",
             mode=route.mode,
             attn_kind=route.attn_kind,
             compress_ratio=route.compress_ratio,
@@ -1192,74 +1413,7 @@ def test_attention_temp_cleanup_attempts_remaining_dirs_after_one_oserror(
     assert not removable.exists()
 
 
-def test_attention_only_dsv4_moe_preserves_stable_constructor_and_restores_binding() -> None:
-    class StableDeepseekV2MoE:
-        def __init__(self, *, config, layer_id: int, is_nextn: bool = False) -> None:
-            self.config = config
-            self.layer_id = layer_id
-            self.is_nextn = is_nextn
-
-        def get_moe_weights(self):
-            return ("stable-weight",)
-
-        def forward(self):
-            return "unsafe-moe-forward"
-
-    class DeepseekV2Module:
-        DeepseekV2MoE = StableDeepseekV2MoE
-
-    module = DeepseekV2Module()
-    with dsv4_attn._attention_only_dsv4_moe(module):
-        patched_type = module.DeepseekV2MoE
-        assert issubclass(patched_type, StableDeepseekV2MoE)
-        instance = patched_type(
-            config="dsv4",
-            layer_id=0,
-            is_nextn=False,
-            is_deepseek_v4=True,
-        )
-        assert instance.config == "dsv4"
-        assert instance.layer_id == 0
-        assert instance.get_moe_weights() == ("stable-weight",)
-        with pytest.raises(RuntimeError, match="must not execute the MoE path"):
-            instance.forward()
-
-    assert module.DeepseekV2MoE is StableDeepseekV2MoE
-    assert isinstance(instance, StableDeepseekV2MoE)
-
-
-def test_attention_only_dsv4_moe_forwards_flag_when_constructor_supports_it() -> None:
-    class CandidateDeepseekV2MoE:
-        def __init__(self, *, is_deepseek_v4: bool = False) -> None:
-            self.is_deepseek_v4 = is_deepseek_v4
-
-        def forward(self):
-            return "unsafe-moe-forward"
-
-    class DeepseekV2Module:
-        DeepseekV2MoE = CandidateDeepseekV2MoE
-
-    module = DeepseekV2Module()
-    with dsv4_attn._attention_only_dsv4_moe(module):
-        instance = module.DeepseekV2MoE(is_deepseek_v4=True)
-
-    assert instance.is_deepseek_v4 is True
-    assert module.DeepseekV2MoE is CandidateDeepseekV2MoE
-
-
-def test_attention_only_dsv4_moe_rejects_non_dsv4_use_and_restores_after_error() -> None:
-    class StableDeepseekV2MoE:
-        def __init__(self) -> None:
-            raise AssertionError("base constructor must not run for an invalid call")
-
-    class DeepseekV2Module:
-        DeepseekV2MoE = StableDeepseekV2MoE
-
-    module = DeepseekV2Module()
-    with (
-        pytest.raises(ValueError, match="requires is_deepseek_v4=True"),
-        dsv4_attn._attention_only_dsv4_moe(module),
-    ):
-        module.DeepseekV2MoE()
-
-    assert module.DeepseekV2MoE is StableDeepseekV2MoE
+def test_attention_runner_does_not_patch_sglang_moe_class() -> None:
+    source = inspect.getsource(dsv4_attn)
+    assert "DeepseekV2MoE =" not in source
+    assert "_attention_only_dsv4_moe" not in source

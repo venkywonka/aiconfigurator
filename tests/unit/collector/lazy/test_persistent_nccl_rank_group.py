@@ -35,6 +35,33 @@ def test_uneven_alltoall_uses_rank_specific_receive_splits() -> None:
     assert executor._nccl_alltoall_splits(5, 2, 1) == ((3, 2), (2, 2))
 
 
+def test_torch_nccl_rank_backend_allocates_bfloat16_for_bfloat16_request() -> None:
+    executor = importlib.import_module("aiconfigurator.collector.executor")
+    bootstrap = executor.NcclRankBootstrap(
+        rank=0,
+        world_size=2,
+        device_uuid="GPU-0",
+        protocol=_protocol(),
+    )
+    backend = executor._TorchNcclRankBackend(bootstrap)
+    fake_tensor = SimpleNamespace(clone=lambda: fake_tensor, copy_=lambda other: None)
+    fake_torch = SimpleNamespace(
+        bfloat16=object(),
+        float16=object(),
+        int8=object(),
+    )
+    allocated_dtypes: list[object] = []
+    backend._torch = fake_torch
+    backend._dist = SimpleNamespace(all_reduce=lambda tensor: None)
+    backend._tensor = lambda count, dtype: allocated_dtypes.append(dtype) or fake_tensor
+
+    prepare, invoke = backend._prepare_case("bfloat16", "all_reduce", 16)
+    prepare()
+    invoke()
+
+    assert allocated_dtypes == [fake_torch.bfloat16]
+
+
 def _api() -> SimpleNamespace:
     executor = importlib.import_module("aiconfigurator.collector.executor")
     missing = tuple(name for name in _API_NAMES if not hasattr(executor, name))

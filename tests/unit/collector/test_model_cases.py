@@ -401,7 +401,7 @@ def test_gptoss_mxfp4_modes_are_additive_on_blackwell():
 
 
 def test_sglang_mxfp4_quant_labels_select_explicit_activation_precision():
-    source_path = REPO_ROOT / "collector/sglang/collect_moe.py"
+    source_path = REPO_ROOT / "collector/sglang/moe_runtime.py"
     tree = ast.parse(source_path.read_text(), filename=str(source_path))
     helper = next(
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_mxfp4_activation_precision"

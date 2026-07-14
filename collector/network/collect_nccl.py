@@ -1,24 +1,42 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Collect NCCL collective latency with nccl-tests binaries.
+"""Offline NCCL sweep backed by the installable exact-case runner."""
 
-This collector wraps the standard nccl-tests command-line tools for all-gather,
-all-to-all, reduce-scatter, and all-reduce sweeps. It translates the benchmark
-output into AIC perf rows and optionally samples representative GPU power while
-each collective size is measured.
-"""
+from __future__ import annotations
 
-import subprocess
-import sys
+import os
 from argparse import ArgumentParser
-from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
 
-import torch
+from aiconfigurator.collector.network.nccl import close_nccl_worker, get_nccl_test_cases, run_nccl_case
+from aiconfigurator.sdk.resolution.types import MeasurementProtocol
+from collector.helper import log_perf
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from helper import PowerMonitor, log_perf
+@contextmanager
+def _offline_gpu_visibility(num_gpus: int) -> Iterator[None]:
+    """Bind this one-shot offline process to exactly the requested GPU slice."""
+
+    original = os.environ.get("CUDA_VISIBLE_DEVICES")
+    available = tuple(value.strip() for value in (original or "").split(",") if value.strip())
+    if original is not None and len(available) < num_gpus:
+        raise RuntimeError(
+            "offline NCCL sweep does not have enough visible GPUs: "
+            f"visible={len(available)}, requested={num_gpus}"
+        )
+    selected = (
+        available[:num_gpus] if original is not None else tuple(str(index) for index in range(num_gpus))
+    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(selected)
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original
 
 
 def nccl_benchmark(
@@ -27,97 +45,35 @@ def nccl_benchmark(
     test_range: str = "10,10000000,1000",
     num_gpus: int = 8,
     measure_power: bool = False,
-):
-    nccl_test_bin = ""
-    if nccl_op == "all_gather":
-        nccl_test_bin = "all_gather_perf"
-    elif nccl_op == "alltoall":
-        nccl_test_bin = "alltoall_perf"
-    elif nccl_op == "reduce_scatter":
-        nccl_test_bin = "reduce_scatter_perf"
-    elif nccl_op == "all_reduce":
-        nccl_test_bin = "all_reduce_perf"
-    assert nccl_test_bin != ""
+) -> None:
+    """Expand the offline range, execute canonical cases, and persist their rows."""
 
-    min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
-    size = min_size
-
-    major, minor, patch = torch.cuda.nccl.version()
-    nccl_version = f"{major}.{minor}.{patch}"
-
-    bytes_per_element = 2 if dtype == "half" else 1
-
-    # Initialize power monitoring if enabled
-    power_monitor = None
     if measure_power:
-        # Use GPU 0 for power monitoring (representative in multi-GPU scenarios)
-        power_monitor = PowerMonitor(device_id=0)
-        if not power_monitor._init_handle():
-            print("Warning: Failed to initialize power monitoring, continuing without power measurement")
-            power_monitor = None
-
-    while size < max_size:
-        inner_loop = 100 if size <= 16777216 else 60
-        cmd_args = [
-            nccl_test_bin,
-            "-b",
-            str(size),
-            "-e",
-            str(size),
-            "-t",
-            str(num_gpus),
-            "-d",
-            dtype,
-            "-w",
-            "40",
-            "-a",
-            "1",
-            "-n",
-            str(inner_loop),
-            "-c",
-            "0",
-        ]
-
-        # Start power monitoring before benchmark
-        power_stats = None
-        if power_monitor:
-            power_monitor.start_sampling()
-
-        result = subprocess.run(cmd_args, capture_output=True, text=True)
-
-        # Stop power monitoring after benchmark
-        if power_monitor:
-            power_stats = power_monitor.stop_sampling()
-
-        print_lines = result.stdout.split("\n")
-        for index_line in range(len(print_lines)):
-            if "time" in print_lines[index_line]:
-                break
-        latency = float(print_lines[index_line + 2].split()[5]) * 1e-3  # us to ms
-
-        print(nccl_test_bin, f"{size=}, {latency=}")
-        if power_stats:
-            print(f"  Power: {power_stats['power']:.2f}W (limit: {power_stats['power_limit']:.2f}W)")
-
-        log_perf(
-            item_list=[
-                {
-                    "nccl_dtype": dtype,
-                    "num_gpus": num_gpus,
-                    "message_size": size // bytes_per_element,
-                    "latency": latency,
-                }
-            ],
-            framework="TRTLLM",
-            version=nccl_version,
-            device_name=torch.cuda.get_device_name(),
-            op_name=nccl_op,
-            kernel_source="NCCL",
-            perf_filename="nccl_perf.txt",
-            power_stats=power_stats,
-        )
-
-        size *= ratio
+        raise ValueError("persistent NCCL collection does not support power sampling")
+    protocol = MeasurementProtocol(
+        revision="cuda-event-samples-v1",
+        warmups=5,
+        samples=10,
+        statistic="median",
+        timer="cuda_event",
+        tuning_revision="torch-nccl-persistent-v1",
+    )
+    with _offline_gpu_visibility(num_gpus):
+        try:
+            for case in get_nccl_test_cases(dtype, nccl_op, test_range, num_gpus):
+                raw = run_nccl_case(*case, protocol=protocol)
+                log_perf(
+                    item_list=[dict(raw.perf_row)],
+                    framework=str(raw.provenance["framework"]),
+                    version=str(raw.provenance["framework_version"]),
+                    device_name=str(raw.provenance["device"]),
+                    op_name=nccl_op,
+                    kernel_source=str(raw.provenance["kernel_source"]),
+                    perf_filename="nccl_perf.txt",
+                    power_stats=None,
+                )
+        finally:
+            close_nccl_worker()
 
 
 if __name__ == "__main__":
@@ -129,26 +85,33 @@ if __name__ == "__main__":
         choices=["all_gather", "alltoall", "reduce_scatter", "all_reduce"],
         help="NCCL OP: all_gather, alltoall, reduce_scatter, all_reduce",
     )
-    parser.add_argument("--dtype", "-t", default="half", choices=["half", "int8"], help="NCCL OP data type")
+    parser.add_argument(
+        "--dtype",
+        "-t",
+        default="half",
+        choices=["half", "bfloat16", "int8"],
+        help="NCCL OP data type",
+    )
     parser.add_argument(
         "--range",
         "-r",
-        default="512,536870913,2",  # 512B to 512MB
+        default="512,536870913,2",
         help="min_size,max_size,multiplicative_ratio",
     )
     parser.add_argument("--num_gpus", "-n", default=8, type=int)
     parser.add_argument(
         "--measure_power",
         action="store_true",
-        help="Enable power monitoring during NCCL benchmark execution (samples at 100ms intervals)",
+        help="Enable power monitoring during NCCL benchmark execution",
     )
     parser.add_argument(
         "--power_test_duration_sec",
         type=float,
         default=1.0,
-        help="Minimum duration for benchmark runs when power measurement is enabled (default: 1.0s). "
-        "Note: NCCL tests already run long enough, so this is informational only.",
+        help="Retained CLI compatibility; nccl-tests already runs long enough for power sampling",
     )
     args = parser.parse_args()
-
     nccl_benchmark(args.dtype, args.nccl_op, args.range, args.num_gpus, args.measure_power)
+
+
+__all__ = ["nccl_benchmark"]

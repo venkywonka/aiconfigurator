@@ -342,25 +342,34 @@ class TestRegistryIntegrity:
 
     @staticmethod
     def _module_top_level_names(module_dotpath: str) -> set[str]:
-        """Parse a collector module source via AST and return top-level def/class names.
+        """Parse a collector module source via AST and return bound top-level names.
 
         Uses AST so that heavy runtime dependencies (torch, tensorrt_llm, …)
-        do NOT need to be installed.
+        do NOT need to be installed. Explicit ``from module import name``
+        bindings count because source wrappers may intentionally re-export the
+        installable canonical runner instead of defining a second callable.
         """
         parts = module_dotpath.split(".")
         source_file = Path(*parts).with_suffix(".py")
         if not source_file.exists():
             return set()
         tree = ast.parse(source_file.read_text(), filename=str(source_file))
-        return {
+        defined = {
             node.name
             for node in ast.iter_child_nodes(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         }
+        imported = {
+            alias.asname or alias.name
+            for node in ast.iter_child_nodes(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+            if alias.name != "*"
+        }
+        return defined | imported
 
     def test_module_exports_declared_functions(self, registry):
-        """Every module referenced in the registry must define the declared
-        get_func and run_func at the module's top level.
+        """Every registry module must bind its declared functions at top level.
 
         Uses AST parsing so the test works without GPU/framework dependencies.
         """

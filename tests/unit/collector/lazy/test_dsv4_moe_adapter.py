@@ -455,6 +455,244 @@ def test_exact_moe_runner_returns_one_raw_rank_local_row_without_logging(monkeyp
     assert not tuple(tmp_path.iterdir())
 
 
+def test_moe_runner_accepts_a_broader_offline_case(monkeypatch) -> None:
+    runner, _ = _moe_modules()
+    model_path = "deepseek-ai/DeepSeek-V4-Pro"
+    query = {
+        "num_tokens": 32,
+        "hidden_size": 7168,
+        "inter_size": 18432,
+        "topk": 8,
+        "num_experts": 256,
+        "moe_tp_size": 2,
+        "moe_ep_size": 8,
+        "quant_mode": "bfloat16",
+        "workload_distribution": "balanced",
+    }
+    monkeypatch.setattr(
+        runner,
+        "_prepare_moe_case",
+        lambda *args: SimpleNamespace(
+            kernel_func=lambda: None,
+            framework_version="0.5.13",
+            device_name="NVIDIA B200",
+            device=object(),
+            model_artifact=model_path,
+            kernel_source="sglang_fused_moe_triton",
+            workload_generator="balanced-v1",
+            seed=0,
+            rank_simulation="single-gpu-ep8-rank0",
+            **query,
+        ),
+    )
+
+    @contextmanager
+    def _benchmark(**kwargs):
+        yield {
+            "latency_ms": 2.0,
+            "samples_ms": (1.5, 2.0, 2.5),
+            "power_stats": None,
+            "throttled": False,
+            "used_cuda_graph": True,
+        }
+
+    monkeypatch.setattr(runner, "benchmark_with_power", _benchmark)
+
+    result = runner.run_moe_case(**query, protocol=_protocol(), model_path=model_path)
+
+    assert result.perf_row["moe_dtype"] == "bfloat16"
+    assert result.perf_row["hidden_size"] == 7168
+    assert result.perf_row["moe_tp_size"] == 2
+    assert result.perf_row["moe_ep_size"] == 8
+    assert result.provenance["model_artifact"] == model_path
+
+
+def test_offline_online_profile_moe_worker_delegates_to_the_canonical_runner(monkeypatch, tmp_path) -> None:
+    from collector.sglang import collect_moe
+
+    calls: list[dict[str, Any]] = []
+    logged: list[dict[str, Any]] = []
+
+    def _run_moe_case(**kwargs):
+        calls.append(kwargs)
+        return RawMeasurement(
+            latency_ms=1.0,
+            energy_wms=0.0,
+            samples_ms=(0.9, 1.0, 1.1),
+            statistic="median",
+            perf_row={
+                "moe_dtype": kwargs["quant_mode"],
+                "num_tokens": kwargs["num_tokens"],
+                "hidden_size": kwargs["hidden_size"],
+                "inter_size": kwargs["inter_size"],
+                "topk": kwargs["topk"],
+                "num_experts": kwargs["num_experts"],
+                "moe_tp_size": kwargs["moe_tp_size"],
+                "moe_ep_size": kwargs["moe_ep_size"],
+                "distribution": kwargs["workload_distribution"],
+                "latency": 1.0,
+            },
+            provenance={
+                "framework": "SGLang",
+                "framework_version": "0.5.13",
+                "kernel_source": "sglang_fused_moe_triton",
+                "device": "NVIDIA B200",
+            },
+            protocol_digest=kwargs["protocol"].digest,
+        )
+
+    monkeypatch.setattr(collect_moe, "run_moe_case", _run_moe_case)
+    monkeypatch.setattr(
+        collect_moe,
+        "get_moe_quantization_module_config",
+        lambda backend, mode, *, model_name: {"group_size": 32},
+    )
+    monkeypatch.setattr(collect_moe, "log_perf", lambda **kwargs: logged.append(kwargs))
+    perf_filename = tmp_path / "moe_perf.txt"
+
+    collect_moe.run_moe_torch(
+        "fp8_block",
+        19,
+        4096,
+        2048,
+        6,
+        256,
+        1,
+        4,
+        "sgl-project/DeepSeek-V4-Flash-FP8",
+        "power_law",
+        1.01,
+        perf_filename=str(perf_filename),
+        device="cuda:2",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["workload_distribution"] == "power_law_1.01"
+    assert calls[0]["model_path"] == "sgl-project/DeepSeek-V4-Flash-FP8"
+    assert "int4_group_size" not in calls[0]
+    assert calls[0]["device"] == "cuda:2"
+    assert "allow_graph_fail" not in calls[0]
+    assert len(logged) == 1
+    assert logged[0]["perf_filename"] == str(perf_filename)
+
+
+def test_offline_only_moe_quantization_stays_out_of_the_online_runner(monkeypatch, tmp_path) -> None:
+    from collector.sglang import collect_moe
+
+    calls: list[tuple[object, ...]] = []
+    logged: list[dict[str, Any]] = []
+
+    def _run_moe_torch(*args, **kwargs):
+        calls.append((*args, kwargs))
+        return {
+            "latency_ms": 3.0,
+            "samples_ms": (2.5, 3.0, 3.5, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0),
+            "power_stats": {"power": 200.0},
+            "throttled": False,
+            "used_cuda_graph": True,
+            "framework_version": "0.5.13",
+            "device_name": "NVIDIA B200",
+            "kernel_source": "sglang_marlin_moe",
+            "perf_row": {
+                "moe_dtype": "int4_wo",
+                "num_tokens": 32,
+                "hidden_size": 4096,
+                "inter_size": 2048,
+                "topk": 6,
+                "num_experts": 256,
+                "moe_tp_size": 1,
+                "moe_ep_size": 4,
+                "distribution": "power_law_1.01",
+                "latency": 3.0,
+            },
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "collector.sglang.moe_runtime",
+        SimpleNamespace(run_moe_torch=_run_moe_torch),
+    )
+    monkeypatch.setattr(
+        collect_moe,
+        "run_moe_case",
+        lambda **_kwargs: pytest.fail("offline-only quantization reached the online runner"),
+    )
+    monkeypatch.setattr(collect_moe, "log_perf", lambda **kwargs: logged.append(kwargs))
+
+    result = collect_moe.run_moe_torch(
+        "int4_wo",
+        32,
+        4096,
+        2048,
+        6,
+        256,
+        1,
+        4,
+        "moonshotai/Kimi-K2.5",
+        "power_law",
+        1.01,
+        perf_filename=str(tmp_path / "moe_perf.txt"),
+        device="cuda:2",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "int4_wo"
+    assert calls[0][-1]["num_iterations"] == 10
+    assert calls[0][-1]["int4_group_size"] == 32
+    assert result.perf_row["kernel_source"] == "sglang_marlin_moe"
+    assert len(logged) == 1
+
+
+@pytest.mark.parametrize("quant_mode", ["nvfp4", "int4_wo", "w4a16_mxfp4", "w4a8_mxfp4_mxfp8"])
+def test_canonical_moe_runner_rejects_offline_only_quantization(quant_mode) -> None:
+    runner, _ = _moe_modules()
+
+    with pytest.raises(ValueError, match="unsupported SGLang online MoE quant_mode"):
+        runner.run_moe_case(
+            32,
+            4096,
+            2048,
+            6,
+            256,
+            1,
+            4,
+            quant_mode,
+            "power_law_1.01",
+            protocol=_protocol(),
+            model_path="moonshotai/Kimi-K2.5",
+        )
+
+
+def test_online_moe_uses_public_server_args_and_native_sglang_reduction() -> None:
+    runner, _ = _moe_modules()
+    source = inspect.getsource(runner._prepare_moe_case)
+    assert "MagicMock" not in source
+    assert "._global_server_args" not in source
+    assert "moe_sum_reduce_torch_compile =" not in source
+    assert "set_global_server_args_for_scheduler" in source
+
+
+def test_all_moe_backends_share_the_same_balanced_expert_generator() -> None:
+    runner, _ = _moe_modules()
+
+    logits_source = inspect.getsource(runner._balanced_logits)
+    workload_source = inspect.getsource(runner._rank0_workloads)
+
+    assert "_balanced_selected_experts" in logits_source
+    assert "_balanced_selected_experts" in workload_source
+    assert "arange(num_tokens * topk)" not in workload_source
+
+
+def test_offline_and_canonical_moe_entrypoints_share_the_swiglu_default() -> None:
+    from collector.sglang import collect_moe
+
+    runner, _ = _moe_modules()
+    offline_default = inspect.signature(collect_moe.run_moe_torch).parameters["swiglu_limit"].default
+    canonical_default = inspect.signature(runner.run_moe_case).parameters["swiglu_limit"].default
+
+    assert offline_default == canonical_default
+
+
 def test_power_law_routing_is_seeded_on_the_requested_gpu() -> None:
     runner, _ = _moe_modules()
 
@@ -579,6 +817,8 @@ def test_moe_runner_is_exact_only_import_light_and_has_no_offline_output_api(mon
     assert {"output_path", "perf_filename", "num_tokens_cases", "model_cases"}.isdisjoint(
         inspect.signature(runner.run_moe_case).parameters
     )
+    assert "int4_group_size" not in inspect.signature(runner.run_moe_case).parameters
+    assert "allow_graph_fail" not in inspect.signature(runner.run_moe_case).parameters
     source = Path(runner.__file__).read_text()
     assert "log_perf" not in source
     assert "from collector" not in source

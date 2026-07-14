@@ -5,7 +5,8 @@ from types import ModuleType
 import pytest
 
 from aiconfigurator.collector.adapters import ResolvedLazyAdapter
-from aiconfigurator.collector.preflight import OperationKind
+from aiconfigurator.collector.network.registry import NCCL_LAZY_SPEC
+from aiconfigurator.collector.preflight import OperationKind, preflight_capabilities
 from aiconfigurator.collector.registry_types import OpEntry, PerfFile
 from aiconfigurator.collector.sglang.registry import (
     CUSTOM_ALLREDUCE_LAZY_SPEC,
@@ -77,6 +78,7 @@ def test_frozen_dsv4_profile_classifies_every_reachable_operation(dsv4_profile_m
         perf_namespace(str(PerfFile.MHC_MODULE)),
         perf_namespace(str(PerfFile.MOE)),
         perf_namespace(str(PerfFile.CUSTOM_ALLREDUCE)),
+        perf_namespace(str(PerfFile.NCCL)),
         perf_namespace(str(PerfFile.DSV4_CSA_CONTEXT_MODULE)),
         perf_namespace(str(PerfFile.DSV4_HCA_CONTEXT_MODULE)),
         perf_namespace(str(PerfFile.DSV4_CSA_GENERATION_MODULE)),
@@ -97,6 +99,22 @@ def test_capability_walk_is_static_and_does_not_query_operations(
     assert capabilities
 
 
+def test_frozen_dsv4_profile_preflight_accepts_shape_dependent_collective_routes(
+    dsv4_profile_model,
+) -> None:
+    capabilities = _reachable_capabilities(dsv4_profile_model)
+
+    resolved = preflight_capabilities(
+        capabilities,
+        backend="sglang",
+        backend_version="0.5.10rc0",
+        routes_for=lambda identity: (identity,),
+    )
+
+    assert (perf_namespace(str(PerfFile.CUSTOM_ALLREDUCE)), "sglang", "0.5.10rc0") in resolved
+    assert (perf_namespace(str(PerfFile.NCCL)), "sglang", "0.5.10rc0") in resolved
+
+
 def test_unknown_operation_fails_closed_as_unsupported() -> None:
     operation = Operation("unknown", 1.0)
 
@@ -115,6 +133,14 @@ def test_unknown_operation_fails_closed_as_unsupported() -> None:
         (MOE_LAZY_SPEC, ResourceContract(1, FabricRequirement.NONE)),
         (
             CUSTOM_ALLREDUCE_LAZY_SPEC,
+            ResourceContract(
+                4,
+                FabricRequirement.NVLINK,
+                reserve_fabric_domain=True,
+            ),
+        ),
+        (
+            NCCL_LAZY_SPEC,
             ResourceContract(
                 4,
                 FabricRequirement.NVLINK,

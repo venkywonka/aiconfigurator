@@ -171,50 +171,28 @@ def test_packaged_mhc_runner_selects_registered_compressed_backend(monkeypatch: 
     _assert_dsv4_server_args(captured)
 
 
-def test_source_attention_collector_selects_registered_compressed_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_source_attention_collector_delegates_backend_selection_to_packaged_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source_attention = _load_source_collector(
         monkeypatch,
         module_name="_r25_source_attention",
         relative_path="collector/sglang/collect_dsv4_attn.py",
     )
-    captured = _install_backend_capture_runtime(monkeypatch)
-    monkeypatch.setattr(source_attention, "torch", _fake_torch())
-    monkeypatch.setattr(source_attention, "validate_deepseek_v4_runtime_contract", lambda: None)
-    monkeypatch.setattr(source_attention, "_resolve_model_path", lambda *_args, **_kwargs: "/tmp/model")
-    monkeypatch.setattr(source_attention, "_pick_free_port", lambda _shard: 45101)
-
-    with pytest.raises(_BackendCapturedError):
-        source_attention._load_model_runner(
-            "model",
-            attn_kind="csa",
-            num_layers=1,
-            kv_cache_dtype="fp8_e4m3",
-            device="cuda:0",
-            shrink_unused_moe=True,
-            disable_weight_quant=False,
-            gemm_type="fp8_block",
-            tp_size=4,
-            max_total_tokens=128,
-        )
-
-    _assert_dsv4_server_args(captured)
+    assert source_attention.run_dsv4_attn_case is packaged_attention.run_dsv4_attn_case
+    assert not hasattr(source_attention, "_load_model_runner")
 
 
-def test_source_mhc_collector_selects_registered_compressed_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_source_mhc_collector_delegates_backend_selection_to_packaged_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source_mhc = _load_source_collector(
         monkeypatch,
         module_name="_r25_source_mhc",
         relative_path="collector/sglang/collect_mhc_module.py",
     )
-    captured = _install_backend_capture_runtime(monkeypatch)
-    monkeypatch.setattr(source_mhc, "torch", _fake_torch())
-    monkeypatch.setattr(source_mhc, "validate_deepseek_v4_runtime_contract", lambda: None)
-    monkeypatch.setattr(source_mhc, "_patched_model_dir", lambda *_args: "/tmp/model")
-
-    with pytest.raises(_BackendCapturedError):
-        source_mhc._load_one_layer_runner("model", "cuda:0", 0.5)
-
-    _assert_dsv4_server_args(captured)
+    assert source_mhc.run_mhc_case is packaged_mhc.run_mhc_case
+    assert not hasattr(source_mhc, "_load_one_layer_runner")
 
 
 def test_active_dsv4_collectors_do_not_depend_on_runtime_sglang_patch(

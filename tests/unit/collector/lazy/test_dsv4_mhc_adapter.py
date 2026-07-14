@@ -524,6 +524,20 @@ def test_mhc_runner_preserves_benchmark_failure_when_cleanup_also_fails(monkeypa
         mhc.run_mhc_case("pre", 19, 4096, 4, 20, "bfloat16", protocol=_protocol())
 
 
+def test_mhc_cleanup_resets_sglang_expert_location_for_the_next_exact_case(monkeypatch) -> None:
+    expert_location = SimpleNamespace(_global_expert_location_metadata=object())
+    monkeypatch.setattr(
+        mhc,
+        "import_module",
+        lambda name: expert_location if name == "sglang.srt.eplb.expert_location" else None,
+        raising=False,
+    )
+
+    mhc._reset_sglang_process_globals()
+
+    assert expert_location._global_expert_location_metadata is None
+
+
 def test_mhc_patched_model_dirs_are_unique_and_removed(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         mhc,
@@ -600,3 +614,129 @@ def test_mhc_runner_is_exact_only_import_light_and_has_no_offline_output_api(mon
 
     monkeypatch.setattr(builtins, "__import__", _guarded_import)
     importlib.import_module(module_name)
+
+
+def test_canonical_mhc_runner_accepts_the_broader_offline_model_domain(monkeypatch) -> None:
+    model_path = "deepseek-ai/DeepSeek-V4-Pro"
+    prepared = mhc.PreparedMhcCase(
+        kernel_func=lambda: None,
+        framework_version="0.5.10",
+        device_name="NVIDIA GB200",
+        device=object(),
+        architecture="DeepseekV4ForCausalLM",
+        model_artifact=model_path,
+        num_sites=2,
+        hidden_size=7168,
+        hc_mult=4,
+        sinkhorn_iters=20,
+        quant_mode="bfloat16",
+    )
+    monkeypatch.setattr(mhc, "_prepare_mhc_case", lambda *args: prepared)
+
+    @contextmanager
+    def benchmark(**kwargs):
+        del kwargs
+        yield {
+            "latency_ms": 1.5,
+            "samples_ms": (1.0, 1.5, 2.0),
+            "used_cuda_graph": True,
+            "throttled": False,
+            "power_stats": None,
+        }
+
+    monkeypatch.setattr(mhc, "benchmark_with_power", benchmark)
+
+    raw = mhc.run_mhc_case(
+        "pre",
+        8,
+        7168,
+        4,
+        20,
+        "bfloat16",
+        protocol=_protocol(),
+        model_path=model_path,
+    )
+
+    assert raw.perf_row["hidden_size"] == 7168
+    assert raw.provenance["model_artifact"] == model_path
+
+
+def test_offline_mhc_sweep_uses_only_the_canonical_runner(monkeypatch, tmp_path) -> None:
+    from collector.sglang import collect_mhc_module
+
+    model_path = "deepseek-ai/DeepSeek-V4-Pro"
+    profile = SimpleNamespace(
+        phase="pre",
+        hidden_size=7168,
+        hc_mult=4,
+        num_tokens_list=[8, 16],
+        model_name=model_path,
+    )
+    runner_calls = []
+    log_calls = []
+    runtime = object()
+    runtime_events = []
+
+    def run_case(op, num_tokens, hidden_size, hc_mult, sinkhorn_iters, quant_mode, **kwargs):
+        assert kwargs["runtime"] is runtime
+        runner_calls.append((op, num_tokens, hidden_size, hc_mult, sinkhorn_iters, quant_mode, kwargs))
+        return RawMeasurement(
+            latency_ms=float(num_tokens),
+            energy_wms=0.0,
+            samples_ms=(float(num_tokens),) * kwargs["protocol"].samples,
+            statistic="median",
+            perf_row={
+                "architecture": "DeepseekV4ForCausalLM",
+                "op_name": op,
+                "num_tokens": num_tokens,
+                "num_sites": 2,
+                "hc_mult": hc_mult,
+                "hidden_size": hidden_size,
+                "sinkhorn_iters": sinkhorn_iters,
+                "quant_mode": quant_mode,
+                "latency": float(num_tokens),
+            },
+            provenance={
+                "framework": "SGLang",
+                "framework_version": "0.5.10",
+                "device": "NVIDIA GB200",
+                "kernel_source": "sglang_mhc",
+            },
+            protocol_digest=kwargs["protocol"].digest,
+            power_stats=None,
+        )
+
+    monkeypatch.setattr(collect_mhc_module, "get_common_mhc_test_cases", lambda: [profile])
+    monkeypatch.setattr(
+        collect_mhc_module,
+        "open_mhc_runtime",
+        lambda **kwargs: runtime_events.append(("open", kwargs)) or runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_mhc_module,
+        "close_mhc_runtime",
+        lambda value: runtime_events.append(("close", value)),
+        raising=False,
+    )
+    monkeypatch.setattr(collect_mhc_module, "run_mhc_case", run_case)
+    monkeypatch.setattr(collect_mhc_module, "log_perf", lambda **kwargs: log_calls.append(kwargs))
+
+    results = collect_mhc_module.run_mhc_module(
+        ops=["pre"],
+        num_tokens_cases=[8, 16],
+        model_path=model_path,
+        num_warmup=5,
+        num_iterations=7,
+        device="cuda:2",
+        output_path=str(tmp_path),
+    )
+
+    assert [call[1] for call in runner_calls] == [8, 16]
+    assert all(call[-1]["model_path"] == model_path for call in runner_calls)
+    assert all(call[-1]["protocol"].warmups == 5 for call in runner_calls)
+    assert all(call[-1]["protocol"].samples == 7 for call in runner_calls)
+    assert [event[0] for event in runtime_events] == ["open", "close"]
+    assert runtime_events[-1] == ("close", runtime)
+    assert [call["item_list"][0]["num_tokens"] for call in log_calls] == [8, 16]
+    assert [result["num_tokens"] for result in results] == [8, 16]

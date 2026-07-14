@@ -15,13 +15,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiconfigurator.collector.types import RawMeasurement
+from aiconfigurator.sdk.operations.communication import SGLANG_CUSTOM_ALLREDUCE_MAX_BYTES
 from aiconfigurator.sdk.resolution.types import MeasurementProtocol
 
 _MODEL_ARTIFACT = "sgl-project/DeepSeek-V4-Flash-FP8"
 _SUPPORTED_SGLANG_VERSIONS = frozenset({"0.5.10", "0.5.10rc0"})
 _REPEATS_PER_GRAPH = 5
 _PHYSICAL_BYTES_PER_ELEMENT = 2
-_MAX_CUSTOM_ALLREDUCE_BYTES = 8 * 1024 * 1024
 _PERSISTENT_RANK_GROUP: Any = None
 _PERSISTENT_DEVICE_UUIDS: tuple[str, ...] = ()
 
@@ -156,7 +156,7 @@ def _validate_case(dtype: str, world_size: int, element_count: int) -> None:
     physical_bytes = element_count * _PHYSICAL_BYTES_PER_ELEMENT
     if physical_bytes % 16:
         raise ValueError("CustomAllReduce physical byte size must be a multiple of 16")
-    if physical_bytes > _MAX_CUSTOM_ALLREDUCE_BYTES:
+    if physical_bytes > SGLANG_CUSTOM_ALLREDUCE_MAX_BYTES:
         raise ValueError("CustomAllReduce element_count exceeds the SGLang 8 MiB maximum")
 
 

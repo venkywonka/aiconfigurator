@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import copy
+import sys
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,6 +25,7 @@ from aiconfigurator.sdk import common
 from aiconfigurator.sdk.operations.communication import NCCL
 from aiconfigurator.sdk.perf_database import PerfDatabase
 from aiconfigurator.sdk.performance_result import PerformanceResult
+from aiconfigurator.sdk.resolution.overlay import OverlayStore
 from aiconfigurator.sdk.resolution.types import (
     MeasurementEnvironment,
     MeasurementProtocol,
@@ -32,6 +36,44 @@ from aiconfigurator.sdk.resolution.types import (
 pytestmark = pytest.mark.unit
 
 _NAMESPACE = f"{PerfFile.NCCL}/v1"
+
+
+@pytest.mark.parametrize(
+    ("raw_version", "expected"),
+    (((2, 27, 7), "2.27.7"), (22800, "2.28.0")),
+)
+def test_nccl_worker_provenance_normalizes_every_supported_runtime_version_form(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_version: object,
+    expected: str,
+) -> None:
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            nccl=SimpleNamespace(version=lambda: raw_version),
+            get_device_name=lambda: "NVIDIA GB200",
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    provenance = nccl_runner._persistent_provenance(SimpleNamespace(device_uuids=("GPU-0",), rank_pids=(1234,)))
+
+    assert provenance["framework_version"] == expected
+    assert provenance["device"] == "NVIDIA GB200"
+
+
+def test_nccl_worker_provenance_fails_closed_without_runtime_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            nccl=SimpleNamespace(version=lambda: None),
+            get_device_name=lambda: "NVIDIA GB200",
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    with pytest.raises(RuntimeError, match="attest"):
+        nccl_runner._persistent_provenance(SimpleNamespace())
 
 
 def _environment() -> MeasurementEnvironment:
@@ -102,6 +144,19 @@ def _operation(*, scale_factor: float = 1.0) -> NCCL:
         comm_quant_mode=common.CommQuantMode.half,
         seq_split=4,
     )
+
+
+@pytest.mark.parametrize("num_gpus", [0, -1])
+def test_nccl_rejects_nonpositive_world_sizes(num_gpus: int) -> None:
+    with pytest.raises(ValueError, match="num_gpus must be positive"):
+        NCCL(
+            "context_all_reduce",
+            1.0,
+            nccl_op="all_reduce",
+            num_elements_per_token=128,
+            num_gpus=num_gpus,
+            comm_quant_mode=common.CommQuantMode.half,
+        )
 
 
 def _manual_request(*, statistic: str = "median") -> MeasurementRequest:
@@ -180,6 +235,65 @@ def test_nccl_literal_curated_hit_does_not_promote_interpolation_to_exact(tmp_pa
     assert interpolation_probe is None
 
 
+def test_nccl_curated_exact_rejects_a_different_requested_runtime_version(tmp_path: Path) -> None:
+    database = _write_database(tmp_path)
+    database.set_measurement_environment(
+        replace(
+            _environment(),
+            runtime_versions={"cuda": "13.0", "nccl": "2.28.0"},
+        )
+    )
+
+    assert _operation(scale_factor=2.0).curated_exact_result(database, x=17) is None
+
+
+def test_nccl_runtime_mismatch_never_uses_version_blind_provisional_or_hybrid_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _write_database(tmp_path)
+    database.set_measurement_environment(
+        replace(
+            _environment(),
+            runtime_versions={"cuda": "13.0", "nccl": "2.28.0"},
+        )
+    )
+    operation = _operation(scale_factor=2.0)
+    normalized = operation.normalize_perf_query(x=17)
+    monkeypatch.setattr(
+        database,
+        "query_nccl",
+        lambda *args, **kwargs: pytest.fail("version-blind NCCL table was queried"),
+    )
+
+    with pytest.raises(ValueError, match="NCCL runtime version"):
+        operation.query(database, x=17)
+    provisional = operation.provisional_result(database, normalized_query=normalized)
+
+    assert float(provisional) == 0.0
+    assert provisional.source == "unresolved"
+    with pytest.raises(ValueError, match="NCCL runtime version"):
+        operation.hybrid_fallback_value(database, normalized_query=normalized)
+
+
+def test_single_gpu_nccl_query_is_a_noop_without_runtime_identity(tmp_path: Path) -> None:
+    database = _write_database(tmp_path)
+    database.set_measurement_environment(replace(_environment(), runtime_versions={"cuda": "13.0"}))
+    operation = NCCL(
+        "context_all_reduce",
+        1.0,
+        nccl_op="all_reduce",
+        num_elements_per_token=128,
+        num_gpus=1,
+        comm_quant_mode=common.CommQuantMode.half,
+        seq_split=4,
+    )
+
+    result = operation.query(database, x=17)
+
+    assert (float(result), result.source) == (0.0, "empirical")
+
+
 def _raw_result(request: MeasurementRequest) -> dict[str, Any]:
     return {
         "latency_ms": 1.5,
@@ -194,7 +308,12 @@ def _raw_result(request: MeasurementRequest) -> dict[str, Any]:
             "message_size": 640,
             "latency": 1.5,
         },
-        "provenance": {"runtime": "persistent_torch_distributed", "worker_pid": 1234},
+        "provenance": {
+            "framework": "NCCL",
+            "framework_version": "2.27.3",
+            "runtime": "persistent_torch_distributed",
+            "worker_pid": 1234,
+        },
     }
 
 
@@ -261,6 +380,58 @@ def test_nccl_result_requires_latency_to_equal_sample_median() -> None:
         nccl_result_to_record(request, case, raw)
 
 
+@pytest.mark.parametrize(
+    "provenance",
+    (
+        {"framework": "NCCL", "runtime": "persistent_torch_distributed"},
+        {
+            "framework": "NCCL",
+            "framework_version": "2.28.0",
+            "runtime": "persistent_torch_distributed",
+        },
+    ),
+)
+def test_nccl_result_rejects_missing_or_mismatched_runtime_version(provenance: dict[str, str]) -> None:
+    request = _manual_request()
+    case = {
+        "dtype": "half",
+        "nccl_op": "all_reduce",
+        "element_count": 640,
+        "num_gpus": 2,
+    }
+    raw = _raw_result(request)
+    raw["provenance"] = provenance
+
+    with pytest.raises(ValueError, match="NCCL runtime version"):
+        nccl_result_to_record(request, case, raw)
+
+
+def test_nccl_runtime_version_change_is_a_reopen_miss(tmp_path: Path) -> None:
+    request_a = _manual_request()
+    case = {
+        "dtype": "half",
+        "nccl_op": "all_reduce",
+        "element_count": 640,
+        "num_gpus": 2,
+    }
+    record = nccl_result_to_record(request_a, case, _raw_result(request_a))
+    path = tmp_path / "nccl-versioned-overlay.sqlite"
+    store = OverlayStore(path)
+    store.append(record)
+    store.close()
+
+    environment_b = replace(
+        request_a.environment,
+        runtime_versions={**request_a.environment.runtime_versions, "nccl": "2.28.0"},
+    )
+    key_b = PerfKey.build(_NAMESPACE, request_a.query, environment_b)
+    reopened = OverlayStore(path)
+
+    assert reopened.lookup(request_a.key, request_a.protocol) is not None
+    assert reopened.lookup(key_b, request_a.protocol) is None
+    reopened.close()
+
+
 def test_nccl_route_rejects_non_median_statistic_before_resource_construction(monkeypatch) -> None:
     resource_calls: list[object] = []
     original_resource = nccl_adapter.nccl_resource_for_request
@@ -289,22 +460,22 @@ class _FakeRuntime:
         return (3.0, 1.0, 2.0)
 
 
-def test_run_nccl_case_uses_persistent_runtime_without_offline_subprocess(
+def test_run_nccl_case_uses_the_only_canonical_persistent_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        nccl_runner,
+        "_persistent_provenance",
+        lambda runtime: {"runtime": "persistent_torch_distributed"},
+    )
     runtime = _FakeRuntime(_protocol().digest)
-
-    def _unexpected_offline_run(**kwargs: object) -> None:
-        raise AssertionError(f"persistent branch invoked offline runner: {kwargs}")
-
-    monkeypatch.setattr(nccl_runner, "_run_nccl_tests_case", _unexpected_offline_run)
     measured = nccl_runner.run_nccl_case(
         "half",
         "all_reduce",
         640,
         2,
         runtime=runtime,
-        measure_power=False,
+        protocol=_protocol(),
     )
 
     assert runtime.calls == [("half", "all_reduce", 640)]
@@ -348,6 +519,14 @@ def test_lazy_nccl_protocol_creates_reuses_and_closes_one_rank_group(
     nccl_runner.close_nccl_worker()
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b")
     monkeypatch.setattr(executor_module, "PersistentNcclRankGroup", _RankGroup)
+    monkeypatch.setattr(
+        nccl_runner,
+        "_persistent_provenance",
+        lambda runtime: {
+            "runtime": "persistent_torch_distributed",
+            "rank_pids": list(runtime.rank_pids),
+        },
+    )
 
     first = nccl_runner.run_nccl_case("half", "all_reduce", 640, 2, protocol=protocol)
     second = nccl_runner.run_nccl_case("half", "all_gather", 1280, 2, protocol=protocol)
@@ -364,45 +543,6 @@ def test_lazy_nccl_protocol_creates_reuses_and_closes_one_rank_group(
     assert first.protocol_digest == second.protocol_digest == protocol.digest
     assert first.samples_ms == second.samples_ms == (1.0, 1.5, 2.0)
     assert first.provenance["rank_pids"] == [101, 102]
-
-
-def test_offline_nccl_case_stops_power_monitor_when_subprocess_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    from aiconfigurator.collector import benchmark
-
-    events: list[str] = []
-
-    class _PowerMonitor:
-        def __init__(self, device_id: int) -> None:
-            assert device_id == 0
-
-        @staticmethod
-        def _init_handle() -> bool:
-            return True
-
-        def start_sampling(self) -> bool:
-            events.append("start")
-            return True
-
-        def stop_sampling(self) -> None:
-            events.append("stop")
-
-    monkeypatch.setattr(benchmark, "PowerMonitor", _PowerMonitor)
-    monkeypatch.setattr(
-        nccl_runner.subprocess,
-        "run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("nccl-tests failed")),
-    )
-
-    with pytest.raises(RuntimeError, match="nccl-tests failed"):
-        nccl_runner._run_nccl_tests_case(
-            dtype="half",
-            nccl_op="all_reduce",
-            message_size_bytes=1280,
-            num_gpus=2,
-            measure_power=True,
-        )
-
-    assert events == ["start", "stop"]
 
 
 class _FakePersistentRankGroup:

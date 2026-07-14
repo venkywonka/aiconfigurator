@@ -11,7 +11,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import version as get_version
 from typing import Any
-from unittest.mock import MagicMock
 
 from aiconfigurator.collector.benchmark import benchmark_with_power
 from aiconfigurator.collector.types import RawMeasurement
@@ -121,6 +120,94 @@ def _power_law_selected_experts(
     return _assign_experts_from_counts(counts, num_tokens, topk)
 
 
+def _balanced_selected_experts(
+    num_tokens: int,
+    num_experts: int,
+    topk: int,
+    *,
+    device=None,
+    torch_module=None,
+):
+    import math
+
+    import torch
+
+    torch_module = torch_module or torch
+    stride = math.ceil(num_experts / topk)
+    token_indices = torch_module.arange(num_tokens, device=device).unsqueeze(1)
+    topk_indices = torch_module.arange(topk, device=device).unsqueeze(0)
+    if num_tokens >= stride:
+        selected = (token_indices + topk_indices * stride) % num_experts
+    else:
+        selected = (token_indices * stride / num_tokens + topk_indices * stride) % num_experts
+    return selected.to(torch_module.int64)
+
+
+def _balanced_logits(num_tokens: int, num_experts: int, topk: int):
+    import torch.nn.functional as functional
+
+    selected = _balanced_selected_experts(num_tokens, num_experts, topk)
+    expert_map = functional.one_hot(selected.long(), num_classes=num_experts).sum(1)
+    return functional.softmax(expert_map.bfloat16(), dim=1)
+
+
+def _power_law_logits_v3(
+    num_tokens: int,
+    num_experts: int,
+    topk: int,
+    ep_size: int,
+    alpha: float,
+    *,
+    return_rank0_info: bool = False,
+):
+    import torch
+    import torch.nn.functional as functional
+
+    selected = _power_law_selected_experts(
+        num_tokens,
+        num_experts,
+        topk,
+        ep_size,
+        alpha,
+        device=torch.device("cuda"),
+        torch_module=torch,
+    )
+    expert_map = functional.one_hot(selected.long(), num_classes=num_experts).sum(1)
+    router_logits = functional.softmax(expert_map.bfloat16(), dim=1)
+    if not return_rank0_info:
+        return router_logits
+    experts_per_rank = num_experts // ep_size
+    rank0_mask = (selected < experts_per_rank).any(dim=1)
+    return router_logits, {
+        "rank0_token_mask": rank0_mask,
+        "rank0_logits": router_logits[rank0_mask],
+        "rank0_selected_slots": selected[rank0_mask],
+        "rank0_num_tokens": int(rank0_mask.sum().item()),
+        "slots_per_rank": experts_per_rank,
+        "rank0_total_selections": int((selected < experts_per_rank).sum().item()),
+    }
+
+
+def _build_rank0_local_workload(rank0_info: dict[str, Any]) -> dict[str, object]:
+    import torch
+
+    selected = rank0_info["rank0_selected_slots"].to(torch.int64)
+    logits = rank0_info["rank0_logits"].to(torch.float32)
+    slots_per_rank = int(rank0_info["slots_per_rank"])
+    weights = torch.gather(logits, 1, selected.long()).to(torch.float32)
+    local_mask = selected < slots_per_rank
+    ids = selected.to(torch.int32).clone()
+    ids[~local_mask] = -1
+    weights[~local_mask] = 0.0
+    masked_m = torch.bincount(ids[ids >= 0], minlength=slots_per_rank).to(torch.int32)
+    return {
+        "num_tokens": int(rank0_info["rank0_num_tokens"]),
+        "topk_ids": ids.contiguous(),
+        "topk_weights": weights.contiguous(),
+        "masked_m": masked_m.contiguous(),
+    }
+
+
 def _rank0_workloads(
     *,
     num_workloads: int,
@@ -130,6 +217,7 @@ def _rank0_workloads(
     num_experts: int,
     moe_ep_size: int,
     power_law_alpha: float,
+    workload_distribution: str = "power_law",
     device,
     torch_module,
     standard_topk_output,
@@ -139,15 +227,26 @@ def _rank0_workloads(
     workloads = []
     experts_per_rank = num_experts // moe_ep_size
     for _ in range(num_workloads):
-        selected = _power_law_selected_experts(
-            num_tokens,
-            num_experts,
-            topk,
-            moe_ep_size,
-            power_law_alpha,
-            device=device,
-            torch_module=torch_module,
-        )
+        if workload_distribution == "power_law":
+            selected = _power_law_selected_experts(
+                num_tokens,
+                num_experts,
+                topk,
+                moe_ep_size,
+                power_law_alpha,
+                device=device,
+                torch_module=torch_module,
+            )
+        elif workload_distribution == "balanced":
+            selected = _balanced_selected_experts(
+                num_tokens,
+                num_experts,
+                topk,
+                device=device,
+                torch_module=torch_module,
+            )
+        else:
+            raise ValueError(f"unsupported MoE workload distribution: {workload_distribution}")
         expert_map = functional.one_hot(selected.long(), num_classes=num_experts).sum(1)
         logits = functional.softmax(expert_map.bfloat16(), dim=1)
         token_mask = (selected < experts_per_rank).any(dim=1)
@@ -180,12 +279,12 @@ def _rank0_workloads(
     return workloads
 
 
-def _make_dsv4_moe_runner_config(config_factory):
+def _make_dsv4_moe_runner_config(config_factory, swiglu_limit=10):
     parameters = inspect.signature(config_factory).parameters
     if "swiglu_limit" in parameters:
-        return config_factory(swiglu_limit=10)
+        return config_factory(swiglu_limit=swiglu_limit)
     if "gemm1_clamp_limit" in parameters:
-        return config_factory(gemm1_clamp_limit=10)
+        return config_factory(gemm1_clamp_limit=swiglu_limit)
     raise RuntimeError("SGLang MoeRunnerConfig does not expose the DSv4 SwiGLU clamp")
 
 
@@ -201,22 +300,32 @@ def _prepare_moe_case(
     workload_distribution: str,
     device: str,
     model_path: str,
+    swiglu_limit: float | None = 10,
 ) -> PreparedMoeCase:
     """Import Torch/SGLang only after the worker has bound its GPU UUID."""
 
-    import sglang.srt.server_args as server_args_module
     import torch
-
-    if server_args_module._global_server_args is None:
-        server_args = MagicMock()
-        server_args.enable_deterministic_inference = False
-        server_args.enable_fused_moe_sum_all_reduce = False
-        server_args.kt_weight_path = None
-        server_args.flashinfer_mxfp4_moe_precision = "default"
-        server_args_module._global_server_args = server_args
+    from sglang.srt.server_args import (
+        ServerArgs,
+        get_global_server_args,
+        set_global_server_args_for_scheduler,
+    )
 
     try:
-        import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as fused_moe_module
+        get_global_server_args()
+    except ValueError:
+        set_global_server_args_for_scheduler(
+            ServerArgs(
+                model_path=model_path,
+                skip_tokenizer_init=True,
+                load_format="dummy",
+                device="cuda",
+                tp_size=1,
+                ep_size=1,
+            )
+        )
+
+    try:
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
             get_config_dtype_str,
@@ -224,7 +333,6 @@ def _prepare_moe_case(
             get_moe_configs,
         )
     except ImportError:
-        import sglang.srt.layers.moe.fused_moe_triton.fused_moe as fused_moe_module
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
             get_config_dtype_str,
@@ -235,17 +343,15 @@ def _prepare_moe_case(
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-    def eager_sum_reduce(x, out, routed_scaling_factor):
-        torch.sum(x, dim=1, out=out)
-        out.mul_(routed_scaling_factor)
-
-    if hasattr(fused_moe_module, "moe_sum_reduce_torch_compile"):
-        fused_moe_module.moe_sum_reduce_torch_compile = eager_sum_reduce
-
     torch_device = torch.device(device)
     torch.cuda.set_device(torch_device)
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
+    if quant_mode not in {"bfloat16", "fp8_block"}:
+        raise ValueError(f"canonical Triton MoE preparation does not support quant_mode={quant_mode!r}")
+    distribution_name, _, alpha_text = workload_distribution.partition("_")
+    power_law_alpha = float(alpha_text.removeprefix("law_")) if distribution_name == "power" else 0.0
+    normalized_distribution = "power_law" if workload_distribution.startswith("power_law_") else workload_distribution
     local_experts = num_experts // moe_ep_size
     shard_intermediate_size = 2 * inter_size // moe_tp_size
     workloads = _rank0_workloads(
@@ -255,15 +361,18 @@ def _prepare_moe_case(
         topk=topk,
         num_experts=num_experts,
         moe_ep_size=moe_ep_size,
-        power_law_alpha=1.01,
+        power_law_alpha=power_law_alpha,
+        workload_distribution=normalized_distribution,
         device=torch_device,
         torch_module=torch,
         standard_topk_output=StandardTopKOutput,
     )
     max_rank_tokens = max(hidden_states.shape[0] for hidden_states, _topk in workloads)
-    block_shape = [128, 128]
-    dtype_name = get_config_dtype_str(torch.bfloat16, use_fp8_w8a8=True)
-    configs = get_moe_configs(local_experts, shard_intermediate_size // 2, dtype_name, *block_shape)
+    use_fp8 = quant_mode == "fp8_block"
+    block_shape = [128, 128] if use_fp8 else None
+    dtype_name = get_config_dtype_str(torch.bfloat16, use_fp8_w8a8=use_fp8)
+    block_n, block_k = block_shape or (0, 0)
+    configs = get_moe_configs(local_experts, shard_intermediate_size // 2, dtype_name, block_n, block_k)
     config = (
         get_default_config(
             max_rank_tokens,
@@ -285,30 +394,34 @@ def _prepare_moe_case(
         hidden_size,
         dtype=torch.bfloat16,
         device=torch_device,
-    ).to(torch.float8_e4m3fn)
+    )
     w2 = torch.randn(
         local_experts,
         hidden_size,
         shard_intermediate_size // 2,
         dtype=torch.bfloat16,
         device=torch_device,
-    ).to(torch.float8_e4m3fn)
-    block_n, block_k = block_shape
-    w1_scale = torch.rand(
-        local_experts,
-        (shard_intermediate_size + block_n - 1) // block_n,
-        (hidden_size + block_k - 1) // block_k,
-        dtype=torch.float32,
-        device=torch_device,
     )
-    w2_scale = torch.rand(
-        local_experts,
-        (hidden_size + block_n - 1) // block_n,
-        (shard_intermediate_size // 2 + block_k - 1) // block_k,
-        dtype=torch.float32,
-        device=torch_device,
-    )
-    runner_config = _make_dsv4_moe_runner_config(MoeRunnerConfig)
+    if use_fp8:
+        w1 = w1.to(torch.float8_e4m3fn)
+        w2 = w2.to(torch.float8_e4m3fn)
+        w1_scale = torch.rand(
+            local_experts,
+            (shard_intermediate_size + block_n - 1) // block_n,
+            (hidden_size + block_k - 1) // block_k,
+            dtype=torch.float32,
+            device=torch_device,
+        )
+        w2_scale = torch.rand(
+            local_experts,
+            (hidden_size + block_n - 1) // block_n,
+            (shard_intermediate_size // 2 + block_k - 1) // block_k,
+            dtype=torch.float32,
+            device=torch_device,
+        )
+    else:
+        w1_scale = w2_scale = None
+    runner_config = _make_dsv4_moe_runner_config(MoeRunnerConfig, swiglu_limit)
 
     def one_workload(hidden_states, topk_output):
         kernel_topk_output = StandardTopKOutput(
@@ -323,7 +436,7 @@ def _prepare_moe_case(
                 w2,
                 kernel_topk_output,
                 moe_runner_config=runner_config,
-                use_fp8_w8a8=True,
+                use_fp8_w8a8=use_fp8,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
@@ -341,9 +454,9 @@ def _prepare_moe_case(
         device=torch_device,
         model_artifact=model_path,
         kernel_source="sglang_fused_moe_triton",
-        workload_generator="power_law_v3",
+        workload_generator="power_law_v3" if normalized_distribution == "power_law" else "balanced-v1",
         seed=0,
-        rank_simulation="single-gpu-ep4-rank0",
+        rank_simulation=f"single-gpu-ep{moe_ep_size}-rank0",
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         inter_size=inter_size,
@@ -374,27 +487,24 @@ def run_moe_case(
     quant_mode: str,
     workload_distribution: str,
     *,
+    swiglu_limit: float | None = 10,
     protocol: MeasurementProtocol | None = None,
     device: str = "cuda:0",
     model_path: str = _MODEL_ARTIFACT,
 ) -> RawMeasurement:
-    """Measure one exact FP8-block local-rank case without a perf-file write."""
+    """Measure one exact online-profile local-rank case without persistence."""
 
     dimensions = (num_tokens, hidden_size, inter_size, topk, num_experts, moe_tp_size, moe_ep_size)
     if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in dimensions):
         raise ValueError("MoE dimensions must be positive integers")
-    if (
-        hidden_size != 4096
-        or inter_size != 2048
-        or topk != 6
-        or num_experts != 256
-        or moe_tp_size != 1
-        or moe_ep_size != 4
-        or quant_mode != "fp8_block"
-        or workload_distribution != "power_law_1.01"
-        or model_path != _MODEL_ARTIFACT
-    ):
-        raise ValueError("MoE case is outside the frozen DSv4 FP8-block TP1/EP4 capability envelope")
+    if inter_size % moe_tp_size or num_experts % moe_ep_size:
+        raise ValueError("MoE inter_size and num_experts must divide exactly across TP and EP")
+    if quant_mode not in {"bfloat16", "fp8_block"}:
+        raise ValueError(f"unsupported SGLang online MoE quant_mode={quant_mode!r}")
+    if workload_distribution != "balanced" and not workload_distribution.startswith("power_law_"):
+        raise ValueError(f"unsupported SGLang MoE workload_distribution={workload_distribution!r}")
+    if not isinstance(model_path, str) or not model_path.strip():
+        raise ValueError("MoE model_path must be a non-empty string")
     protocol = protocol or MeasurementProtocol(
         revision="cuda-event-samples-v1",
         warmups=3,
@@ -412,7 +522,7 @@ def run_moe_case(
     ):
         raise ValueError("MoE measurement protocol is incompatible with the exact runner")
 
-    prepared = _prepare_moe_case(
+    prepare_args = (
         num_tokens,
         hidden_size,
         inter_size,
@@ -424,6 +534,9 @@ def run_moe_case(
         workload_distribution,
         device,
         model_path,
+    )
+    prepared = (
+        _prepare_moe_case(*prepare_args) if swiglu_limit == 10 else _prepare_moe_case(*prepare_args, swiglu_limit)
     )
     expected = (
         num_tokens,
@@ -447,8 +560,8 @@ def run_moe_case(
         prepared.quant_mode,
         prepared.workload_distribution,
     )
-    if actual != expected or prepared.model_artifact != _MODEL_ARTIFACT:
-        raise ValueError("prepared MoE case does not match the frozen request")
+    if actual != expected or prepared.model_artifact != model_path:
+        raise ValueError("prepared MoE case does not match the exact request")
 
     with benchmark_with_power(
         device=prepared.device,

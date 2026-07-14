@@ -150,7 +150,6 @@ def test_nccl_adapter_registers_exact_case_resource_and_persistent_runner() -> N
         "element_count",
         "num_gpus",
         "runtime",
-        "measure_power",
         "protocol",
     )
     assert signature.parameters["runtime"].default is None
@@ -205,7 +204,11 @@ def test_nccl_result_requires_operation_and_protocol_to_round_trip() -> None:
             "message_size": 4096,
             "latency": 1.0,
         },
-        "provenance": {"runtime": "fake-persistent-group"},
+        "provenance": {
+            "runtime": "fake-persistent-group",
+            "framework": "NCCL",
+            "framework_version": "2.27.3",
+        },
     }
 
     record = adapter.nccl_result_to_record(request, case, raw)

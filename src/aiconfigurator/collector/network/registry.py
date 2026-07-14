@@ -4,7 +4,11 @@
 """Packaged lazy registrations for network collectors."""
 
 from aiconfigurator.collector.registry_types import OpEntry, PerfFile
-from aiconfigurator.collector.types import LazyOpEntry
+from aiconfigurator.collector.types import (
+    FabricRequirement,
+    LazyOpEntry,
+    ResourceContract,
+)
 from aiconfigurator.sdk.perf_namespace import perf_namespace
 
 NCCL_LAZY_SPEC = LazyOpEntry(
@@ -18,6 +22,11 @@ NCCL_LAZY_SPEC = LazyOpEntry(
     protocol_revision="cuda-event-samples-v1",
     timer="cuda_event",
     tuning_revision="torch-nccl-persistent-v1",
+    preflight_resource=ResourceContract(
+        4,
+        FabricRequirement.NVLINK,
+        reserve_fabric_domain=True,
+    ),
 )
 
 NETWORK_LAZY_REGISTRY = (

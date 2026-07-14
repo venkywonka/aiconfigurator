@@ -42,3 +42,12 @@ def test_slurm_network_docs_use_new_folder_name():
 
     for path in docs:
         assert "slurm_comm_collector" not in path.read_text(encoding="utf-8")
+
+
+def test_collect_comm_invokes_the_nccl_wrapper_as_a_module():
+    source = (NETWORK_ROOT / "collect_comm.sh").read_text(encoding="utf-8")
+
+    assert 'REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)' in source
+    assert 'export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"' in source
+    assert "python3 -m collector.network.collect_nccl" in source
+    assert 'python3 "$SCRIPT_DIR/collect_nccl.py"' not in source

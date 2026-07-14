@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from contextlib import contextmanager
 
 import pytest
@@ -88,6 +89,93 @@ def test_exact_sglang_gemm_runner_returns_raw_samples_and_cleans_up(monkeypatch)
     assert benchmark_kwargs["repeat_n"] == 1
     assert benchmark_kwargs["return_samples"] is True
     assert calls[-1] == ("cleanup",)
+
+
+def test_sglang_gemm_runner_has_the_offline_protocol_as_its_default(monkeypatch) -> None:
+    calls: list[object] = []
+
+    monkeypatch.setattr(
+        gemm,
+        "_prepare_gemm_case",
+        lambda *args: gemm.PreparedGemmCase(
+            kernel_func=lambda: None,
+            cleanup_func=lambda: calls.append(("cleanup",)),
+            outside_loop_count=1,
+            kernel_source="torch_flow",
+            framework_version="0.5.10",
+            device_name="NVIDIA GB200",
+            device=object(),
+        ),
+    )
+
+    @contextmanager
+    def _benchmark(**kwargs):
+        calls.append(("benchmark", kwargs))
+        yield {
+            "latency_ms": 2.0,
+            "samples_ms": (1.0, 2.0, 2.0, 2.0, 3.0, 4.0),
+            "power_stats": None,
+            "throttled": False,
+            "used_cuda_graph": True,
+        }
+
+    monkeypatch.setattr(gemm, "benchmark_with_power", _benchmark)
+
+    result = gemm.run_gemm_case("bfloat16", 8, 16, 32)
+
+    benchmark_kwargs = next(call[1] for call in calls if call[0] == "benchmark")
+    assert benchmark_kwargs["num_warmups"] == 3
+    assert benchmark_kwargs["num_runs"] == 6
+    assert result.samples_ms == (1.0, 2.0, 2.0, 2.0, 3.0, 4.0)
+
+
+def test_canonical_sglang_gemm_runner_does_not_embed_the_frozen_jit_hardware_envelope() -> None:
+    source = inspect.getsource(gemm._prepare_gemm_case)
+
+    assert "nvidia gb200" not in source.casefold()
+    assert "major < 10" not in source
+    assert "_SUPPORTED_SGLANG_VERSIONS" not in source
+
+
+def test_offline_sglang_gemm_logs_the_canonical_runner_row_once(monkeypatch) -> None:
+    from collector.sglang import collect_gemm
+
+    raw = RawMeasurement(
+        latency_ms=1.25,
+        energy_wms=125.0,
+        samples_ms=(1.2, 1.25, 1.3),
+        statistic="median",
+        perf_row={"gemm_dtype": "bfloat16", "m": 8, "n": 16, "k": 32, "latency": 1.25},
+        provenance={
+            "framework": "SGLang",
+            "framework_version": "0.5.10",
+            "device": "NVIDIA GB200",
+            "kernel_source": "torch_flow",
+        },
+        protocol_digest="protocol-digest",
+        power_stats={"power": 100.0, "power_limit": 1200.0},
+    )
+    runner_calls = []
+    log_calls = []
+    monkeypatch.setattr(
+        collect_gemm,
+        "run_gemm_case",
+        lambda *args, **kwargs: runner_calls.append((args, kwargs)) or raw,
+    )
+    monkeypatch.setattr(collect_gemm, "log_perf", lambda **kwargs: log_calls.append(kwargs))
+
+    result = collect_gemm.run_gemm("bfloat16", 8, 16, 32, perf_filename="gemm_perf.txt", device="cuda:3")
+
+    assert result is None
+    assert runner_calls == [(("bfloat16", 8, 16, 32), {"device": "cuda:3"})]
+    assert len(log_calls) == 1
+    assert log_calls[0]["item_list"] == [dict(raw.perf_row)]
+    assert log_calls[0]["framework"] == "SGLang"
+    assert log_calls[0]["version"] == "0.5.10"
+    assert log_calls[0]["device_name"] == "NVIDIA GB200"
+    assert log_calls[0]["kernel_source"] == "torch_flow"
+    assert log_calls[0]["perf_filename"] == "gemm_perf.txt"
+    assert log_calls[0]["power_stats"] == {"power": 100.0, "power_limit": 1200.0}
 
 
 def test_sglang_gemm_runner_rejects_protocol_before_gpu_preparation(monkeypatch) -> None:

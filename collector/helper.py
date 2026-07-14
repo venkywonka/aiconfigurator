@@ -693,6 +693,26 @@ def log_perf(
     perf_filename: str,
     power_stats: dict | None = None,
 ):
+    base_data = {
+        "framework": framework,
+        "version": version,
+        "device": device_name,
+        "op_name": op_name,
+        "kernel_source": kernel_source,
+    }
+    normalized_items: list[dict] = []
+    for index, item in enumerate(item_list):
+        conflicts = {
+            key: (base_data[key], item[key]) for key in base_data.keys() & item.keys() if item[key] != base_data[key]
+        }
+        if conflicts:
+            details = ", ".join(
+                f"{key}: wrapper={wrapper_value!r}, row={row_value!r}"
+                for key, (wrapper_value, row_value) in sorted(conflicts.items())
+            )
+            raise ValueError(f"conflicting canonical perf metadata in item {index}: {details}")
+        normalized_items.append({key: value for key, value in item.items() if key not in base_data})
+
     lock_file = perf_filename + ".lock"
 
     # Try for 1 sec (10 * 0.1s)
@@ -715,18 +735,10 @@ def log_perf(
             # Add header only if file is empty
             is_empty = os.fstat(f.fileno()).st_size == 0
 
-            base_data = {
-                "framework": framework,
-                "version": version,
-                "device": device_name,
-                "op_name": op_name,
-                "kernel_source": kernel_source,
-            }
-
             # Get headers from first item if exists
             fieldnames = list(base_data.keys())
-            if item_list:
-                fieldnames += list(item_list[0].keys())
+            if normalized_items:
+                fieldnames += list(normalized_items[0].keys())
             # Add power_stats keys if present
             if power_stats:
                 for key in ["power", "power_limit"]:
@@ -738,7 +750,7 @@ def log_perf(
             if is_empty:
                 writer.writeheader()
 
-            for item in item_list:
+            for item in normalized_items:
                 row = base_data | item
                 # Add power_stats values if present
                 if power_stats:

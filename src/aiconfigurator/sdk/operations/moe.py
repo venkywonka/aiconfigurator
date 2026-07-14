@@ -1267,16 +1267,17 @@ class MoEDispatch(Operation):
 
     def resolution_capabilities(self):
         """Describe the frozen non-DeepEP dispatch walk without a shape."""
-        from aiconfigurator.collector.preflight import OperationCapability, OperationKind
+        from aiconfigurator.sdk.operations.communication import CustomAllReduce
 
         capabilities = list(super().resolution_capabilities())
         if self.num_gpus > 1:
-            capabilities.append(
-                OperationCapability(
-                    "CustomAllReduce",
-                    OperationKind.MEASURED,
-                    perf_namespace("custom_allreduce_perf.txt"),
-                )
+            capabilities.extend(
+                CustomAllReduce(
+                    f"{self._name}.custom_allreduce",
+                    1.0,
+                    h=1,
+                    tp_size=self.num_gpus,
+                ).resolution_capabilities()
             )
         return tuple(capabilities)
 
