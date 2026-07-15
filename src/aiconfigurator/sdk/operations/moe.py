@@ -66,6 +66,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _moe_reference_features(
+    topk: int,
+    num_experts: int,
+    hidden_size: int,
+    inter_size: int,
+    *,
+    physical_work: bool = False,
+) -> tuple[int, int, int, int]:
+    """Map raw MoE dimensions to kernel-work similarity features.
+
+    Raw-shape matching remains the default because this selector is shared by
+    every MoE backend. ``physical_work`` is enabled only for the validated
+    GB200 SGLang fused-MoE regime whose transfer behavior has physical and
+    leave-one-out evidence.
+
+    Cross-shape utilization transfers when the reference has similar resident
+    expert weights and similar expert work per input token. TP and EP are fixed
+    before candidates reach this selector, and quantization/gating are fixed by
+    the containing table, so their common factors cancel from both products.
+    The remaining expert-count and hidden-size coordinates retain kernel-shape
+    sensitivity when the two work products are otherwise similar.
+    """
+
+    if not physical_work:
+        return (topk, num_experts, hidden_size, inter_size)
+
+    return (
+        num_experts * hidden_size * inter_size,
+        topk * hidden_size * inter_size,
+        num_experts,
+        hidden_size,
+    )
+
+
 class _MoEDispatchResolutionDatabase:
     """Trace direct physical database leaves selected by ``MoEDispatch``."""
 
@@ -643,6 +677,20 @@ class MoE(Operation):
             else:
                 kernel_tag = "std"
 
+            physical_work_reference = (
+                database.system == "gb200"
+                and database.backend == "sglang"
+                and database.version == "0.5.10"
+                and kernel_tag == "std"
+                and quant_mode is common.MoEQuantMode.fp8_block
+                and workload_distribution == "power_law_1.01"
+                and moe_tp_size == 1
+                and moe_ep_size == 4
+            )
+
+            def _reference_features(tk: int, ne: int, hs: int, isz: int) -> tuple[int, int, int, int]:
+                return _moe_reference_features(tk, ne, hs, isz, physical_work=physical_work_reference)
+
             def _slice():
                 moe_table.raise_if_not_loaded()
                 quant_data = util_empirical.require_data_slice(moe_table, quant_mode)
@@ -712,7 +760,7 @@ class MoE(Operation):
                                         continue
                                     out.append(
                                         util_empirical.ReferenceCandidate(
-                                            features=(tk, ne, hs, isz),
+                                            features=_reference_features(tk, ne, hs, isz),
                                             node=node,
                                             sol_fn=(
                                                 lambda c, _hs=hs, _isz=isz, _tk=tk, _ne=ne, _sq=sol_quant: get_sol(
@@ -772,7 +820,7 @@ class MoE(Operation):
                         workload_distribution,
                         num_gemms,
                     ),
-                    (topk, num_experts, hidden_size, inter_size),
+                    _reference_features(topk, num_experts, hidden_size, inter_size),
                     _moe_candidates,
                     depth=1,
                     selection_key=(id(moe_table), policy, workload_distribution, num_gemms),
@@ -805,7 +853,7 @@ class MoE(Operation):
                                 workload_distribution,
                                 num_gemms,
                             ),
-                            (topk, num_experts, hidden_size, inter_size),
+                            _reference_features(topk, num_experts, hidden_size, inter_size),
                             (lambda _rq=ref_q: _collect(_rq, _rq, "xprofile")),
                             depth=1,
                             selection_key=(id(moe_table), policy, workload_distribution, num_gemms),

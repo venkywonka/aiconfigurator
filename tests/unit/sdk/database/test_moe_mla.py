@@ -772,6 +772,64 @@ class TestMoECrossProfileTransfer:
     by the per-quant util-LEVEL ratio e(query)/e(ref). The stub db collects only
     bfloat16 (2,1) and fp8 (1,2)."""
 
+    def test_moe_reference_features_default_to_legacy_raw_shape(self):
+        """Physical-work matching must remain opt-in for proven kernel tables."""
+        from aiconfigurator.sdk.operations.moe import _moe_reference_features
+
+        shape = (6, 256, 4096, 2048)
+        assert _moe_reference_features(*shape, physical_work=False) == shape
+        assert _moe_reference_features(*shape, physical_work=True) == (
+            256 * 4096 * 2048,
+            6 * 4096 * 2048,
+            256,
+            4096,
+        )
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "physical_latency_ms"),
+        (
+            (65, 0.2765631914138794),
+            (258, 0.36370559930801394),
+            (516, 0.4183968067169189),
+            (1025, 0.571619200706482),
+        ),
+    )
+    def test_gb200_sglang_dsv4_xshape_uses_physical_work_similarity(self, num_tokens, physical_latency_ms):
+        """The closest raw shape is not the closest MoE workload.
+
+        These bounds are backed by Lyris job 2377454 using the canonical
+        SGLang 0.5.10rc0 fused-MoE runner. The same runner reproduces the
+        selected 0.5.10 reference curve within 1.5%, isolating XSHAPE choice.
+        """
+        from aiconfigurator.sdk import perf_database
+        from aiconfigurator.sdk.operations import util_empirical
+        from aiconfigurator.sdk.operations.moe import MoE
+
+        database = perf_database.get_database_view(
+            "gb200",
+            "sglang",
+            "0.5.10",
+            database_mode=common.DatabaseMode.HYBRID,
+        )
+        assert database is not None
+        util_empirical.clear_grid_cache()
+        with util_empirical.capture_provenance() as tags:
+            result = MoE._query_moe_table(
+                database,
+                num_tokens=num_tokens,
+                hidden_size=4096,
+                inter_size=2048,
+                topk=6,
+                num_experts=256,
+                moe_tp_size=1,
+                moe_ep_size=4,
+                quant_mode=common.MoEQuantMode.fp8_block,
+                workload_distribution="power_law_1.01",
+                database_mode=common.DatabaseMode.HYBRID,
+            )
+        assert util_empirical.worst_provenance(tags) == "xshape"
+        assert float(result) == pytest.approx(physical_latency_ms, rel=0.08)
+
     def test_quant_util_level_keyed_by_profile_and_structured(self):
         from aiconfigurator.sdk.operations.moe import _moe_quant_util_level
 
